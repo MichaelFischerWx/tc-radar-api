@@ -271,12 +271,9 @@ def list_variables():
 
 @app.get("/levels")
 def list_levels():
-    """Available height levels in km."""
-    try:
-        ds = get_dataset("swath", "early")
-        return {"levels_km": [round(float(h), 2) for h in ds["height"].values]}
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=str(e))
+    """Available height levels in km (hardcoded from TC-RADAR v3m spec: 37 levels, 0–18 km)."""
+    levels = [round(i * 0.5, 1) for i in range(37)]  # 0.0, 0.5, 1.0, ... 18.0
+    return {"levels_km": levels}
 
 
 @app.get("/metadata")
