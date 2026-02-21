@@ -131,7 +131,7 @@ def get_dataset(data_type: str, era: str) -> xr.Dataset:
         path = S3_PATHS[(data_type, era)]
         fs   = s3fs.S3FileSystem(anon=False, client_kwargs={"region_name": AWS_REGION})
         store = s3fs.S3Map(root=path, s3=fs, check=False)
-        ds = xr.open_zarr(store, consolidated=False)
+        ds = xr.open_zarr(store, consolidated=True)
         print(f"Opened Zarr from S3: {path}")
     else:
         url = AOML_FILES[(data_type, era)]
@@ -265,6 +265,20 @@ def health():
         "backend": "s3_zarr" if USE_S3 else "aoml_http",
         "bucket": S3_BUCKET if USE_S3 else None,
     }
+
+
+@app.get("/debug")
+def debug():
+    """Temporary debug endpoint — shows what xarray sees in the Zarr store."""
+    try:
+        ds = get_dataset("swath", "early")
+        return {
+            "dims": dict(ds.sizes),
+            "data_vars": list(ds.data_vars),
+            "coords": list(ds.coords),
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @app.get("/variables")
