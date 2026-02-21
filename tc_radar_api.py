@@ -316,6 +316,98 @@ def get_metadata(case_index: int = Query(..., ge=0)):
     return JSONResponse(_metadata_cache[case_index])
 
 
+# ---------------------------------------------------------------------------
+# Helper: matplotlib colormap → Plotly colorscale
+# ---------------------------------------------------------------------------
+def _cmap_to_plotly(cmap_name: str, n_steps: int = 64) -> list:
+    """Convert a matplotlib colormap name to a Plotly-compatible colorscale list."""
+    cmap = plt.get_cmap(cmap_name)
+    return [
+        [round(i / (n_steps - 1), 4),
+         f"rgb({int(c[0]*255)},{int(c[1]*255)},{int(c[2]*255)})"]
+        for i, c in enumerate(cmap(np.linspace(0, 1, n_steps)))
+    ]
+
+
+@app.get("/data")
+def get_data(
+    case_index: int   = Query(...,              ge=0,          description="0-based case index"),
+    variable:   str   = Query(DEFAULT_VARIABLE,                description="Variable key — see /variables"),
+    level_km:   float = Query(2.0,              ge=0.0, le=18, description="Altitude in km"),
+    data_type:  str   = Query("swath",                         description="'swath' or 'merge'"),
+):
+    """Return the raw 2D data slice as JSON for client-side Plotly rendering."""
+    if variable not in VARIABLES:
+        raise HTTPException(status_code=400, detail=f"Unknown variable '{variable}'. See /variables.")
+    if data_type not in ("swath", "merge"):
+        raise HTTPException(status_code=400, detail="data_type must be 'swath' or 'merge'")
+
+    try:
+        ds, local_idx = resolve_case(case_index, data_type)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not open dataset: {e}")
+
+    display_name, varname, cmap, units, vmin, vmax = VARIABLES[variable]
+
+    if varname not in ds:
+        available = [k for k, v in VARIABLES.items() if v[1] in ds]
+        raise HTTPException(status_code=400, detail=f"'{varname}' not in dataset. Available: {available}")
+
+    # Select case and height level
+    da = ds[varname].isel(num_cases=local_idx)
+    height_vals = ds["height"].values
+    z_idx = int(np.argmin(np.abs(height_vals - level_km)))
+    actual_level = float(height_vals[z_idx])
+    da = da.isel(height=z_idx)
+
+    data = da.values  # triggers S3 fetch
+
+    # Determine spatial grid
+    var_dims = set(ds[varname].dims)
+    if "eastward_distance" in var_dims and "northward_distance" in var_dims:
+        x = ds["eastward_distance"].values.tolist()
+        y = ds["northward_distance"].values.tolist()
+    elif "latitude" in var_dims and "longitude" in var_dims:
+        nx = ds.sizes["longitude"]
+        ny = ds.sizes["latitude"]
+        x = np.linspace(-(nx - 1), (nx - 1), nx).tolist()
+        y = np.linspace(-(ny - 1), (ny - 1), ny).tolist()
+    else:
+        x = list(range(data.shape[-1]))
+        y = list(range(data.shape[-2]))
+
+    # Convert NaN → None for JSON serialization
+    data_list = np.where(np.isnan(data), None, np.round(data, 4))
+    # numpy None trick doesn't work directly; use a nested list approach
+    data_clean = []
+    for row in data:
+        data_clean.append([None if np.isnan(v) else round(float(v), 4) for v in row])
+
+    case_meta = _metadata_cache.get(case_index, {"case_index": case_index})
+
+    return JSONResponse({
+        "data": data_clean,
+        "x": x,
+        "y": y,
+        "actual_level_km": actual_level,
+        "variable": {
+            "key": variable,
+            "display_name": display_name,
+            "units": units,
+            "vmin": vmin,
+            "vmax": vmax,
+            "colorscale": _cmap_to_plotly(cmap),
+        },
+        "case_meta": {
+            "storm_name": case_meta.get("storm_name", ""),
+            "datetime": case_meta.get("datetime", ""),
+            "vmax_kt": case_meta.get("vmax_kt"),
+            "rmw_km": case_meta.get("rmw_km"),
+            "mission_id": case_meta.get("mission_id", ""),
+        },
+    })
+
+
 @app.get("/plot")
 def plot(
     case_index: int   = Query(...,              ge=0,          description="0-based case index"),
