@@ -88,6 +88,7 @@ VARIABLES = {
     "recentered_upward_air_velocity":       ("Vertical Velocity (WCM)",         "recentered_upward_air_velocity",       "RdBu_r",    "m/s",   -5,    5),
     "recentered_reflectivity":              ("Reflectivity (WCM)",              "recentered_reflectivity",              "Spectral_r","dBZ",  -10,   65),
     "recentered_wind_speed":                ("Wind Speed (WCM)",                "recentered_wind_speed",                "inferno",   "m/s",    0,   80),
+    "recentered_earth_relative_wind_speed": ("Earth-Rel. Wind Speed (WCM)",    "recentered_earth_relative_wind_speed", "inferno",   "m/s",    0,   80),
     "recentered_relative_vorticity":        ("Relative Vorticity (WCM)",        "recentered_relative_vorticity",        "RdBu_r",    "s⁻¹",-5e-3, 5e-3),
     "recentered_divergence":                ("Divergence (WCM)",                "recentered_divergence",                "RdBu_r",    "s⁻¹",-5e-3, 5e-3),
     "total_recentered_tangential_wind":     ("Tangential Wind (tilt-relative)", "total_recentered_tangential_wind",     "RdBu_r",    "m/s",  -10,   80),
@@ -95,10 +96,20 @@ VARIABLES = {
     "total_recentered_upward_air_velocity": ("Vertical Velocity (tilt-rel.)",   "total_recentered_upward_air_velocity", "RdBu_r",    "m/s",   -5,    5),
     "total_recentered_reflectivity":        ("Reflectivity (tilt-relative)",    "total_recentered_reflectivity",        "Spectral_r","dBZ",  -10,   65),
     "total_recentered_wind_speed":          ("Wind Speed (tilt-relative)",      "total_recentered_wind_speed",          "inferno",   "m/s",    0,   80),
+    "total_recentered_earth_relative_wind_speed": ("Earth-Rel. Wind Speed (tilt-rel.)", "total_recentered_earth_relative_wind_speed", "inferno", "m/s", 0, 80),
     "swath_tangential_wind":                ("Tangential Wind (original)",      "swath_tangential_wind",                "RdBu_r",    "m/s",  -10,   80),
     "swath_radial_wind":                    ("Radial Wind (original)",          "swath_radial_wind",                    "RdBu_r",    "m/s",  -30,   30),
     "swath_reflectivity":                   ("Reflectivity (original)",         "swath_reflectivity",                   "Spectral_r","dBZ",  -10,   65),
     "swath_wind_speed":                     ("Wind Speed (original)",           "swath_wind_speed",                     "inferno",   "m/s",    0,   80),
+    "swath_earth_relative_wind_speed":      ("Earth-Rel. Wind Speed (original)","swath_earth_relative_wind_speed",      "inferno",   "m/s",    0,   80),
+}
+
+# Derived variables: computed as sqrt(u² + v²) from component pairs
+# key → (u_varname, v_varname)
+DERIVED_VARIABLES = {
+    "recentered_earth_relative_wind_speed":       ("recentered_earth_relative_eastward_wind",       "recentered_earth_relative_northward_wind"),
+    "total_recentered_earth_relative_wind_speed":  ("total_recentered_earth_relative_eastward_wind",  "total_recentered_earth_relative_northward_wind"),
+    "swath_earth_relative_wind_speed":             ("swath_earth_relative_eastward_wind",             "swath_earth_relative_northward_wind"),
 }
 
 DEFAULT_VARIABLE = "recentered_tangential_wind"
@@ -163,23 +174,34 @@ def render_planview(
 ) -> bytes:
     display_name, varname, cmap, units, vmin, vmax = VARIABLES[variable_key]
 
-    if varname not in ds:
-        available = [k for k, v in VARIABLES.items() if v[1] in ds]
-        raise ValueError(f"'{varname}' not in dataset. Available: {available}")
-
-    da = ds[varname].isel(num_cases=local_idx)
-    height_vals = ds["height"].values
-    z_idx = int(np.argmin(np.abs(height_vals - level_km)))
-    actual_level = float(height_vals[z_idx])
-    da = da.isel(height=z_idx)
-
-    # Trigger data fetch (one S3 GET in Zarr mode, HTTP range in AOML mode)
-    data = da.values
+    # Derived variable: compute sqrt(u² + v²) from component pair
+    if variable_key in DERIVED_VARIABLES:
+        u_name, v_name = DERIVED_VARIABLES[variable_key]
+        if u_name not in ds or v_name not in ds:
+            raise ValueError(f"Components '{u_name}' / '{v_name}' not in dataset.")
+        ref_varname = u_name  # use u component for dim detection
+        height_vals = ds["height"].values
+        z_idx = int(np.argmin(np.abs(height_vals - level_km)))
+        actual_level = float(height_vals[z_idx])
+        u = ds[u_name].isel(num_cases=local_idx, height=z_idx).values
+        v = ds[v_name].isel(num_cases=local_idx, height=z_idx).values
+        data = np.sqrt(u**2 + v**2)
+    else:
+        if varname not in ds:
+            available = [k for k, v in VARIABLES.items() if v[1] in ds]
+            raise ValueError(f"'{varname}' not in dataset. Available: {available}")
+        ref_varname = varname
+        da = ds[varname].isel(num_cases=local_idx)
+        height_vals = ds["height"].values
+        z_idx = int(np.argmin(np.abs(height_vals - level_km)))
+        actual_level = float(height_vals[z_idx])
+        da = da.isel(height=z_idx)
+        data = da.values
 
     # Determine which spatial grid this variable is on:
     #   - recentered / total_recentered vars: (northward_distance, eastward_distance) — 201×201
     #   - original swath vars:                (latitude, longitude)                   — 200×200
-    var_dims = set(ds[varname].dims)
+    var_dims = set(ds[ref_varname].dims)
     if "eastward_distance" in var_dims and "northward_distance" in var_dims:
         x = ds["eastward_distance"].values
         y = ds["northward_distance"].values
@@ -349,21 +371,32 @@ def get_data(
 
     display_name, varname, cmap, units, vmin, vmax = VARIABLES[variable]
 
-    if varname not in ds:
-        available = [k for k, v in VARIABLES.items() if v[1] in ds]
-        raise HTTPException(status_code=400, detail=f"'{varname}' not in dataset. Available: {available}")
-
-    # Select case and height level
-    da = ds[varname].isel(num_cases=local_idx)
-    height_vals = ds["height"].values
-    z_idx = int(np.argmin(np.abs(height_vals - level_km)))
-    actual_level = float(height_vals[z_idx])
-    da = da.isel(height=z_idx)
-
-    data = da.values  # triggers S3 fetch
+    # Derived variable: compute sqrt(u² + v²) from component pair
+    if variable in DERIVED_VARIABLES:
+        u_name, v_name = DERIVED_VARIABLES[variable]
+        if u_name not in ds or v_name not in ds:
+            raise HTTPException(status_code=400, detail=f"Components '{u_name}' / '{v_name}' not in dataset.")
+        ref_varname = u_name
+        height_vals = ds["height"].values
+        z_idx = int(np.argmin(np.abs(height_vals - level_km)))
+        actual_level = float(height_vals[z_idx])
+        u = ds[u_name].isel(num_cases=local_idx, height=z_idx).values
+        v = ds[v_name].isel(num_cases=local_idx, height=z_idx).values
+        data = np.sqrt(u**2 + v**2)
+    else:
+        if varname not in ds:
+            available = [k for k, v in VARIABLES.items() if v[1] in ds]
+            raise HTTPException(status_code=400, detail=f"'{varname}' not in dataset. Available: {available}")
+        ref_varname = varname
+        da = ds[varname].isel(num_cases=local_idx)
+        height_vals = ds["height"].values
+        z_idx = int(np.argmin(np.abs(height_vals - level_km)))
+        actual_level = float(height_vals[z_idx])
+        da = da.isel(height=z_idx)
+        data = da.values  # triggers S3 fetch
 
     # Determine spatial grid
-    var_dims = set(ds[varname].dims)
+    var_dims = set(ds[ref_varname].dims)
     if "eastward_distance" in var_dims and "northward_distance" in var_dims:
         x = ds["eastward_distance"].values.tolist()
         y = ds["northward_distance"].values.tolist()
