@@ -131,7 +131,7 @@ def get_dataset(data_type: str, era: str) -> xr.Dataset:
         path = S3_PATHS[(data_type, era)]
         fs   = s3fs.S3FileSystem(anon=False, client_kwargs={"region_name": AWS_REGION})
         store = s3fs.S3Map(root=path, s3=fs, check=False)
-        ds = xr.open_zarr(store, consolidated=True)
+        ds = xr.open_zarr(store, consolidated=False)
         print(f"Opened Zarr from S3: {path}")
     else:
         url = AOML_FILES[(data_type, era)]
