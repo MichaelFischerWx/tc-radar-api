@@ -540,7 +540,7 @@
             </div>
             <div class="usage-policy">
                 <h3>📋 Usage Policy</h3>
-                <p>Users are free to download TC-RADAR. However, we request that you notify <strong>Dr. Michael Fischer</strong> (<a href="mailto:mike.fischer@miami.edu" style="color:#667eea;">mike.fischer@miami.edu</a>) and NOAA's Hurricane Research Division radar team lead, <strong>Dr. Paul Reasor</strong> (<a href="mailto:paul.reasor@noaa.gov" style="color:#667eea;">paul.reasor@noaa.gov</a>), of the nature of your research project to ensure proper usage. Users should carefully examine data and apply additional QC consistent with their objectives.</p>
+                <p>Users are free to download TC-RADAR. However, we request that you notify <strong>Dr. Michael Fischer</strong> (<a href="/cdn-cgi/l/email-protection#aec3c7c5cb80c8c7ddcdc6cbdceec3c7cfc3c780cbcadb" style="color:#667eea;"><span class="__cf_email__" data-cfemail="660b0f0d0348000f15050e0314260b0f070b0f48030213">[email&#160;protected]</span></a>) and NOAA's Hurricane Research Division radar team lead, <strong>Dr. Paul Reasor</strong> (<a href="/cdn-cgi/l/email-protection#3d4d5c4851134f585c4e524f7d53525c5c135a524b" style="color:#667eea;"><span class="__cf_email__" data-cfemail="502031253c7e223531233f22103e3f31317e373f26">[email&#160;protected]</span></a>), of the nature of your research project to ensure proper usage. Users should carefully examine data and apply additional QC consistent with their objectives.</p>
             </div>
             <div class="citation-box">
                 <h3 style="color:#1e3a8a;margin-bottom:1rem;">How to Cite</h3>
@@ -557,7 +557,7 @@
             <div class="contact-info">
                 <p style="font-size:1.2rem;margin-bottom:1rem;"><strong>Dr. Michael Fischer</strong></p>
                 <p>TC-RADAR Developer</p>
-                <p style="margin-top:1rem;"><a href="mailto:mike.fischer@miami.edu" style="color:white;text-decoration:underline;font-size:1.1rem;">mike.fischer@miami.edu</a></p>
+                <p style="margin-top:1rem;"><a href="/cdn-cgi/l/email-protection#6a0703010f440c031909020f182a07030b0703440f0e1f" style="color:white;text-decoration:underline;font-size:1.1rem;"><span class="__cf_email__" data-cfemail="583531333d763e312b3b303d2a183531393531763d3c2d">[email&#160;protected]</span></a></p>
                 <p style="margin-top:2rem;font-size:0.9rem;opacity:0.9;">Please include details about your research project and intended use of TC-RADAR data.</p>
             </div>
         </div>
@@ -570,7 +570,7 @@
         </div>
     </footer>
 
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
 
     <script>
@@ -600,7 +600,7 @@
         function openSidePanel(caseData) {
             currentCaseIndex = caseData.case_index;
             const idx     = caseData.case_index;
-            const padded  = String(idx + 1).padStart(4, '0');
+            const padded  = String(idx).padStart(4, '0');
             const imageUrl = `https://raw.githubusercontent.com/MichaelFischerWx/michaelfischerwx.github.io/main/TC-RADAR/images/v3m/v3m_swath_cf_${padded}.png`;
             const catColor = getIntensityColor(caseData.vmax_kt);
             const category = getIntensityCategory(caseData.vmax_kt);
@@ -970,15 +970,4 @@
             document.getElementById('imageModal').style.display = 'none';
         }
         document.addEventListener('click', e => { if (e.target===document.getElementById('imageModal')) closeImageModal(); });
-        document.addEventListener('keydown', e => { if (e.key==='Escape') closeImageModal(); });
-    </script>
-
-    <div id="imageModal" class="image-modal" onclick="closeImageModal()">
-        <div class="image-modal-content" onclick="event.stopPropagation()">
-            <span class="modal-close" onclick="closeImageModal()">&times;</span>
-            <img id="modalImage" class="modal-image" alt="Full size radar analysis">
-            <div id="modalCaption" class="modal-caption"></div>
-        </div>
-    </div>
-</body>
-</html>
+       
