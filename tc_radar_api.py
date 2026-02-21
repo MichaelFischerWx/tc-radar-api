@@ -32,6 +32,7 @@ import io
 import json
 import os
 import threading
+from collections import OrderedDict
 from functools import lru_cache
 from pathlib import Path
 
@@ -175,8 +176,24 @@ def render_planview(
     # Trigger data fetch (one S3 GET in Zarr mode, HTTP range in AOML mode)
     data = da.values
 
-    x = ds["eastward_distance"].values
-    y = ds["northward_distance"].values
+    # Determine which spatial grid this variable is on:
+    #   - recentered / total_recentered vars: (northward_distance, eastward_distance) — 201×201
+    #   - original swath vars:                (latitude, longitude)                   — 200×200
+    var_dims = set(ds[varname].dims)
+    if "eastward_distance" in var_dims and "northward_distance" in var_dims:
+        x = ds["eastward_distance"].values
+        y = ds["northward_distance"].values
+    elif "latitude" in var_dims and "longitude" in var_dims:
+        # Original grid: construct storm-centered distance axes (2 km spacing)
+        nx = ds.sizes["longitude"]
+        ny = ds.sizes["latitude"]
+        x = np.linspace(-(nx - 1), (nx - 1), nx)   # e.g. -199 to +199 km
+        y = np.linspace(-(ny - 1), (ny - 1), ny)
+    else:
+        # Fallback: use first two remaining dims as index arrays
+        remaining = [d for d in da.dims if d != "num_cases" and d != "height"]
+        x = np.arange(data.shape[-1])
+        y = np.arange(data.shape[-2])
 
     fig, ax = plt.subplots(figsize=(7, 6.5), facecolor="#0e1117")
     ax.set_facecolor("#0e1117")
@@ -224,7 +241,8 @@ def render_planview(
 # ---------------------------------------------------------------------------
 METADATA_PATH = Path(os.environ.get("METADATA_PATH", "./tc_radar_metadata.json"))
 _metadata_cache: dict[int, dict] = {}
-_plot_cache: dict = {}
+_plot_cache: OrderedDict = OrderedDict()
+_PLOT_CACHE_MAX = 500  # ~500 plots × ~150 KB ≈ 75 MB max
 
 
 @app.on_event("startup")
@@ -313,6 +331,7 @@ def plot(
     # Serve from cache if available (instant)
     cache_key = (case_index, variable, round(level_km, 1), data_type)
     if cache_key in _plot_cache:
+        _plot_cache.move_to_end(cache_key)
         return Response(content=_plot_cache[cache_key], media_type="image/png",
                         headers={"X-Cache": "HIT"})
 
@@ -331,6 +350,8 @@ def plot(
         raise HTTPException(status_code=500, detail=f"Render error: {e}")
 
     _plot_cache[cache_key] = png
+    if len(_plot_cache) > _PLOT_CACHE_MAX:
+        _plot_cache.popitem(last=False)  # evict oldest entry
     return Response(content=png, media_type="image/png", headers={"X-Cache": "MISS"})
 
 
