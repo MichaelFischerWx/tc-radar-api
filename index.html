@@ -1,0 +1,984 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TC-RADAR - Tropical Cyclone Radar Database</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+    <style>
+        * { margin:0; padding:0; box-sizing:border-box; }
+        body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,Ubuntu,Cantarell,sans-serif; line-height:1.6; color:#333; }
+        .container { max-width:1200px; margin:0 auto; padding:0 20px; }
+
+        header { background:rgba(255,255,255,0.95); backdrop-filter:blur(10px); box-shadow:0 2px 20px rgba(0,0,0,0.1); position:sticky; top:0; z-index:1000; }
+        nav { display:flex; justify-content:space-between; align-items:center; padding:1rem 0; }
+        .logo { font-size:1.8rem; font-weight:bold; background:linear-gradient(135deg,#1e3a8a 0%,#3b82f6 100%); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; }
+        .nav-links { display:flex; gap:2rem; list-style:none; }
+        .nav-links a { color:#333; text-decoration:none; font-weight:500; transition:color 0.3s; }
+        .nav-links a:hover { color:#3b82f6; }
+
+        .hero { background:linear-gradient(135deg,#1e3a8a 0%,#3b82f6 100%); color:white; padding:4rem 0 3rem 0; text-align:center; }
+        .hero h1 { font-size:3.5rem; margin-bottom:1rem; text-shadow:2px 2px 4px rgba(0,0,0,0.3); }
+        .hero p { font-size:1.3rem; margin-bottom:1rem; opacity:0.95; }
+        .version-badge { display:inline-block; background:rgba(255,255,255,0.2); padding:0.5rem 1rem; border-radius:50px; font-size:0.9rem; margin-bottom:2rem; }
+        .hero-stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:2rem; margin:3rem 0 2rem 0; }
+        .stat-card { background:rgba(255,255,255,0.15); backdrop-filter:blur(10px); padding:2rem; border-radius:15px; text-align:center; }
+        .stat-number { font-size:2.5rem; font-weight:bold; display:block; }
+        .stat-label { font-size:0.9rem; opacity:0.9; }
+
+        section { padding:4rem 0; }
+        section:nth-child(even) { background:#f8f9fa; }
+        h2 { font-size:2.5rem; margin-bottom:2rem; color:#1e3a8a; text-align:center; }
+
+        /* Map section */
+        #map-section { background:white; padding:0; }
+        #map-header { background:linear-gradient(135deg,#1e3a8a 0%,#3b82f6 100%); color:white; padding:20px 30px; }
+        #map-header h2 { color:white; font-size:28px; font-weight:600; margin-bottom:8px; text-align:left; }
+        #map-header p { font-size:14px; opacity:0.9; }
+        #map-stats { background:white; padding:15px 30px; border-bottom:1px solid #e5e7eb; display:flex; gap:40px; flex-wrap:wrap; }
+        .map-stat-item { display:flex; flex-direction:column; }
+        .map-stat-label { font-size:12px; color:#6b7280; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:4px; }
+        .map-stat-value { font-size:20px; font-weight:600; color:#1f2937; }
+
+        /* Map + side panel wrapper */
+        #map-wrapper {
+            position: relative;
+            height: 600px;
+            display: flex;
+        }
+
+        #map-container {
+            position: relative;
+            flex: 1;
+            min-width: 0;
+            transition: flex 0.35s ease;
+        }
+
+        #map {
+            height: 100%;
+            width: 100%;
+        }
+
+        /* Side panel */
+        #side-panel {
+            width: 0;
+            overflow: hidden;
+            background: #fff;
+            border-left: none;
+            transition: width 0.35s ease, border 0.35s ease;
+            display: flex;
+            flex-direction: column;
+            position: relative;
+            z-index: 500;
+        }
+
+        #side-panel.open {
+            width: 380px;
+            border-left: 2px solid #e5e7eb;
+        }
+
+        #side-panel-inner {
+            width: 380px;
+            height: 100%;
+            overflow-y: auto;
+            overflow-x: hidden;
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+        }
+
+        #side-panel-close {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: #f3f4f6;
+            border: none;
+            border-radius: 50%;
+            width: 28px;
+            height: 28px;
+            font-size: 16px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #6b7280;
+            z-index: 10;
+            line-height: 1;
+        }
+
+        #side-panel-close:hover { background: #e5e7eb; color: #1f2937; }
+
+        .panel-storm-name {
+            font-size: 17px;
+            font-weight: 700;
+            color: #1f2937;
+            padding-right: 32px;
+            margin-bottom: 2px;
+        }
+
+        .panel-mission {
+            font-size: 11px;
+            color: #9ca3af;
+            font-family: monospace;
+            margin-bottom: 12px;
+        }
+
+        /* Pre-rendered image */
+        .panel-image-wrap {
+            width: 100%;
+            margin-bottom: 14px;
+            border-radius: 8px;
+            overflow: hidden;
+            background: #0e1117;
+            cursor: pointer;
+        }
+
+        .panel-image-wrap img {
+            width: 100%;
+            height: auto;
+            display: block;
+            transition: opacity 0.2s;
+        }
+
+        .panel-image-wrap img:hover { opacity: 0.9; }
+
+        .panel-image-label {
+            font-size: 11px;
+            color: #9ca3af;
+            text-align: center;
+            margin-bottom: 14px;
+            margin-top: -8px;
+        }
+
+        /* Explorer */
+        .explorer-divider {
+            border: none;
+            border-top: 2px dashed #e5e7eb;
+            margin-bottom: 14px;
+        }
+
+        .explorer-title {
+            font-size: 12px;
+            font-weight: 700;
+            color: #1e3a8a;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 12px;
+        }
+
+        .explorer-row {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+            margin-bottom: 10px;
+        }
+
+        .explorer-row label {
+            font-size: 11px;
+            font-weight: 600;
+            color: #6b7280;
+            text-transform: uppercase;
+            letter-spacing: 0.4px;
+        }
+
+        .explorer-select {
+            width: 100%;
+            padding: 7px 10px;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            font-size: 13px;
+            background: white;
+            color: #1f2937;
+        }
+
+        .explorer-select:focus { outline: none; border-color: #3b82f6; }
+
+        .explorer-level-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .explorer-level-row input[type="range"] {
+            flex: 1;
+            -webkit-appearance: none;
+            appearance: none;
+            height: 6px;
+            background: #e5e7eb;
+            border-radius: 3px;
+            position: static;
+            pointer-events: auto;
+            transform: none;
+            top: auto;
+            width: auto;
+        }
+
+        .explorer-level-row input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 18px; height: 18px;
+            background: #3b82f6;
+            border-radius: 50%;
+            cursor: pointer;
+            box-shadow: 0 0 0 2px white, 0 2px 6px rgba(0,0,0,0.3);
+            margin-top: -6px;
+        }
+
+        .explorer-level-value {
+            font-size: 13px;
+            font-weight: 700;
+            color: #1e3a8a;
+            min-width: 48px;
+            text-align: right;
+        }
+
+        .generate-btn {
+            width: 100%;
+            padding: 9px 0;
+            background: linear-gradient(135deg,#1e3a8a 0%,#3b82f6 100%);
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: opacity 0.2s;
+            margin-top: 4px;
+        }
+
+        .generate-btn:hover { opacity: 0.9; }
+        .generate-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
+        .explorer-result { margin-top: 12px; text-align: center; }
+
+        .explorer-result img {
+            width: 100%;
+            border-radius: 6px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+            cursor: pointer;
+        }
+
+        .explorer-status { font-size: 12px; color: #6b7280; padding: 8px 0; }
+        .explorer-status.loading { color: #3b82f6; }
+        .explorer-status.error   { color: #ef4444; }
+
+        .explorer-view-link {
+            display: inline-block;
+            margin-top: 6px;
+            color: #3b82f6;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        .explorer-view-link:hover { text-decoration: underline; }
+
+        /* Compact popup (metadata only) */
+        .leaflet-popup-content-wrapper { border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
+        .leaflet-popup-content { margin: 14px; font-size: 13px; min-width: 240px; max-width: 300px; }
+        .leaflet-popup { margin-bottom: 20px; }
+
+        .popup-header { border-bottom: 2px solid #3b82f6; padding-bottom: 8px; margin-bottom: 10px; }
+        .popup-storm-name { font-size: 16px; font-weight: 600; color: #1f2937; margin-bottom: 2px; }
+        .popup-mission { font-size: 11px; color: #6b7280; font-family: monospace; }
+        .popup-row { display:flex; justify-content:space-between; padding:5px 0; border-bottom:1px solid #f3f4f6; }
+        .popup-row:last-child { border-bottom:none; }
+        .popup-label { color:#6b7280; font-weight:500; }
+        .popup-value { color:#1f2937; font-weight:600; }
+        .intensity-badge { display:inline-block; padding:3px 8px; border-radius:10px; font-size:11px; font-weight:600; color:white; }
+
+        .popup-explore-btn {
+            display: block;
+            width: 100%;
+            margin-top: 12px;
+            padding: 8px 0;
+            background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%);
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 700;
+            cursor: pointer;
+            text-align: center;
+            transition: opacity 0.2s;
+        }
+
+        .popup-explore-btn:hover { opacity: 0.9; }
+
+        /* Filter panel */
+        #filter-panel { background:white; padding:20px 30px; border-bottom:2px solid #e5e7eb; }
+        .filter-controls { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:20px; margin-bottom:15px; }
+        .filter-actions { display:flex; gap:20px; align-items:center; justify-content:center; margin-top:15px; padding-top:15px; border-top:1px solid #e5e7eb; }
+        .filter-group { display:flex; flex-direction:column; gap:8px; }
+        .filter-group label { font-size:13px; font-weight:600; color:#4b5563; text-transform:uppercase; letter-spacing:0.5px; }
+        .filter-group select, .filter-group input { padding:8px 12px; border:1px solid #d1d5db; border-radius:6px; font-size:14px; background:white; transition:border-color 0.2s; }
+        .filter-group select:focus, .filter-group input:focus { outline:none; border-color:#3b82f6; }
+        .filter-group select { min-width:200px; }
+        .slider-container { display:flex; flex-direction:column; gap:8px; min-width:280px; }
+        .slider-values { display:flex; justify-content:space-between; font-size:13px; color:#6b7280; font-weight:600; }
+        .slider-wrapper { position:relative; height:40px; display:flex; align-items:center; }
+        .slider-track { position:absolute; width:100%; height:6px; background:#e5e7eb; border-radius:3px; top:50%; transform:translateY(-50%); }
+        .slider-range { position:absolute; height:6px; background:linear-gradient(90deg,#3b82f6,#1e3a8a); border-radius:3px; top:50%; transform:translateY(-50%); }
+        input[type="range"] { position:absolute; width:100%; height:6px; background:transparent; pointer-events:none; -webkit-appearance:none; appearance:none; margin:0; padding:0; top:50%; transform:translateY(-50%); }
+        input[type="range"]::-webkit-slider-thumb { -webkit-appearance:none; width:18px; height:18px; background:#3b82f6; border:none; border-radius:50%; cursor:pointer; pointer-events:auto; box-shadow:0 0 0 2px white,0 2px 6px rgba(0,0,0,0.3); margin-top:-6px; }
+        input[type="range"]::-moz-range-thumb { width:18px; height:18px; background:#3b82f6; border:none; border-radius:50%; cursor:pointer; pointer-events:auto; box-shadow:0 0 0 2px white,0 2px 6px rgba(0,0,0,0.3); }
+        input[type="range"]::-webkit-slider-runnable-track { height:6px; background:transparent; border-radius:3px; }
+        input[type="range"]::-moz-range-track { height:6px; background:transparent; border-radius:3px; }
+        .reset-btn { padding:10px 24px; background:#f3f4f6; border:1px solid #d1d5db; border-radius:6px; font-size:14px; font-weight:600; color:#4b5563; cursor:pointer; transition:all 0.2s; }
+        .reset-btn:hover { background:#e5e7eb; border-color:#9ca3af; }
+        .filtered-count { align-self:center; padding:10px 20px; background:#eff6ff; border-radius:6px; font-size:14px; font-weight:600; color:#1e40af; }
+
+        #loading { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); background:white; padding:30px 40px; border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,0.15); z-index:1000; text-align:center; }
+        .spinner { border:4px solid #f3f4f6; border-top:4px solid #3b82f6; border-radius:50%; width:40px; height:40px; animation:spin 1s linear infinite; margin:0 auto 15px; }
+        @keyframes spin { 0%{transform:rotate(0deg)} 100%{transform:rotate(360deg)} }
+
+        .intensity-legend { background:white; padding:15px; border-radius:8px; box-shadow:0 2px 8px rgba(0,0,0,0.15); font-size:13px; line-height:1.6; }
+        .intensity-legend h4 { margin:0 0 10px 0; font-size:14px; font-weight:600; color:#1f2937; }
+        .legend-item { display:flex; align-items:center; margin:5px 0; }
+        .legend-color { width:20px; height:20px; border-radius:50%; margin-right:10px; border:2px solid rgba(0,0,0,0.2); }
+        .custom-marker { border-radius:50%; border:2px solid rgba(0,0,0,0.3); cursor:pointer; }
+
+        .features { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:2rem; margin-top:3rem; }
+        .feature-card { padding:2rem; border-radius:15px; background:white; box-shadow:0 4px 6px rgba(0,0,0,0.1); transition:transform 0.3s,box-shadow 0.3s; }
+        .feature-card:hover { transform:translateY(-5px); box-shadow:0 8px 15px rgba(30,58,138,0.2); }
+        .feature-icon { font-size:3rem; margin-bottom:1rem; }
+        .feature-card h3 { color:#1e3a8a; margin-bottom:1rem; }
+        .data-files { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:1.5rem; margin-top:2rem; }
+        .file-card { background:linear-gradient(135deg,#1e3a8a 0%,#3b82f6 100%); color:white; padding:2rem; border-radius:15px; text-align:center; }
+        .file-size { font-size:2rem; font-weight:bold; margin:1rem 0; }
+        .download-btn { background:white; color:#1e3a8a; padding:1rem 2rem; border:none; border-radius:50px; font-size:1rem; font-weight:bold; cursor:pointer; transition:all 0.3s; text-decoration:none; display:inline-block; margin-top:1rem; }
+        .download-btn:hover { transform:scale(1.05); box-shadow:0 5px 15px rgba(0,0,0,0.2); }
+        .usage-policy { max-width:800px; margin:3rem auto; padding:2rem; background:#fff3cd; border-radius:10px; border-left:4px solid #ffc107; }
+        .usage-policy h3 { color:#856404; margin-bottom:1rem; }
+        .usage-policy p { color:#856404; }
+        .citation-box { background:#f8f9fa; padding:2rem; border-radius:10px; border-left:4px solid #1e3a8a; margin:2rem 0; font-family:'Courier New',monospace; font-size:0.9rem; }
+        .contact-section { background:linear-gradient(135deg,#1e3a8a 0%,#3b82f6 100%); color:white; text-align:center; }
+        .contact-section h2 { color:white; }
+        .contact-info { max-width:600px; margin:2rem auto; background:rgba(255,255,255,0.1); padding:2rem; border-radius:15px; backdrop-filter:blur(10px); }
+        footer { background:#1f2937; color:white; text-align:center; padding:2rem 0; }
+        footer a { color:#60a5fa; text-decoration:none; }
+        footer a:hover { text-decoration:underline; }
+
+        /* Image modal */
+        .image-modal { display:none; position:fixed; z-index:10000; left:0; top:0; width:100%; height:100%; background-color:rgba(0,0,0,0.9); overflow:auto; }
+        .image-modal-content { position:relative; margin:2% auto; padding:0; width:90%; max-width:1200px; }
+        .modal-image { width:100%; height:auto; border-radius:4px; }
+        .modal-close { position:absolute; top:15px; right:35px; color:#f1f1f1; font-size:40px; font-weight:bold; cursor:pointer; transition:0.3s; z-index:10001; }
+        .modal-close:hover { color:#bbb; }
+        .modal-caption { text-align:center; color:#ccc; padding:10px 0; font-size:14px; }
+
+        @media (max-width:768px) {
+            .hero h1 { font-size:2rem; }
+            .nav-links { flex-direction:column; gap:1rem; }
+            #map-wrapper { height:auto; flex-direction:column; }
+            #map-container { height:400px; }
+            #side-panel.open { width:100%; border-left:none; border-top:2px solid #e5e7eb; height:500px; }
+            #side-panel-inner { width:100%; }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <nav class="container">
+            <div class="logo">TC-RADAR</div>
+            <ul class="nav-links">
+                <li><a href="#about">About</a></li>
+                <li><a href="#map-section">Interactive Map</a></li>
+                <li><a href="#features">Features</a></li>
+                <li><a href="#download">Download</a></li>
+                <li><a href="#contact">Contact</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <div class="hero">
+        <div class="container">
+            <div class="version-badge">Current Version: v3m (August 2025)</div>
+            <h1>TC-RADAR</h1>
+            <p>Tropical Cyclone Radar Archive of Doppler Analyses with Recentering</p>
+            <p style="font-size:1.1rem;opacity:0.9;">A comprehensive database of airborne radar observations from NOAA's Hurricane Research Division</p>
+            <div class="hero-stats">
+                <div class="stat-card"><span class="stat-number">1,510</span><span class="stat-label">TDR Swath Analyses</span></div>
+                <div class="stat-card"><span class="stat-number">436</span><span class="stat-label">Merged Analyses</span></div>
+                <div class="stat-card"><span class="stat-number">1997-2024</span><span class="stat-label">Data Coverage</span></div>
+                <div class="stat-card"><span class="stat-number">~40 GB</span><span class="stat-label">Total Database Size</span></div>
+            </div>
+        </div>
+    </div>
+
+    <section id="about">
+        <div class="container">
+            <h2>About TC-RADAR</h2>
+            <p style="text-align:center;max-width:800px;margin:0 auto;font-size:1.1rem;line-height:1.8;">
+                TC-RADAR provides a homogeneous platform of post-processed airborne Doppler radar analyses of tropical cyclones.
+                Developed by Dr. Michael Fischer (University of Miami) in collaboration with NOAA's Hurricane Research Division,
+                this database enables researchers to conduct storm-to-storm comparisons and climatological analyses of TC vortex
+                and convective characteristics across all stages of the tropical cyclone lifecycle.
+            </p>
+            <div class="features">
+                <div class="feature-card"><div class="feature-icon">🌀</div><h3>Storm-Centered Grids</h3><p>All analyses use a weighted circulation maximization (WCM) method for precise TC center identification, enabling accurate vortex-relative analyses.</p></div>
+                <div class="feature-card"><div class="feature-icon">📊</div><h3>Rich Metadata</h3><p>Includes best-track information and environmental diagnostics from the operational SHIPS model for comprehensive storm context.</p></div>
+                <div class="feature-card"><div class="feature-icon">🎯</div><h3>High Resolution</h3><p>2.0 km horizontal grid spacing, 0.5 km vertical grid spacing, spanning 0–18 km in height for detailed 3D structure analysis.</p></div>
+            </div>
+        </div>
+    </section>
+
+    <section id="map-section">
+        <div id="map-header">
+            <div class="container">
+                <h2>🗺️ Interactive Database Coverage Map</h2>
+                <p>Explore all 1,510 TC-RADAR analyses. Click any marker to see storm details.</p>
+            </div>
+        </div>
+
+        <div id="map-stats">
+            <div class="container" style="display:flex;gap:40px;flex-wrap:wrap;">
+                <div class="map-stat-item"><span class="map-stat-label">Total Analyses</span><span class="map-stat-value" id="total-cases">-</span></div>
+                <div class="map-stat-item"><span class="map-stat-label">Unique Storms</span><span class="map-stat-value" id="unique-storms">-</span></div>
+                <div class="map-stat-item"><span class="map-stat-label">Year Range</span><span class="map-stat-value" id="year-range">-</span></div>
+                <div class="map-stat-item"><span class="map-stat-label">Intensity Range</span><span class="map-stat-value" id="intensity-range">-</span></div>
+            </div>
+        </div>
+
+        <div id="filter-panel">
+            <div class="container">
+                <div class="filter-controls">
+                    <div class="filter-group slider-container">
+                        <label>Intensity Range (kt)</label>
+                        <div class="slider-values"><span id="min-intensity-value">0</span><span id="max-intensity-value">200</span></div>
+                        <div class="slider-wrapper">
+                            <div class="slider-track"></div><div class="slider-range" id="intensity-range-fill"></div>
+                            <input type="range" id="min-intensity" min="0" max="200" value="0" step="5">
+                            <input type="range" id="max-intensity" min="0" max="200" value="200" step="5">
+                        </div>
+                    </div>
+                    <div class="filter-group slider-container">
+                        <label>24-h Intensity Change (kt)</label>
+                        <div class="slider-values"><span id="min-vmax-change-value">-100</span><span id="max-vmax-change-value">85</span></div>
+                        <div class="slider-wrapper">
+                            <div class="slider-track"></div><div class="slider-range" id="vmax-change-range-fill"></div>
+                            <input type="range" id="min-vmax-change" min="-100" max="85" value="-100" step="5">
+                            <input type="range" id="max-vmax-change" min="-100" max="85" value="85" step="5">
+                        </div>
+                    </div>
+                    <div class="filter-group slider-container">
+                        <label>Tilt Magnitude (km)</label>
+                        <div class="slider-values"><span id="min-tilt-value">0</span><span id="max-tilt-value">200</span></div>
+                        <div class="slider-wrapper">
+                            <div class="slider-track"></div><div class="slider-range" id="tilt-range-fill"></div>
+                            <input type="range" id="min-tilt" min="0" max="200" value="0" step="5">
+                            <input type="range" id="max-tilt" min="0" max="200" value="200" step="5">
+                        </div>
+                    </div>
+                    <div class="filter-group">
+                        <label>Year Range</label>
+                        <div style="display:flex;gap:10px;align-items:center;">
+                            <input type="number" id="min-year" min="1997" max="2024" value="1997" style="width:80px;">
+                            <span>to</span>
+                            <input type="number" id="max-year" min="1997" max="2024" value="2024" style="width:80px;">
+                        </div>
+                    </div>
+                    <div class="filter-group">
+                        <label>Storm Name</label>
+                        <select id="storm-filter"><option value="all">All Storms</option></select>
+                    </div>
+                </div>
+                <div class="filter-actions">
+                    <button class="reset-btn" onclick="resetFilters()">Reset All Filters</button>
+                    <div class="filtered-count">Showing: <span id="filtered-count">0</span> of <span id="total-count">0</span> cases</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Map + side panel -->
+        <div id="map-wrapper">
+            <div id="map-container">
+                <div id="loading"><div class="spinner"></div><div>Loading TC-RADAR data...</div></div>
+                <div id="map"></div>
+            </div>
+
+            <div id="side-panel">
+                <div id="side-panel-inner">
+                    <button id="side-panel-close" onclick="closeSidePanel()">✕</button>
+                    <!-- Content injected by JS -->
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id="features" style="background:#f8f9fa;">
+        <div class="container">
+            <h2>Database Features</h2>
+            <div style="max-width:800px;margin:0 auto;">
+                <h3 style="color:#1e3a8a;margin-top:2rem;">Available Variables</h3>
+                <ul style="column-count:2;column-gap:3rem;margin:1rem 0;line-height:2;">
+                    <li>Eastward &amp; Northward Velocity</li><li>Vertical Velocity</li>
+                    <li>Radar Reflectivity</li><li>Wind Speed</li>
+                    <li>Tangential &amp; Radial Velocity</li><li>Relative Vorticity</li>
+                    <li>Divergence</li><li>Vortex Tilt Profiles</li><li>Radius of Maximum Wind</li>
+                </ul>
+                <h3 style="color:#1e3a8a;margin-top:3rem;">Reference Frameworks</h3>
+                <div class="features" style="margin-top:1.5rem;">
+                    <div class="feature-card"><h4>Real-time Center Fix</h4><p>Based on operational center position during the mission</p></div>
+                    <div class="feature-card"><h4>2-km Recentered</h4><p>Using WCM method at 2 km reference height</p></div>
+                    <div class="feature-card"><h4>Vortex Tilt-Relative</h4><p>Recentered at every vertical level for tilt analysis</p></div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id="download">
+        <div class="container">
+            <h2>Download Database Files</h2>
+            <p style="text-align:center;max-width:800px;margin:0 auto 3rem auto;font-size:1.1rem;">TC-RADAR consists of four netCDF files, grouped by data type and time period. Each file is approximately 10 GB.</p>
+            <div class="data-files">
+                <div class="file-card"><h3>Swath Data</h3><p>1997-2019</p><div class="file-size">~10 GB</div><a href="https://www.aoml.noaa.gov/ftp/pub/hrd/data/radar/level3/v3m_1997_2019_xy_rel_swath_ships.nc" class="download-btn" target="_blank">Download</a></div>
+                <div class="file-card"><h3>Swath Data</h3><p>2020-2024</p><div class="file-size">~10 GB</div><a href="https://www.aoml.noaa.gov/ftp/pub/hrd/data/radar/level3/v3m_2020_2024_xy_rel_swath_ships.nc" class="download-btn" target="_blank">Download</a></div>
+                <div class="file-card"><h3>Merged Data</h3><p>1997-2019</p><div class="file-size">~10 GB</div><a href="https://www.aoml.noaa.gov/ftp/pub/hrd/data/radar/level3/v3m_1997_2019_xy_rel_merged_ships.nc" class="download-btn" target="_blank">Download</a></div>
+                <div class="file-card"><h3>Merged Data</h3><p>2020-2024</p><div class="file-size">~10 GB</div><a href="https://www.aoml.noaa.gov/ftp/pub/hrd/data/radar/level3/v3m_2020_2024_xy_rel_merged_ships.nc" class="download-btn" target="_blank">Download</a></div>
+            </div>
+            <div class="usage-policy">
+                <h3>📋 Usage Policy</h3>
+                <p>Users are free to download TC-RADAR. However, we request that you notify <strong>Dr. Michael Fischer</strong> (<a href="mailto:mike.fischer@miami.edu" style="color:#667eea;">mike.fischer@miami.edu</a>) and NOAA's Hurricane Research Division radar team lead, <strong>Dr. Paul Reasor</strong> (<a href="mailto:paul.reasor@noaa.gov" style="color:#667eea;">paul.reasor@noaa.gov</a>), of the nature of your research project to ensure proper usage. Users should carefully examine data and apply additional QC consistent with their objectives.</p>
+            </div>
+            <div class="citation-box">
+                <h3 style="color:#1e3a8a;margin-bottom:1rem;">How to Cite</h3>
+                <p style="margin-bottom:1rem;">Fischer, M. S., R. F. Rogers, P. D. Reasor, and J. F. Gamache, 2022: An analysis of tropical cyclone vortex and convective characteristics in relation to storm intensity using a novel airborne Doppler radar database. Mon. Wea. Rev., 150, 2255–2278, https://doi.org/10.1175/MWR-D-21-0223.1.</p>
+                <p style="margin-top:1.5rem;padding-top:1rem;border-top:1px solid #dee2e6;"><strong>For vortex tilt analyses, also cite:</strong><br>Fischer, M. S., P. D. Reasor, J. P. Dunion, and R. F. Rogers, 2024: An Observational Analysis of the Relationship between Tropical Cyclone Vortex Tilt, Precipitation Structure, and Intensity Change. Mon. Wea. Rev., 152, 203–225, https://doi.org/10.1175/MWR-D-23-0089.1.</p>
+            </div>
+        </div>
+    </section>
+
+    <section class="contact-section" id="contact">
+        <div class="container">
+            <h2>Get in Touch</h2>
+            <p style="font-size:1.2rem;margin-bottom:2rem;">Questions about TC-RADAR? Contact the developer.</p>
+            <div class="contact-info">
+                <p style="font-size:1.2rem;margin-bottom:1rem;"><strong>Dr. Michael Fischer</strong></p>
+                <p>TC-RADAR Developer</p>
+                <p style="margin-top:1rem;"><a href="mailto:mike.fischer@miami.edu" style="color:white;text-decoration:underline;font-size:1.1rem;">mike.fischer@miami.edu</a></p>
+                <p style="margin-top:2rem;font-size:0.9rem;opacity:0.9;">Please include details about your research project and intended use of TC-RADAR data.</p>
+            </div>
+        </div>
+    </section>
+
+    <footer>
+        <div class="container">
+            <p>Created by Michael S. Fischer | University of Miami</p>
+            <p style="margin-top:0.5rem;opacity:0.8;"><a href="https://www.aoml.noaa.gov/ftp/pub/hrd/data/radar/level3/TC_RADAR_README.pdf" target="_blank">Full Documentation (README)</a></p>
+        </div>
+    </footer>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+
+    <script>
+        const API_BASE = 'https://tc-radar-api.onrender.com';
+
+        let allData = null;
+        let markers = null;
+        let allMarkers = [];
+        let currentCaseIndex = null;
+
+        const filters = {
+            minIntensity:0, maxIntensity:200,
+            minVmaxChange:-100, maxVmaxChange:85,
+            minTilt:0, maxTilt:200,
+            minYear:1997, maxYear:2024,
+            stormName:'all'
+        };
+
+        const map = L.map('map', { center:[20,-60], zoom:4, zoomControl:true, tap:true, tapTolerance:15 });
+
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+            maxZoom:18
+        }).addTo(map);
+
+        // ── Side panel ───────────────────────────────────────────────
+        function openSidePanel(caseData) {
+            currentCaseIndex = caseData.case_index;
+            const idx     = caseData.case_index;
+            const padded  = String(idx + 1).padStart(4, '0');
+            const imageUrl = `https://raw.githubusercontent.com/MichaelFischerWx/michaelfischerwx.github.io/main/TC-RADAR/images/v3m/v3m_swath_cf_${padded}.png`;
+            const catColor = getIntensityColor(caseData.vmax_kt);
+            const category = getIntensityCategory(caseData.vmax_kt);
+
+            document.getElementById('side-panel-inner').innerHTML = `
+                <button id="side-panel-close" onclick="closeSidePanel()">✕</button>
+
+                <div class="panel-storm-name">${caseData.storm_name}</div>
+                <div class="panel-mission">${caseData.mission_id} &nbsp;·&nbsp; ${caseData.datetime}</div>
+
+                <div class="panel-image-wrap" onclick="openImageModal('${imageUrl}','${caseData.storm_name} – ${caseData.datetime}')">
+                    <img src="${imageUrl}" alt="Quick-look: ${caseData.storm_name}"
+                         onerror="this.parentElement.style.display='none'">
+                </div>
+                <div class="panel-image-label">Quick-look (2-km V<sub>t</sub>, WCM) · click to enlarge</div>
+
+                <hr class="explorer-divider">
+                <div class="explorer-title">🔬 Explore Data</div>
+
+                <div class="explorer-row">
+                    <label>Variable</label>
+                    <select class="explorer-select" id="ep-var">
+                        <optgroup label="WCM Recentered (2 km)">
+                            <option value="recentered_tangential_wind">Tangential Wind</option>
+                            <option value="recentered_radial_wind">Radial Wind</option>
+                            <option value="recentered_upward_air_velocity">Vertical Velocity</option>
+                            <option value="recentered_reflectivity">Reflectivity</option>
+                            <option value="recentered_wind_speed">Wind Speed</option>
+                            <option value="recentered_relative_vorticity">Relative Vorticity</option>
+                            <option value="recentered_divergence">Divergence</option>
+                        </optgroup>
+                        <optgroup label="Tilt-Relative">
+                            <option value="total_recentered_tangential_wind">Tangential Wind</option>
+                            <option value="total_recentered_radial_wind">Radial Wind</option>
+                            <option value="total_recentered_upward_air_velocity">Vertical Velocity</option>
+                            <option value="total_recentered_reflectivity">Reflectivity</option>
+                            <option value="total_recentered_wind_speed">Wind Speed</option>
+                        </optgroup>
+                        <optgroup label="Original Swath">
+                            <option value="swath_tangential_wind">Tangential Wind</option>
+                            <option value="swath_radial_wind">Radial Wind</option>
+                            <option value="swath_reflectivity">Reflectivity</option>
+                            <option value="swath_wind_speed">Wind Speed</option>
+                        </optgroup>
+                    </select>
+                </div>
+
+                <div class="explorer-row">
+                    <label>Height Level</label>
+                    <div class="explorer-level-row">
+                        <input type="range" id="ep-level" min="0" max="18" step="0.5" value="2"
+                               oninput="document.getElementById('ep-level-val').textContent = parseFloat(this.value).toFixed(1)+' km'">
+                        <span class="explorer-level-value" id="ep-level-val">2.0 km</span>
+                    </div>
+                </div>
+
+                <button class="generate-btn" id="ep-btn" onclick="generateCustomPlot()">Generate Plot</button>
+                <div class="explorer-result" id="ep-result"></div>
+            `;
+
+            document.getElementById('side-panel').classList.add('open');
+            setTimeout(() => map.invalidateSize(), 360);
+        }
+
+        function closeSidePanel() {
+            document.getElementById('side-panel').classList.remove('open');
+            currentCaseIndex = null;
+            setTimeout(() => map.invalidateSize(), 360);
+        }
+
+        function generateCustomPlot() {
+            if (currentCaseIndex === null) return;
+            const variable  = document.getElementById('ep-var').value;
+            const level_km  = document.getElementById('ep-level').value;
+            const resultDiv = document.getElementById('ep-result');
+            const btn       = document.getElementById('ep-btn');
+
+            btn.disabled = true;
+            btn.textContent = 'Generating…';
+            resultDiv.innerHTML = `<div class="explorer-status loading">⏳ Fetching from AOML & rendering… (may take ~30s if service is waking up)</div>`;
+
+            fetch(`${API_BASE}/plot?case_index=${currentCaseIndex}&variable=${variable}&level_km=${level_km}&data_type=swath`)
+                .then(r => {
+                    if (!r.ok) return r.json().then(e => { throw new Error(e.detail || `HTTP ${r.status}`); });
+                    return r.blob();
+                })
+                .then(blob => {
+                    const imgUrl  = URL.createObjectURL(blob);
+                    const sel     = document.getElementById('ep-var');
+                    const varLbl  = sel.options[sel.selectedIndex].text;
+                    const caption = `${varLbl} @ ${parseFloat(level_km).toFixed(1)} km`;
+                    resultDiv.innerHTML = `
+                        <img src="${imgUrl}" alt="${caption}"
+                             onclick="openImageModal('${imgUrl}','${caption}')"
+                             title="Click to enlarge">
+                        <br><a class="explorer-view-link" onclick="openImageModal('${imgUrl}','${caption}')">Click to enlarge →</a>
+                    `;
+                })
+                .catch(err => {
+                    resultDiv.innerHTML = `<div class="explorer-status error">⚠️ ${err.message}</div>`;
+                })
+                .finally(() => {
+                    btn.disabled = false;
+                    btn.textContent = 'Generate Plot';
+                });
+        }
+
+        // ── Intensity helpers ────────────────────────────────────────
+        function getIntensityColor(vmax) {
+            if (!vmax) return '#9ca3af';
+            if (vmax < 34)  return '#3b82f6';
+            if (vmax < 64)  return '#10b981';
+            if (vmax < 83)  return '#fbbf24';
+            if (vmax < 96)  return '#f97316';
+            if (vmax < 113) return '#ef4444';
+            if (vmax < 137) return '#dc2626';
+            return '#7f1d1d';
+        }
+
+        function getIntensityCategory(vmax) {
+            if (!vmax) return 'Unknown';
+            if (vmax < 34)  return 'TD';
+            if (vmax < 64)  return 'TS';
+            if (vmax < 83)  return 'Cat 1';
+            if (vmax < 96)  return 'Cat 2';
+            if (vmax < 113) return 'Cat 3';
+            if (vmax < 137) return 'Cat 4';
+            return 'Cat 5';
+        }
+
+        // ── Compact popup (metadata only) ────────────────────────────
+        function createPopupContent(caseData) {
+            const intensity  = caseData.vmax_kt !== null ? `${caseData.vmax_kt} kt` : 'N/A';
+            const pressure   = caseData.min_pressure_hpa !== null ? `${caseData.min_pressure_hpa} hPa` : 'N/A';
+            const rmw        = caseData.rmw_km !== null ? `${caseData.rmw_km} km` : 'N/A';
+            const vmaxChange = caseData['24-h_vmax_change_kt'] !== null
+                ? `${caseData['24-h_vmax_change_kt'] > 0 ? '+' : ''}${caseData['24-h_vmax_change_kt']} kt` : 'N/A';
+            const tiltMag    = caseData.tilt_magnitude_km !== null ? `${caseData.tilt_magnitude_km.toFixed(1)} km` : 'N/A';
+            const category   = getIntensityCategory(caseData.vmax_kt);
+            const catColor   = getIntensityColor(caseData.vmax_kt);
+            const idx        = caseData.case_index;
+
+            return `
+                <div class="popup-header">
+                    <div class="popup-storm-name">${caseData.storm_name}</div>
+                    <div class="popup-mission">${caseData.mission_id}</div>
+                </div>
+                <div class="popup-row"><span class="popup-label">Date/Time:</span><span class="popup-value">${caseData.datetime}</span></div>
+                <div class="popup-row">
+                    <span class="popup-label">Intensity:</span>
+                    <span class="popup-value"><span class="intensity-badge" style="background:${catColor}">${category}</span> ${intensity}</span>
+                </div>
+                <div class="popup-row"><span class="popup-label">24-h Change:</span><span class="popup-value">${vmaxChange}</span></div>
+                <div class="popup-row"><span class="popup-label">Min Pressure:</span><span class="popup-value">${pressure}</span></div>
+                <div class="popup-row"><span class="popup-label">RMW:</span><span class="popup-value">${rmw}</span></div>
+                <div class="popup-row"><span class="popup-label">Tilt Magnitude:</span><span class="popup-value">${tiltMag}</span></div>
+                <div class="popup-row"><span class="popup-label">Location:</span><span class="popup-value">${caseData.latitude.toFixed(2)}°N, ${Math.abs(caseData.longitude).toFixed(2)}°W</span></div>
+                <button class="popup-explore-btn" onclick="openSidePanelById(${idx})">🔬 View Radar & Explore Data →</button>
+            `;
+        }
+
+        // ── Open side panel from popup button ───────────────────────
+        function openSidePanelById(idx) {
+            if (!allData) return;
+            const caseData = allData.cases.find(c => c.case_index === idx);
+            if (caseData) openSidePanel(caseData);
+        }
+
+        // ── Filters ──────────────────────────────────────────────────
+        function passesFilters(c) {
+            const vmax = c.vmax_kt || 0;
+            if (vmax < filters.minIntensity || vmax > filters.maxIntensity) return false;
+            if (filters.minVmaxChange !== -100 || filters.maxVmaxChange !== 85) {
+                if (c['24-h_vmax_change_kt'] === null) return false;
+                const vc = c['24-h_vmax_change_kt'];
+                if (vc < filters.minVmaxChange || vc > filters.maxVmaxChange) return false;
+            }
+            if (filters.minTilt !== 0 || filters.maxTilt !== 200) {
+                if (c.tilt_magnitude_km === null) return false;
+                if (c.tilt_magnitude_km < filters.minTilt || c.tilt_magnitude_km > filters.maxTilt) return false;
+            }
+            if (c.year < filters.minYear || c.year > filters.maxYear) return false;
+            if (filters.stormName !== 'all' && c.storm_name !== filters.stormName) return false;
+            return true;
+        }
+
+        function updateMarkers() {
+            if (!markers || !allData) return;
+            markers.clearLayers();
+            let n = 0;
+            allData.cases.forEach(c => {
+                if (passesFilters(c)) {
+                    const m = allMarkers.find(m => m.caseIndex === c.case_index);
+                    if (m) { markers.addLayer(m.marker); n++; }
+                }
+            });
+            document.getElementById('filtered-count').textContent = n;
+        }
+
+        function updateIntensitySlider() {
+            let min = parseInt(document.getElementById('min-intensity').value);
+            let max = parseInt(document.getElementById('max-intensity').value);
+            if (min > max) { document.getElementById('min-intensity').value = max; min = max; }
+            filters.minIntensity = min; filters.maxIntensity = max;
+            document.getElementById('min-intensity-value').textContent = min+' kt';
+            document.getElementById('max-intensity-value').textContent = max+' kt';
+            const rf = document.getElementById('intensity-range-fill');
+            rf.style.left = (min/200*100)+'%'; rf.style.width = ((max-min)/200*100)+'%';
+            updateMarkers();
+        }
+
+        function updateVmaxChangeSlider() {
+            let min = parseInt(document.getElementById('min-vmax-change').value);
+            let max = parseInt(document.getElementById('max-vmax-change').value);
+            if (min > max) { document.getElementById('min-vmax-change').value = max; min = max; }
+            filters.minVmaxChange = min; filters.maxVmaxChange = max;
+            document.getElementById('min-vmax-change-value').textContent = min+' kt';
+            document.getElementById('max-vmax-change-value').textContent = max+' kt';
+            const rf = document.getElementById('vmax-change-range-fill');
+            rf.style.left = ((min+100)/185*100)+'%'; rf.style.width = ((max-min)/185*100)+'%';
+            updateMarkers();
+        }
+
+        function updateTiltSlider() {
+            let min = parseInt(document.getElementById('min-tilt').value);
+            let max = parseInt(document.getElementById('max-tilt').value);
+            if (min > max) { document.getElementById('min-tilt').value = max; min = max; }
+            filters.minTilt = min; filters.maxTilt = max;
+            document.getElementById('min-tilt-value').textContent = min+' km';
+            document.getElementById('max-tilt-value').textContent = max+' km';
+            const rf = document.getElementById('tilt-range-fill');
+            rf.style.left = (min/200*100)+'%'; rf.style.width = ((max-min)/200*100)+'%';
+            updateMarkers();
+        }
+
+        function updateYearFilter() {
+            let min = parseInt(document.getElementById('min-year').value);
+            let max = parseInt(document.getElementById('max-year').value);
+            if (min > max) { document.getElementById('min-year').value = max; min = max; }
+            filters.minYear = min; filters.maxYear = max;
+            updateMarkers();
+        }
+
+        function updateStormFilter() {
+            filters.stormName = document.getElementById('storm-filter').value;
+            updateMarkers();
+        }
+
+        function resetFilters() {
+            filters.minIntensity=0; filters.maxIntensity=200;
+            document.getElementById('min-intensity').value=0; document.getElementById('max-intensity').value=200; updateIntensitySlider();
+            filters.minVmaxChange=-100; filters.maxVmaxChange=85;
+            document.getElementById('min-vmax-change').value=-100; document.getElementById('max-vmax-change').value=85; updateVmaxChangeSlider();
+            filters.minTilt=0; filters.maxTilt=200;
+            document.getElementById('min-tilt').value=0; document.getElementById('max-tilt').value=200; updateTiltSlider();
+            filters.minYear=1997; filters.maxYear=2024;
+            document.getElementById('min-year').value=1997; document.getElementById('max-year').value=2024;
+            filters.stormName='all'; document.getElementById('storm-filter').value='all';
+            updateMarkers();
+        }
+
+        function initializeFilters() {
+            document.getElementById('min-intensity').addEventListener('input', updateIntensitySlider);
+            document.getElementById('max-intensity').addEventListener('input', updateIntensitySlider);
+            document.getElementById('min-vmax-change').addEventListener('input', updateVmaxChangeSlider);
+            document.getElementById('max-vmax-change').addEventListener('input', updateVmaxChangeSlider);
+            document.getElementById('min-tilt').addEventListener('input', updateTiltSlider);
+            document.getElementById('max-tilt').addEventListener('input', updateTiltSlider);
+            document.getElementById('min-year').addEventListener('change', updateYearFilter);
+            document.getElementById('max-year').addEventListener('change', updateYearFilter);
+            document.getElementById('storm-filter').addEventListener('change', updateStormFilter);
+            updateIntensitySlider(); updateVmaxChangeSlider(); updateTiltSlider();
+        }
+
+        // ── Load data ────────────────────────────────────────────────
+        fetch('tc_radar_metadata.json')
+            .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+            .then(data => {
+                allData = data;
+                document.getElementById('loading').style.display = 'none';
+                document.getElementById('total-cases').textContent  = data.total_cases.toLocaleString();
+                document.getElementById('total-count').textContent  = data.total_cases.toLocaleString();
+                document.getElementById('filtered-count').textContent = data.total_cases.toLocaleString();
+
+                const storms = new Set(data.cases.map(c => c.storm_name));
+                document.getElementById('unique-storms').textContent = storms.size.toLocaleString();
+                const years = data.cases.map(c => c.year);
+                document.getElementById('year-range').textContent = `${Math.min(...years)} - ${Math.max(...years)}`;
+                const validVmax = data.cases.filter(c => c.vmax_kt !== null).map(c => c.vmax_kt);
+                document.getElementById('intensity-range').textContent = validVmax.length
+                    ? `${Math.min(...validVmax).toFixed(0)} - ${Math.max(...validVmax).toFixed(0)} kt` : 'N/A';
+
+                const stormSelect = document.getElementById('storm-filter');
+                [...storms].sort().forEach(s => {
+                    const o = document.createElement('option'); o.value = s; o.textContent = s; stormSelect.appendChild(o);
+                });
+
+                markers = L.markerClusterGroup({
+                    maxClusterRadius:30, disableClusteringAtZoom:10,
+                    spiderfyOnMaxZoom:true, showCoverageOnHover:false, zoomToBoundsOnClick:true,
+                    iconCreateFunction: function(cluster) {
+                        const n = cluster.getChildCount();
+                        let color = n<10?'#c7e9c0':n<50?'#74c476':n<100?'#31a354':n<200?'#238b45':'#006d2c';
+                        let tc    = n<10?'#006d2c':'#ffffff';
+                        return L.divIcon({
+                            html:`<div style="background:${color};color:${tc};width:40px;height:40px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:bold;font-size:14px;border:3px solid white;box-shadow:0 2px 8px rgba(0,0,0,0.3);">${n}</div>`,
+                            className:'custom-cluster-icon', iconSize:L.point(40,40)
+                        });
+                    }
+                });
+
+                data.cases.forEach(caseData => {
+                    const color = getIntensityColor(caseData.vmax_kt);
+                    const icon  = L.divIcon({
+                        className:'custom-div-icon',
+                        html:`<div class="custom-marker" style="background-color:${color};width:12px;height:12px;"></div>`,
+                        iconSize:[12,12], iconAnchor:[6,6]
+                    });
+                    const marker = L.marker([caseData.latitude, caseData.longitude], { icon });
+                    marker.bindPopup(createPopupContent(caseData), {
+                        maxWidth:320, minWidth:260,
+                        autoPan:true, autoPanPadding:[50,50], keepInView:true,
+                        closeButton:true, closeOnEscapeKey:true
+                    });
+                    allMarkers.push({ caseIndex: caseData.case_index, marker });
+                    markers.addLayer(marker);
+                });
+
+                map.addLayer(markers);
+
+                const legend = L.control({ position:'bottomright' });
+                legend.onAdd = function() {
+                    const div = L.DomUtil.create('div','intensity-legend');
+                    div.innerHTML = `<h4>Intensity (kt)</h4>
+                        <div class="legend-item"><div class="legend-color" style="background:#3b82f6"></div><span>TD (&lt;34)</span></div>
+                        <div class="legend-item"><div class="legend-color" style="background:#10b981"></div><span>TS (34-63)</span></div>
+                        <div class="legend-item"><div class="legend-color" style="background:#fbbf24"></div><span>Cat 1 (64-82)</span></div>
+                        <div class="legend-item"><div class="legend-color" style="background:#f97316"></div><span>Cat 2 (83-95)</span></div>
+                        <div class="legend-item"><div class="legend-color" style="background:#ef4444"></div><span>Cat 3 (96-112)</span></div>
+                        <div class="legend-item"><div class="legend-color" style="background:#dc2626"></div><span>Cat 4 (113-136)</span></div>
+                        <div class="legend-item"><div class="legend-color" style="background:#7f1d1d"></div><span>Cat 5 (137+)</span></div>`;
+                    return div;
+                };
+                legend.addTo(map);
+                initializeFilters();
+            })
+            .catch(err => {
+                document.getElementById('loading').innerHTML = `<div style="color:#ef4444;"><strong>Error loading data</strong><br><small>${err.message}</small></div>`;
+            });
+
+        // ── Smooth scroll ────────────────────────────────────────────
+        document.querySelectorAll('a[href^="#"]').forEach(a => {
+            a.addEventListener('click', function(e) {
+                e.preventDefault();
+                const t = document.querySelector(this.getAttribute('href'));
+                if (t) t.scrollIntoView({ behavior:'smooth', block:'start' });
+            });
+        });
+
+        // ── Image modal ──────────────────────────────────────────────
+        function openImageModal(url, caption) {
+            document.getElementById('imageModal').style.display = 'block';
+            document.getElementById('modalImage').src = url;
+            document.getElementById('modalCaption').textContent = caption;
+        }
+        function closeImageModal() {
+            document.getElementById('imageModal').style.display = 'none';
+        }
+        document.addEventListener('click', e => { if (e.target===document.getElementById('imageModal')) closeImageModal(); });
+        document.addEventListener('keydown', e => { if (e.key==='Escape') closeImageModal(); });
+    </script>
+
+    <div id="imageModal" class="image-modal" onclick="closeImageModal()">
+        <div class="image-modal-content" onclick="event.stopPropagation()">
+            <span class="modal-close" onclick="closeImageModal()">&times;</span>
+            <img id="modalImage" class="modal-image" alt="Full size radar analysis">
+            <div id="modalCaption" class="modal-caption"></div>
+        </div>
+    </div>
+</body>
+</html>
