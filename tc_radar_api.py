@@ -441,6 +441,120 @@ def get_data(
     })
 
 
+@app.get("/cross_section")
+def cross_section(
+    case_index: int   = Query(...,              ge=0,          description="0-based case index"),
+    variable:   str   = Query(DEFAULT_VARIABLE,                description="Variable key — see /variables"),
+    data_type:  str   = Query("swath",                         description="'swath' or 'merge'"),
+    x0:         float = Query(...,                             description="Start X (km)"),
+    y0:         float = Query(...,                             description="Start Y (km)"),
+    x1:         float = Query(...,                             description="End X (km)"),
+    y1:         float = Query(...,                             description="End Y (km)"),
+    n_points:   int   = Query(150,              ge=10, le=500, description="Sample points along line"),
+):
+    """Return a vertical cross-section along a user-defined line."""
+    if variable not in VARIABLES:
+        raise HTTPException(status_code=400, detail=f"Unknown variable '{variable}'. See /variables.")
+    if data_type not in ("swath", "merge"):
+        raise HTTPException(status_code=400, detail="data_type must be 'swath' or 'merge'")
+
+    try:
+        ds, local_idx = resolve_case(case_index, data_type)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not open dataset: {e}")
+
+    display_name, varname, cmap, units, vmin, vmax = VARIABLES[variable]
+    height_vals = ds["height"].values  # shape (37,)
+
+    # Load full 3D volume for this case
+    if variable in DERIVED_VARIABLES:
+        u_name, v_name = DERIVED_VARIABLES[variable]
+        if u_name not in ds or v_name not in ds:
+            raise HTTPException(status_code=400, detail=f"Components not in dataset.")
+        ref_varname = u_name
+        u_3d = ds[u_name].isel(num_cases=local_idx).values  # (ny, nx, nz) or (nz, ny, nx)
+        v_3d = ds[v_name].isel(num_cases=local_idx).values
+        vol = np.sqrt(u_3d**2 + v_3d**2)
+    else:
+        if varname not in ds:
+            raise HTTPException(status_code=400, detail=f"'{varname}' not in dataset.")
+        ref_varname = varname
+        vol = ds[varname].isel(num_cases=local_idx).values  # (ny, nx, nz) or similar
+
+    # Determine spatial grid
+    var_dims = set(ds[ref_varname].dims)
+    if "eastward_distance" in var_dims and "northward_distance" in var_dims:
+        x_coords = ds["eastward_distance"].values
+        y_coords = ds["northward_distance"].values
+    elif "latitude" in var_dims and "longitude" in var_dims:
+        nx = ds.sizes["longitude"]
+        ny = ds.sizes["latitude"]
+        x_coords = np.linspace(-(nx - 1), (nx - 1), nx)
+        y_coords = np.linspace(-(ny - 1), (ny - 1), ny)
+    else:
+        x_coords = np.arange(vol.shape[-1])
+        y_coords = np.arange(vol.shape[-2])
+
+    # Determine dim ordering: vol may be (y, x, height) or (height, y, x)
+    dim_list = list(ds[ref_varname].dims)
+    dim_list = [d for d in dim_list if d != "num_cases"]  # remove case dim
+    # We need indices for y, x, height dimensions
+    if "height" in dim_list:
+        h_axis = dim_list.index("height")
+    else:
+        raise HTTPException(status_code=500, detail="Cannot determine height axis")
+
+    # Sample points along the line
+    t = np.linspace(0, 1, n_points)
+    xs = x0 + t * (x1 - x0)
+    ys = y0 + t * (y1 - y0)
+    dist = np.sqrt((xs - x0)**2 + (ys - y0)**2)
+
+    # Find nearest grid indices for each sample point
+    xi_idx = np.array([int(np.argmin(np.abs(x_coords - xp))) for xp in xs])
+    yi_idx = np.array([int(np.argmin(np.abs(y_coords - yp))) for yp in ys])
+
+    # Extract cross-section: shape (n_heights, n_points)
+    n_heights = len(height_vals)
+    cs = np.full((n_heights, n_points), np.nan)
+
+    for h in range(n_heights):
+        for p in range(n_points):
+            if h_axis == 0:      # (height, y, x)
+                cs[h, p] = vol[h, yi_idx[p], xi_idx[p]]
+            elif h_axis == 2:    # (y, x, height)
+                cs[h, p] = vol[yi_idx[p], xi_idx[p], h]
+            else:                # (y, height, x)
+                cs[h, p] = vol[yi_idx[p], h, xi_idx[p]]
+
+    # Convert to JSON-safe format
+    cs_clean = []
+    for row in cs:
+        cs_clean.append([None if np.isnan(v) else round(float(v), 4) for v in row])
+
+    case_meta = _metadata_cache.get(case_index, {"case_index": case_index})
+
+    return JSONResponse({
+        "cross_section": cs_clean,
+        "distance_km": [round(float(d), 2) for d in dist],
+        "height_km": [round(float(h), 2) for h in height_vals],
+        "endpoints": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
+        "variable": {
+            "key": variable,
+            "display_name": display_name,
+            "units": units,
+            "vmin": vmin,
+            "vmax": vmax,
+            "colorscale": _cmap_to_plotly(cmap),
+        },
+        "case_meta": {
+            "storm_name": case_meta.get("storm_name", ""),
+            "datetime": case_meta.get("datetime", ""),
+            "vmax_kt": case_meta.get("vmax_kt"),
+        },
+    })
+
+
 @app.get("/plot")
 def plot(
     case_index: int   = Query(...,              ge=0,          description="0-based case index"),
