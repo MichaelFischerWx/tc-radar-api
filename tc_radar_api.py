@@ -588,6 +588,178 @@ def cross_section(
     return JSONResponse(result)
 
 
+def _extract_3d_volume(ds, local_idx, variable_key):
+    """Extract the full 3D volume (height × y × x) for a variable."""
+    _, varname, _, _, _, _ = VARIABLES[variable_key]
+    if variable_key in DERIVED_VARIABLES:
+        u_name, v_name = DERIVED_VARIABLES[variable_key]
+        u_3d = ds[u_name].isel(num_cases=local_idx).values
+        v_3d = ds[v_name].isel(num_cases=local_idx).values
+        return np.sqrt(u_3d**2 + v_3d**2), u_name
+    else:
+        vol = ds[varname].isel(num_cases=local_idx).values
+        return vol, varname
+
+
+def _compute_azimuthal_mean(vol, x_coords, y_coords, height_vals, h_axis,
+                            max_radius_km, dr_km, coverage_min):
+    """
+    Compute azimuthal mean from a 3D Cartesian volume.
+
+    Returns:
+        az_mean: 2D array (n_heights × n_rbins) — NaN where coverage < threshold
+        coverage: 2D array (n_heights × n_rbins) — fraction of valid data
+        r_bins: 1D array of radius bin centres
+    """
+    # Build 2D radius grid from coordinate arrays
+    xx, yy = np.meshgrid(x_coords, y_coords)
+    rr = np.sqrt(xx**2 + yy**2)
+
+    # Define radius bins
+    r_edges = np.arange(0, max_radius_km + dr_km, dr_km)
+    r_centers = (r_edges[:-1] + r_edges[1:]) / 2.0
+    n_rbins = len(r_centers)
+    n_heights = len(height_vals)
+
+    # Pre-compute bin membership for each (y, x) grid point
+    bin_idx = np.digitize(rr, r_edges) - 1  # shape: (ny, nx), values 0..n_rbins-1
+
+    az_mean  = np.full((n_heights, n_rbins), np.nan)
+    coverage = np.full((n_heights, n_rbins), 0.0)
+
+    for h in range(n_heights):
+        # Extract 2D slice at this height
+        if h_axis == 0:
+            slab = vol[h, :, :]
+        elif h_axis == 2:
+            slab = vol[:, :, h]
+        else:
+            slab = vol[:, h, :]
+
+        valid = ~np.isnan(slab)
+
+        for r in range(n_rbins):
+            mask = (bin_idx == r)
+            n_total = np.count_nonzero(mask)
+            if n_total == 0:
+                continue
+            in_bin = mask & valid
+            n_valid = np.count_nonzero(in_bin)
+            frac = n_valid / n_total
+            coverage[h, r] = frac
+            if frac >= coverage_min:
+                az_mean[h, r] = float(np.nanmean(slab[in_bin]))
+
+    return az_mean, coverage, r_centers
+
+
+@app.get("/azimuthal_mean")
+def azimuthal_mean(
+    case_index:    int   = Query(...,   ge=0,            description="0-based case index"),
+    variable:      str   = Query(DEFAULT_VARIABLE,       description="Variable key — see /variables"),
+    data_type:     str   = Query("swath",                description="'swath' or 'merge'"),
+    max_radius_km: float = Query(200.0, ge=10, le=500,   description="Maximum radius in km"),
+    dr_km:         float = Query(2.0,   ge=0.5, le=20,   description="Radial bin width in km"),
+    coverage_min:  float = Query(0.5,   ge=0.0, le=1.0,  description="Min fraction of valid data per bin"),
+    overlay:       str   = Query("",                      description="Optional overlay variable key"),
+):
+    """Return azimuthal-mean radius-height cross-section as JSON."""
+    if variable not in VARIABLES:
+        raise HTTPException(status_code=400, detail=f"Unknown variable '{variable}'. See /variables.")
+    if data_type not in ("swath", "merge"):
+        raise HTTPException(status_code=400, detail="data_type must be 'swath' or 'merge'")
+    if overlay and overlay not in VARIABLES:
+        raise HTTPException(status_code=400, detail=f"Unknown overlay variable '{overlay}'.")
+
+    try:
+        ds, local_idx = resolve_case(case_index, data_type)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not open dataset: {e}")
+
+    display_name, varname, cmap, units, vmin, vmax = VARIABLES[variable]
+    height_vals = ds["height"].values
+
+    # Get ref variable for grid detection
+    if variable in DERIVED_VARIABLES:
+        ref_varname = DERIVED_VARIABLES[variable][0]
+    else:
+        if varname not in ds:
+            raise HTTPException(status_code=400, detail=f"'{varname}' not in dataset.")
+        ref_varname = varname
+
+    # Determine spatial grid
+    var_dims = set(ds[ref_varname].dims)
+    if "eastward_distance" in var_dims and "northward_distance" in var_dims:
+        x_coords = ds["eastward_distance"].values
+        y_coords = ds["northward_distance"].values
+    elif "latitude" in var_dims and "longitude" in var_dims:
+        nx = ds.sizes["longitude"]
+        ny = ds.sizes["latitude"]
+        x_coords = np.linspace(-(nx - 1), (nx - 1), nx)
+        y_coords = np.linspace(-(ny - 1), (ny - 1), ny)
+    else:
+        raise HTTPException(status_code=500, detail="Cannot determine spatial grid")
+
+    # Determine height axis position
+    dim_list = [d for d in ds[ref_varname].dims if d != "num_cases"]
+    if "height" not in dim_list:
+        raise HTTPException(status_code=500, detail="Cannot determine height axis")
+    h_axis = dim_list.index("height")
+
+    # Extract 3D volume and compute azimuthal mean
+    vol, _ = _extract_3d_volume(ds, local_idx, variable)
+    az_mean, coverage, r_centers = _compute_azimuthal_mean(
+        vol, x_coords, y_coords, height_vals, h_axis,
+        max_radius_km, dr_km, coverage_min
+    )
+
+    case_meta = _metadata_cache.get(case_index, {"case_index": case_index})
+
+    result = {
+        "azimuthal_mean": _clean_2d(az_mean),
+        "coverage": _clean_2d(coverage),
+        "radius_km": [round(float(r), 2) for r in r_centers],
+        "height_km": [round(float(h), 2) for h in height_vals],
+        "coverage_min": coverage_min,
+        "variable": {
+            "key": variable,
+            "display_name": display_name,
+            "units": units,
+            "vmin": vmin,
+            "vmax": vmax,
+            "colorscale": _cmap_to_plotly(cmap),
+        },
+        "case_meta": {
+            "storm_name": case_meta.get("storm_name", ""),
+            "datetime": case_meta.get("datetime", ""),
+            "vmax_kt": case_meta.get("vmax_kt"),
+            "rmw_km": case_meta.get("rmw_km"),
+        },
+    }
+
+    # Optional overlay azimuthal mean
+    if overlay:
+        ov_display, _, ov_cmap, ov_units, ov_vmin, ov_vmax = VARIABLES[overlay]
+        try:
+            ov_vol, _ = _extract_3d_volume(ds, local_idx, overlay)
+            ov_az, _, _ = _compute_azimuthal_mean(
+                ov_vol, x_coords, y_coords, height_vals, h_axis,
+                max_radius_km, dr_km, coverage_min
+            )
+            result["overlay"] = {
+                "azimuthal_mean": _clean_2d(ov_az),
+                "key": overlay,
+                "display_name": ov_display,
+                "units": ov_units,
+                "vmin": ov_vmin,
+                "vmax": ov_vmax,
+            }
+        except Exception:
+            pass
+
+    return JSONResponse(result)
+
+
 @app.get("/plot")
 def plot(
     case_index: int   = Query(...,              ge=0,          description="0-based case index"),
