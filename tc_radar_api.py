@@ -351,18 +351,39 @@ def _cmap_to_plotly(cmap_name: str, n_steps: int = 64) -> list:
     ]
 
 
+def _extract_2d_slice(ds, local_idx, variable_key, z_idx):
+    """Extract a 2D (y, x) data slice for a variable at a given height index."""
+    _, varname, _, _, _, _ = VARIABLES[variable_key]
+    if variable_key in DERIVED_VARIABLES:
+        u_name, v_name = DERIVED_VARIABLES[variable_key]
+        u = ds[u_name].isel(num_cases=local_idx, height=z_idx).values
+        v = ds[v_name].isel(num_cases=local_idx, height=z_idx).values
+        return np.sqrt(u**2 + v**2), u_name
+    else:
+        da = ds[varname].isel(num_cases=local_idx, height=z_idx)
+        return da.values, varname
+
+
+def _clean_2d(data):
+    """Convert 2D numpy array to JSON-safe nested list (NaN → None)."""
+    return [[None if np.isnan(v) else round(float(v), 4) for v in row] for row in data]
+
+
 @app.get("/data")
 def get_data(
     case_index: int   = Query(...,              ge=0,          description="0-based case index"),
     variable:   str   = Query(DEFAULT_VARIABLE,                description="Variable key — see /variables"),
     level_km:   float = Query(2.0,              ge=0.0, le=18, description="Altitude in km"),
     data_type:  str   = Query("swath",                         description="'swath' or 'merge'"),
+    overlay:    str   = Query("",                              description="Optional overlay variable key"),
 ):
     """Return the raw 2D data slice as JSON for client-side Plotly rendering."""
     if variable not in VARIABLES:
         raise HTTPException(status_code=400, detail=f"Unknown variable '{variable}'. See /variables.")
     if data_type not in ("swath", "merge"):
         raise HTTPException(status_code=400, detail="data_type must be 'swath' or 'merge'")
+    if overlay and overlay not in VARIABLES:
+        raise HTTPException(status_code=400, detail=f"Unknown overlay variable '{overlay}'. See /variables.")
 
     try:
         ds, local_idx = resolve_case(case_index, data_type)
@@ -370,30 +391,12 @@ def get_data(
         raise HTTPException(status_code=400, detail=f"Could not open dataset: {e}")
 
     display_name, varname, cmap, units, vmin, vmax = VARIABLES[variable]
+    height_vals = ds["height"].values
+    z_idx = int(np.argmin(np.abs(height_vals - level_km)))
+    actual_level = float(height_vals[z_idx])
 
-    # Derived variable: compute sqrt(u² + v²) from component pair
-    if variable in DERIVED_VARIABLES:
-        u_name, v_name = DERIVED_VARIABLES[variable]
-        if u_name not in ds or v_name not in ds:
-            raise HTTPException(status_code=400, detail=f"Components '{u_name}' / '{v_name}' not in dataset.")
-        ref_varname = u_name
-        height_vals = ds["height"].values
-        z_idx = int(np.argmin(np.abs(height_vals - level_km)))
-        actual_level = float(height_vals[z_idx])
-        u = ds[u_name].isel(num_cases=local_idx, height=z_idx).values
-        v = ds[v_name].isel(num_cases=local_idx, height=z_idx).values
-        data = np.sqrt(u**2 + v**2)
-    else:
-        if varname not in ds:
-            available = [k for k, v in VARIABLES.items() if v[1] in ds]
-            raise HTTPException(status_code=400, detail=f"'{varname}' not in dataset. Available: {available}")
-        ref_varname = varname
-        da = ds[varname].isel(num_cases=local_idx)
-        height_vals = ds["height"].values
-        z_idx = int(np.argmin(np.abs(height_vals - level_km)))
-        actual_level = float(height_vals[z_idx])
-        da = da.isel(height=z_idx)
-        data = da.values  # triggers S3 fetch
+    # Primary variable
+    data, ref_varname = _extract_2d_slice(ds, local_idx, variable, z_idx)
 
     # Determine spatial grid
     var_dims = set(ds[ref_varname].dims)
@@ -409,17 +412,10 @@ def get_data(
         x = list(range(data.shape[-1]))
         y = list(range(data.shape[-2]))
 
-    # Convert NaN → None for JSON serialization
-    data_list = np.where(np.isnan(data), None, np.round(data, 4))
-    # numpy None trick doesn't work directly; use a nested list approach
-    data_clean = []
-    for row in data:
-        data_clean.append([None if np.isnan(v) else round(float(v), 4) for v in row])
-
     case_meta = _metadata_cache.get(case_index, {"case_index": case_index})
 
-    return JSONResponse({
-        "data": data_clean,
+    result = {
+        "data": _clean_2d(data),
         "x": x,
         "y": y,
         "actual_level_km": actual_level,
@@ -438,7 +434,48 @@ def get_data(
             "rmw_km": case_meta.get("rmw_km"),
             "mission_id": case_meta.get("mission_id", ""),
         },
-    })
+    }
+
+    # Optional overlay variable
+    if overlay:
+        ov_display, ov_varname, _, ov_units, ov_vmin, ov_vmax = VARIABLES[overlay]
+        try:
+            ov_data, _ = _extract_2d_slice(ds, local_idx, overlay, z_idx)
+            result["overlay"] = {
+                "data": _clean_2d(ov_data),
+                "key": overlay,
+                "display_name": ov_display,
+                "units": ov_units,
+                "vmin": ov_vmin,
+                "vmax": ov_vmax,
+            }
+        except Exception:
+            pass  # silently skip overlay if variable unavailable
+
+    return JSONResponse(result)
+
+
+def _extract_cross_section(ds, local_idx, variable_key, x_coords, y_coords, xi_idx, yi_idx, h_axis, n_heights, n_points):
+    """Extract a vertical cross-section for a variable along sample indices."""
+    _, varname, _, _, _, _ = VARIABLES[variable_key]
+    if variable_key in DERIVED_VARIABLES:
+        u_name, v_name = DERIVED_VARIABLES[variable_key]
+        u_3d = ds[u_name].isel(num_cases=local_idx).values
+        v_3d = ds[v_name].isel(num_cases=local_idx).values
+        vol = np.sqrt(u_3d**2 + v_3d**2)
+    else:
+        vol = ds[varname].isel(num_cases=local_idx).values
+
+    cs = np.full((n_heights, n_points), np.nan)
+    for h in range(n_heights):
+        for p in range(n_points):
+            if h_axis == 0:
+                cs[h, p] = vol[h, yi_idx[p], xi_idx[p]]
+            elif h_axis == 2:
+                cs[h, p] = vol[yi_idx[p], xi_idx[p], h]
+            else:
+                cs[h, p] = vol[yi_idx[p], h, xi_idx[p]]
+    return cs
 
 
 @app.get("/cross_section")
@@ -451,12 +488,15 @@ def cross_section(
     x1:         float = Query(...,                             description="End X (km)"),
     y1:         float = Query(...,                             description="End Y (km)"),
     n_points:   int   = Query(150,              ge=10, le=500, description="Sample points along line"),
+    overlay:    str   = Query("",                              description="Optional overlay variable key"),
 ):
     """Return a vertical cross-section along a user-defined line."""
     if variable not in VARIABLES:
         raise HTTPException(status_code=400, detail=f"Unknown variable '{variable}'. See /variables.")
     if data_type not in ("swath", "merge"):
         raise HTTPException(status_code=400, detail="data_type must be 'swath' or 'merge'")
+    if overlay and overlay not in VARIABLES:
+        raise HTTPException(status_code=400, detail=f"Unknown overlay variable '{overlay}'.")
 
     try:
         ds, local_idx = resolve_case(case_index, data_type)
@@ -464,22 +504,15 @@ def cross_section(
         raise HTTPException(status_code=400, detail=f"Could not open dataset: {e}")
 
     display_name, varname, cmap, units, vmin, vmax = VARIABLES[variable]
-    height_vals = ds["height"].values  # shape (37,)
+    height_vals = ds["height"].values
 
-    # Load full 3D volume for this case
+    # Determine ref variable for grid detection
     if variable in DERIVED_VARIABLES:
-        u_name, v_name = DERIVED_VARIABLES[variable]
-        if u_name not in ds or v_name not in ds:
-            raise HTTPException(status_code=400, detail=f"Components not in dataset.")
-        ref_varname = u_name
-        u_3d = ds[u_name].isel(num_cases=local_idx).values  # (ny, nx, nz) or (nz, ny, nx)
-        v_3d = ds[v_name].isel(num_cases=local_idx).values
-        vol = np.sqrt(u_3d**2 + v_3d**2)
+        ref_varname = DERIVED_VARIABLES[variable][0]
     else:
         if varname not in ds:
             raise HTTPException(status_code=400, detail=f"'{varname}' not in dataset.")
         ref_varname = varname
-        vol = ds[varname].isel(num_cases=local_idx).values  # (ny, nx, nz) or similar
 
     # Determine spatial grid
     var_dims = set(ds[ref_varname].dims)
@@ -492,17 +525,13 @@ def cross_section(
         x_coords = np.linspace(-(nx - 1), (nx - 1), nx)
         y_coords = np.linspace(-(ny - 1), (ny - 1), ny)
     else:
-        x_coords = np.arange(vol.shape[-1])
-        y_coords = np.arange(vol.shape[-2])
+        raise HTTPException(status_code=500, detail="Cannot determine spatial grid")
 
-    # Determine dim ordering: vol may be (y, x, height) or (height, y, x)
-    dim_list = list(ds[ref_varname].dims)
-    dim_list = [d for d in dim_list if d != "num_cases"]  # remove case dim
-    # We need indices for y, x, height dimensions
-    if "height" in dim_list:
-        h_axis = dim_list.index("height")
-    else:
+    # Determine height axis position
+    dim_list = [d for d in ds[ref_varname].dims if d != "num_cases"]
+    if "height" not in dim_list:
         raise HTTPException(status_code=500, detail="Cannot determine height axis")
+    h_axis = dim_list.index("height")
 
     # Sample points along the line
     t = np.linspace(0, 1, n_points)
@@ -510,32 +539,18 @@ def cross_section(
     ys = y0 + t * (y1 - y0)
     dist = np.sqrt((xs - x0)**2 + (ys - y0)**2)
 
-    # Find nearest grid indices for each sample point
     xi_idx = np.array([int(np.argmin(np.abs(x_coords - xp))) for xp in xs])
     yi_idx = np.array([int(np.argmin(np.abs(y_coords - yp))) for yp in ys])
 
-    # Extract cross-section: shape (n_heights, n_points)
     n_heights = len(height_vals)
-    cs = np.full((n_heights, n_points), np.nan)
 
-    for h in range(n_heights):
-        for p in range(n_points):
-            if h_axis == 0:      # (height, y, x)
-                cs[h, p] = vol[h, yi_idx[p], xi_idx[p]]
-            elif h_axis == 2:    # (y, x, height)
-                cs[h, p] = vol[yi_idx[p], xi_idx[p], h]
-            else:                # (y, height, x)
-                cs[h, p] = vol[yi_idx[p], h, xi_idx[p]]
-
-    # Convert to JSON-safe format
-    cs_clean = []
-    for row in cs:
-        cs_clean.append([None if np.isnan(v) else round(float(v), 4) for v in row])
+    # Primary cross-section
+    cs = _extract_cross_section(ds, local_idx, variable, x_coords, y_coords, xi_idx, yi_idx, h_axis, n_heights, n_points)
 
     case_meta = _metadata_cache.get(case_index, {"case_index": case_index})
 
-    return JSONResponse({
-        "cross_section": cs_clean,
+    result = {
+        "cross_section": _clean_2d(cs),
         "distance_km": [round(float(d), 2) for d in dist],
         "height_km": [round(float(h), 2) for h in height_vals],
         "endpoints": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
@@ -552,7 +567,25 @@ def cross_section(
             "datetime": case_meta.get("datetime", ""),
             "vmax_kt": case_meta.get("vmax_kt"),
         },
-    })
+    }
+
+    # Optional overlay cross-section
+    if overlay:
+        ov_display, _, _, ov_units, ov_vmin, ov_vmax = VARIABLES[overlay]
+        try:
+            ov_cs = _extract_cross_section(ds, local_idx, overlay, x_coords, y_coords, xi_idx, yi_idx, h_axis, n_heights, n_points)
+            result["overlay"] = {
+                "cross_section": _clean_2d(ov_cs),
+                "key": overlay,
+                "display_name": ov_display,
+                "units": ov_units,
+                "vmin": ov_vmin,
+                "vmax": ov_vmax,
+            }
+        except Exception:
+            pass
+
+    return JSONResponse(result)
 
 
 @app.get("/plot")
