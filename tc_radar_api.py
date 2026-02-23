@@ -412,7 +412,7 @@ def get_data(
         x = list(range(data.shape[-1]))
         y = list(range(data.shape[-2]))
 
-    case_meta = _metadata_cache.get(case_index, {"case_index": case_index})
+    case_meta = _build_case_meta(case_index, ds, local_idx)
 
     result = {
         "data": _clean_2d(data),
@@ -427,13 +427,7 @@ def get_data(
             "vmax": vmax,
             "colorscale": _cmap_to_plotly(cmap),
         },
-        "case_meta": {
-            "storm_name": case_meta.get("storm_name", ""),
-            "datetime": case_meta.get("datetime", ""),
-            "vmax_kt": case_meta.get("vmax_kt"),
-            "rmw_km": case_meta.get("rmw_km"),
-            "mission_id": case_meta.get("mission_id", ""),
-        },
+        "case_meta": case_meta,
     }
 
     # Optional overlay variable
@@ -547,7 +541,7 @@ def cross_section(
     # Primary cross-section
     cs = _extract_cross_section(ds, local_idx, variable, x_coords, y_coords, xi_idx, yi_idx, h_axis, n_heights, n_points)
 
-    case_meta = _metadata_cache.get(case_index, {"case_index": case_index})
+    case_meta = _build_case_meta(case_index, ds, local_idx)
 
     result = {
         "cross_section": _clean_2d(cs),
@@ -562,11 +556,7 @@ def cross_section(
             "vmax": vmax,
             "colorscale": _cmap_to_plotly(cmap),
         },
-        "case_meta": {
-            "storm_name": case_meta.get("storm_name", ""),
-            "datetime": case_meta.get("datetime", ""),
-            "vmax_kt": case_meta.get("vmax_kt"),
-        },
+        "case_meta": case_meta,
     }
 
     # Optional overlay cross-section
@@ -599,6 +589,55 @@ def _extract_3d_volume(ds, local_idx, variable_key):
     else:
         vol = ds[varname].isel(num_cases=local_idx).values
         return vol, varname
+
+
+def _get_ships_value(ds, local_idx, varname):
+    """
+    Look up a SHIPS variable at t=0 h.
+
+    SHIPS lag-hour axis has 17 entries: -48, -42, -36, …, 0, …, +42, +48 h.
+    t=0 is index 8 (0-based).
+    Returns float or None if unavailable / missing (9999).
+    """
+    SHIPS_T0_IDX = 8
+    if varname not in ds:
+        return None
+    try:
+        raw = ds[varname].isel(num_cases=local_idx).values
+        val = float(raw[SHIPS_T0_IDX]) if raw.ndim >= 1 else float(raw)
+    except Exception:
+        return None
+    if val == 9999 or np.isnan(val):
+        return None
+    return round(val, 1)
+
+
+def _get_sddc(ds, local_idx):
+    """SDDC: deep-layer shear heading (deg, met convention)."""
+    return _get_ships_value(ds, local_idx, "sddc_ships")
+
+
+def _get_shdc(ds, local_idx):
+    """SHDC: deep-layer shear magnitude (kt)."""
+    return _get_ships_value(ds, local_idx, "shdc_ships")
+
+
+def _build_case_meta(case_index, ds=None, local_idx=None):
+    """Build case_meta dict with SDDC included."""
+    case_meta = _metadata_cache.get(case_index, {"case_index": case_index})
+    meta = {
+        "storm_name": case_meta.get("storm_name", ""),
+        "datetime": case_meta.get("datetime", ""),
+        "vmax_kt": case_meta.get("vmax_kt"),
+        "rmw_km": case_meta.get("rmw_km"),
+        "mission_id": case_meta.get("mission_id", ""),
+    }
+    if ds is not None and local_idx is not None:
+        sddc = _get_sddc(ds, local_idx)
+        shdc = _get_shdc(ds, local_idx)
+        meta["sddc"] = sddc if sddc is not None else 9999
+        meta["shdc"] = shdc if shdc is not None else 9999
+    return meta
 
 
 def _compute_azimuthal_mean(vol, x_coords, y_coords, height_vals, h_axis,
@@ -713,7 +752,7 @@ def azimuthal_mean(
         max_radius_km, dr_km, coverage_min
     )
 
-    case_meta = _metadata_cache.get(case_index, {"case_index": case_index})
+    case_meta = _build_case_meta(case_index, ds, local_idx)
 
     result = {
         "azimuthal_mean": _clean_2d(az_mean),
@@ -729,12 +768,7 @@ def azimuthal_mean(
             "vmax": vmax,
             "colorscale": _cmap_to_plotly(cmap),
         },
-        "case_meta": {
-            "storm_name": case_meta.get("storm_name", ""),
-            "datetime": case_meta.get("datetime", ""),
-            "vmax_kt": case_meta.get("vmax_kt"),
-            "rmw_km": case_meta.get("rmw_km"),
-        },
+        "case_meta": case_meta,
     }
 
     # Optional overlay azimuthal mean
@@ -748,6 +782,202 @@ def azimuthal_mean(
             )
             result["overlay"] = {
                 "azimuthal_mean": _clean_2d(ov_az),
+                "key": overlay,
+                "display_name": ov_display,
+                "units": ov_units,
+                "vmin": ov_vmin,
+                "vmax": ov_vmax,
+            }
+        except Exception:
+            pass
+
+    return JSONResponse(result)
+
+
+# ---------------------------------------------------------------------------
+# Shear-Relative Quadrant Means
+# ---------------------------------------------------------------------------
+QUADRANT_DEFS = {
+    # key: (start_deg, end_deg) in shear-relative met heading
+    # θ_sr = (θ_met - SDDC) mod 360, where 0° = downshear, CW positive
+    # "left" = counterclockwise from downshear (met convention)
+    "DSR": (0,   90),    # downshear-right
+    "USR": (90,  180),   # upshear-right
+    "USL": (180, 270),   # upshear-left
+    "DSL": (270, 360),   # downshear-left
+}
+
+
+def _compute_quadrant_means(vol, x_coords, y_coords, height_vals, h_axis,
+                            sddc, max_radius_km, dr_km, coverage_min):
+    """
+    Compute shear-relative quadrant means from a 3D Cartesian volume.
+
+    Parameters
+    ----------
+    vol : 3D array — full volume with axes depending on h_axis
+    sddc : float — deep-layer shear heading (met deg, 0=N, 90=E, CW)
+    Others same as _compute_azimuthal_mean
+
+    Returns
+    -------
+    quad_means : dict[str, 2D array] — {DSL, DSR, USL, USR} each (n_heights × n_rbins)
+    r_centers  : 1D array of radial bin centres
+    """
+    # Build 2D radius and azimuth grids
+    xx, yy = np.meshgrid(x_coords, y_coords)
+    rr = np.sqrt(xx**2 + yy**2)
+
+    # Math angle → meteorological heading
+    azimuth_math_deg = np.degrees(np.arctan2(yy, xx))        # -180..180, CCW from +x
+    azimuth_met = (90.0 - azimuth_math_deg) % 360.0          # met heading, CW from N
+
+    # Shear-relative azimuth: 0° = downshear, 90° = right-of-shear (CW)
+    shear_rel_az = (azimuth_met - sddc) % 360.0
+
+    # Radial bins
+    r_edges = np.arange(0, max_radius_km + dr_km, dr_km)
+    r_centers = (r_edges[:-1] + r_edges[1:]) / 2.0
+    n_rbins = len(r_centers)
+    n_heights = len(height_vals)
+
+    bin_idx = np.digitize(rr, r_edges) - 1   # (ny, nx)
+
+    # Pre-compute quadrant masks (ny, nx) for each quadrant
+    q_masks = {}
+    for qname, (az_start, az_end) in QUADRANT_DEFS.items():
+        q_masks[qname] = (shear_rel_az >= az_start) & (shear_rel_az < az_end)
+
+    quad_means = {q: np.full((n_heights, n_rbins), np.nan) for q in QUADRANT_DEFS}
+
+    for h in range(n_heights):
+        # Extract 2D slab at this height
+        if h_axis == 0:
+            slab = vol[h, :, :]
+        elif h_axis == 2:
+            slab = vol[:, :, h]
+        else:
+            slab = vol[:, h, :]
+
+        valid = ~np.isnan(slab)
+
+        for r in range(n_rbins):
+            r_mask = (bin_idx == r)
+            for qname, q_mask in q_masks.items():
+                mask = r_mask & q_mask
+                n_total = np.count_nonzero(mask)
+                if n_total == 0:
+                    continue
+                in_bin = mask & valid
+                n_valid = np.count_nonzero(in_bin)
+                frac = n_valid / n_total
+                if frac >= coverage_min:
+                    quad_means[qname][h, r] = float(np.nanmean(slab[in_bin]))
+
+    return quad_means, r_centers
+
+
+@app.get("/quadrant_mean")
+def quadrant_mean(
+    case_index:    int   = Query(...,   ge=0,            description="0-based case index"),
+    variable:      str   = Query(DEFAULT_VARIABLE,       description="Variable key — see /variables"),
+    data_type:     str   = Query("swath",                description="'swath' or 'merge'"),
+    max_radius_km: float = Query(200.0, ge=10, le=500,   description="Maximum radius in km"),
+    dr_km:         float = Query(2.0,   ge=0.5, le=20,   description="Radial bin width in km"),
+    coverage_min:  float = Query(0.5,   ge=0.0, le=1.0,  description="Min fraction of valid data per bin"),
+    overlay:       str   = Query("",                      description="Optional overlay variable key"),
+):
+    """Return shear-relative quadrant-mean radius-height sections as JSON."""
+    if variable not in VARIABLES:
+        raise HTTPException(status_code=400, detail=f"Unknown variable '{variable}'. See /variables.")
+    if data_type not in ("swath", "merge"):
+        raise HTTPException(status_code=400, detail="data_type must be 'swath' or 'merge'")
+    if overlay and overlay not in VARIABLES:
+        raise HTTPException(status_code=400, detail=f"Unknown overlay variable '{overlay}'.")
+
+    try:
+        ds, local_idx = resolve_case(case_index, data_type)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not open dataset: {e}")
+
+    # Look up SDDC — required for this endpoint
+    sddc = _get_sddc(ds, local_idx)
+    if sddc is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Shear direction (SDDC) not available for this case — cannot compute shear-relative quadrants."
+        )
+
+    display_name, varname, cmap, units, vmin, vmax = VARIABLES[variable]
+    height_vals = ds["height"].values
+
+    # Ref variable for grid detection
+    if variable in DERIVED_VARIABLES:
+        ref_varname = DERIVED_VARIABLES[variable][0]
+    else:
+        if varname not in ds:
+            raise HTTPException(status_code=400, detail=f"'{varname}' not in dataset.")
+        ref_varname = varname
+
+    # Determine spatial grid
+    var_dims = set(ds[ref_varname].dims)
+    if "eastward_distance" in var_dims and "northward_distance" in var_dims:
+        x_coords = ds["eastward_distance"].values
+        y_coords = ds["northward_distance"].values
+    elif "latitude" in var_dims and "longitude" in var_dims:
+        nx = ds.sizes["longitude"]
+        ny = ds.sizes["latitude"]
+        x_coords = np.linspace(-(nx - 1), (nx - 1), nx)
+        y_coords = np.linspace(-(ny - 1), (ny - 1), ny)
+    else:
+        raise HTTPException(status_code=500, detail="Cannot determine spatial grid")
+
+    # Determine height axis position
+    dim_list = [d for d in ds[ref_varname].dims if d != "num_cases"]
+    if "height" not in dim_list:
+        raise HTTPException(status_code=500, detail="Cannot determine height axis")
+    h_axis = dim_list.index("height")
+
+    # Extract 3D volume and compute quadrant means
+    vol, _ = _extract_3d_volume(ds, local_idx, variable)
+    quad_means, r_centers = _compute_quadrant_means(
+        vol, x_coords, y_coords, height_vals, h_axis,
+        sddc, max_radius_km, dr_km, coverage_min
+    )
+
+    case_meta = _build_case_meta(case_index, ds, local_idx)
+
+    result = {
+        "quadrant_means": {
+            q: {"data": _clean_2d(quad_means[q])} for q in QUADRANT_DEFS
+        },
+        "radius_km": [round(float(r), 2) for r in r_centers],
+        "height_km": [round(float(h), 2) for h in height_vals],
+        "coverage_min": coverage_min,
+        "variable": {
+            "key": variable,
+            "display_name": display_name,
+            "units": units,
+            "vmin": vmin,
+            "vmax": vmax,
+            "colorscale": _cmap_to_plotly(cmap),
+        },
+        "case_meta": case_meta,
+    }
+
+    # Optional overlay quadrant means
+    if overlay:
+        ov_display, _, ov_cmap, ov_units, ov_vmin, ov_vmax = VARIABLES[overlay]
+        try:
+            ov_vol, _ = _extract_3d_volume(ds, local_idx, overlay)
+            ov_quads, _ = _compute_quadrant_means(
+                ov_vol, x_coords, y_coords, height_vals, h_axis,
+                sddc, max_radius_km, dr_km, coverage_min
+            )
+            result["overlay"] = {
+                "quadrant_means": {
+                    q: {"data": _clean_2d(ov_quads[q])} for q in QUADRANT_DEFS
+                },
                 "key": overlay,
                 "display_name": ov_display,
                 "units": ov_units,
