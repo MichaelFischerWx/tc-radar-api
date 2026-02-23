@@ -440,10 +440,14 @@ def list_levels():
 
 
 @app.get("/metadata")
-def get_metadata(case_index: int = Query(..., ge=0)):
-    if case_index not in _metadata_cache:
+def get_metadata(
+    case_index: int = Query(..., ge=0),
+    data_type:  str = Query("swath", description="'swath' or 'merge'"),
+):
+    cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
+    if case_index not in cache:
         raise HTTPException(status_code=404, detail=f"case_index {case_index} not found")
-    return JSONResponse(_metadata_cache[case_index])
+    return JSONResponse(cache[case_index])
 
 
 # ---------------------------------------------------------------------------
@@ -520,7 +524,7 @@ def get_data(
         x = list(range(data.shape[-1]))
         y = list(range(data.shape[-2]))
 
-    case_meta = _build_case_meta(case_index, ds, local_idx)
+    case_meta = _build_case_meta(case_index, ds, local_idx, data_type)
 
     result = {
         "data": _clean_2d(data),
@@ -649,7 +653,7 @@ def cross_section(
     # Primary cross-section
     cs = _extract_cross_section(ds, local_idx, variable, x_coords, y_coords, xi_idx, yi_idx, h_axis, n_heights, n_points)
 
-    case_meta = _build_case_meta(case_index, ds, local_idx)
+    case_meta = _build_case_meta(case_index, ds, local_idx, data_type)
 
     result = {
         "cross_section": _clean_2d(cs),
@@ -730,9 +734,10 @@ def _get_shdc(ds, local_idx):
     return _get_ships_value(ds, local_idx, "shdc_ships")
 
 
-def _build_case_meta(case_index, ds=None, local_idx=None):
+def _build_case_meta(case_index, ds=None, local_idx=None, data_type="swath"):
     """Build case_meta dict with SDDC included."""
-    case_meta = _metadata_cache.get(case_index, {"case_index": case_index})
+    cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
+    case_meta = cache.get(case_index, {"case_index": case_index})
     meta = {
         "storm_name": case_meta.get("storm_name", ""),
         "datetime": case_meta.get("datetime", ""),
@@ -867,7 +872,7 @@ def azimuthal_mean(
         max_radius_km, dr_km, coverage_min
     )
 
-    case_meta = _build_case_meta(case_index, ds, local_idx)
+    case_meta = _build_case_meta(case_index, ds, local_idx, data_type)
 
     result = {
         "azimuthal_mean": _clean_2d(az_mean),
@@ -1066,7 +1071,7 @@ def quadrant_mean(
         sddc, max_radius_km, dr_km, coverage_min
     )
 
-    case_meta = _build_case_meta(case_index, ds, local_idx)
+    case_meta = _build_case_meta(case_index, ds, local_idx, data_type)
 
     result = {
         "quadrant_means": {
@@ -1513,7 +1518,8 @@ def plot(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not open dataset: {e}")
 
-    case_meta = _metadata_cache.get(case_index, {"case_index": case_index})
+    cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
+    case_meta = cache.get(case_index, {"case_index": case_index})
 
     try:
         png = render_planview(ds, local_idx, variable, level_km, case_meta)
