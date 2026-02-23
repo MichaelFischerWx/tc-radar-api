@@ -102,6 +102,14 @@ VARIABLES = {
     "swath_reflectivity":                   ("Reflectivity (original)",         "swath_reflectivity",                   "Spectral_r","dBZ",  -10,   65),
     "swath_wind_speed":                     ("Wind Speed (original)",           "swath_wind_speed",                     "inferno",   "m/s",    0,   80),
     "swath_earth_relative_wind_speed":      ("Earth-Rel. Wind Speed (original)","swath_earth_relative_wind_speed",      "inferno",   "m/s",    0,   80),
+    # Merged (flight-averaged) domain
+    "merged_tangential_wind":               ("Tangential Wind (merged)",        "merged_tangential_wind",               "RdBu_r",    "m/s",  -10,   80),
+    "merged_radial_wind":                   ("Radial Wind (merged)",            "merged_radial_wind",                   "RdBu_r",    "m/s",  -30,   30),
+    "merged_reflectivity":                  ("Reflectivity (merged)",           "merged_reflectivity",                  "Spectral_r","dBZ",  -10,   65),
+    "merged_wind_speed":                    ("Wind Speed (merged)",             "merged_wind_speed",                    "inferno",   "m/s",    0,   80),
+    "merged_upward_air_velocity":           ("Vertical Velocity (merged)",      "merged_upward_air_velocity",           "RdBu_r",    "m/s",   -5,    5),
+    "merged_relative_vorticity":            ("Relative Vorticity (merged)",     "merged_relative_vorticity",            "RdBu_r",    "s⁻¹",-5e-3, 5e-3),
+    "merged_divergence":                    ("Divergence (merged)",             "merged_divergence",                    "RdBu_r",    "s⁻¹",-5e-3, 5e-3),
 }
 
 # Derived variables: computed as sqrt(u² + v²) from component pairs
@@ -262,7 +270,9 @@ def render_planview(
 # Metadata + plot cache
 # ---------------------------------------------------------------------------
 METADATA_PATH = Path(os.environ.get("METADATA_PATH", "./tc_radar_metadata.json"))
+MERGE_METADATA_PATH = Path(os.environ.get("MERGE_METADATA_PATH", "./tc_radar_metadata_merge.json"))
 _metadata_cache: dict[int, dict] = {}
+_merge_metadata_cache: dict[int, dict] = {}
 _plot_cache: OrderedDict = OrderedDict()
 _PLOT_CACHE_MAX = 500  # ~500 plots × ~150 KB ≈ 75 MB max
 
@@ -270,7 +280,7 @@ _PLOT_CACHE_MAX = 500  # ~500 plots × ~150 KB ≈ 75 MB max
 @app.on_event("startup")
 def startup():
     # Load metadata
-    global _metadata_cache
+    global _metadata_cache, _merge_metadata_cache
     if METADATA_PATH.exists():
         with open(METADATA_PATH) as f:
             data = json.load(f)
@@ -279,10 +289,18 @@ def startup():
     else:
         print(f"Warning: {METADATA_PATH} not found")
 
+    if MERGE_METADATA_PATH.exists():
+        with open(MERGE_METADATA_PATH) as f:
+            data = json.load(f)
+        _merge_metadata_cache = {c["case_index"]: c for c in data.get("cases", [])}
+        print(f"Loaded {len(_merge_metadata_cache)} merge cases from {MERGE_METADATA_PATH}")
+    else:
+        print(f"Warning: {MERGE_METADATA_PATH} not found — merge composites will not filter correctly")
+
     backend = f"S3 Zarr (s3://{S3_BUCKET}/{S3_PREFIX})" if USE_S3 else "AOML HTTP (fallback)"
     print(f"Data backend: {backend}")
 
-    # Pre-warm swath datasets in background threads
+    # Pre-warm datasets in background threads
     # Also enrich metadata with SHIPS shear values once datasets are loaded
     def prewarm_and_enrich(data_type, era):
         try:
@@ -292,30 +310,32 @@ def startup():
         except Exception as e:
             print(f"Pre-warm failed {data_type}/{era}: {e}")
 
-    for era in ("early", "recent"):
-        threading.Thread(target=prewarm_and_enrich, args=("swath", era), daemon=True).start()
+    for dt in ("swath", "merge"):
+        for era in ("early", "recent"):
+            threading.Thread(target=prewarm_and_enrich, args=(dt, era), daemon=True).start()
 
 
 def _enrich_metadata_with_ships(ds, data_type, era):
     """
-    Enrich _metadata_cache with SHIPS shear values (SDDC, SHDC) read
+    Enrich metadata cache with SHIPS shear values (SDDC, SHDC) read
     from the Zarr store.  Runs once per dataset at startup so that
     composite filtering never needs to open the Zarr just to check shear.
     """
+    cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
     early_count = CASE_COUNTS[(data_type, "early")]
     offset = 0 if era == "early" else early_count
     n_cases = ds.sizes.get("num_cases", 0)
     enriched = 0
     for local_idx in range(n_cases):
         case_index = local_idx + offset
-        if case_index not in _metadata_cache:
+        if case_index not in cache:
             continue
         sddc = _get_ships_value(ds, local_idx, "sddc_ships")
         shdc = _get_ships_value(ds, local_idx, "shdc_ships")
         if sddc is not None:
-            _metadata_cache[case_index]["sddc"] = sddc
+            cache[case_index]["sddc"] = sddc
         if shdc is not None:
-            _metadata_cache[case_index]["shdc"] = shdc
+            cache[case_index]["shdc"] = shdc
         enriched += 1
     print(f"Enriched {enriched} cases with SHIPS shear data ({data_type}/{era})")
 
@@ -327,10 +347,12 @@ def _filter_cases_for_composite(
     min_year: int, max_year: int,
     min_shear_mag: float, max_shear_mag: float,
     min_shear_dir: float, max_shear_dir: float,
+    data_type: str = "swath",
 ) -> list[int]:
     """Return list of case_index values that pass all composite filters."""
+    cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
     matching = []
-    for idx, meta in _metadata_cache.items():
+    for idx, meta in cache.items():
         vmax = meta.get("vmax_kt")
         if vmax is None:
             continue
@@ -355,11 +377,12 @@ def _filter_cases_for_composite(
         if year is not None and (year < min_year or year > max_year):
             continue
 
-        shdc = meta.get("shdc")
+        # Shear magnitude: swath uses "shdc" (enriched), merge uses "shear_magnitude_kt" (from JSON)
+        shear_mag = meta.get("shdc") or meta.get("shear_magnitude_kt")
         if min_shear_mag > 0 or max_shear_mag < 100:
-            if shdc is None:
+            if shear_mag is None:
                 continue
-            if shdc < min_shear_mag or shdc > max_shear_mag:
+            if shear_mag < min_shear_mag or shear_mag > max_shear_mag:
                 continue
 
         sddc = meta.get("sddc")
@@ -1140,6 +1163,7 @@ def _resolve_grid_and_haxis(ds, ref_varname):
 
 @app.get("/composite/count")
 def composite_count(
+    data_type:      str   = Query("swath",                description="'swath' or 'merge'"),
     min_intensity:  float = Query(0,    ge=0,   le=200),
     max_intensity:  float = Query(200,  ge=0,   le=200),
     min_vmax_change:float = Query(-100, ge=-100,le=85),
@@ -1158,6 +1182,7 @@ def composite_count(
         min_intensity, max_intensity, min_vmax_change, max_vmax_change,
         min_tilt, max_tilt, min_year, max_year,
         min_shear_mag, max_shear_mag, min_shear_dir, max_shear_dir,
+        data_type=data_type,
     )
     return {"count": len(cases), "case_indices": cases[:20]}  # preview first 20
 
@@ -1165,6 +1190,7 @@ def composite_count(
 @app.get("/composite/azimuthal_mean")
 def composite_azimuthal_mean(
     variable:      str   = Query(DEFAULT_VARIABLE,       description="Variable key"),
+    overlay:       str   = Query("",                     description="Optional overlay variable key"),
     data_type:     str   = Query("swath",                description="'swath' or 'merge'"),
     max_r_rmw:     float = Query(8.0,   ge=1, le=20,    description="Max radius in R/RMW"),
     dr_rmw:        float = Query(0.25,  ge=0.1, le=2,   description="Radial bin width in R/RMW"),
@@ -1179,13 +1205,17 @@ def composite_azimuthal_mean(
     """Compute RMW-normalised composite azimuthal mean across matching cases."""
     if variable not in VARIABLES:
         raise HTTPException(status_code=400, detail=f"Unknown variable '{variable}'.")
+    if overlay and overlay not in VARIABLES:
+        raise HTTPException(status_code=400, detail=f"Unknown overlay variable '{overlay}'.")
     if data_type not in ("swath", "merge"):
         raise HTTPException(status_code=400, detail="data_type must be 'swath' or 'merge'")
 
+    meta_cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
     matching = _filter_cases_for_composite(
         min_intensity, max_intensity, min_vmax_change, max_vmax_change,
         min_tilt, max_tilt, min_year, max_year,
         min_shear_mag, max_shear_mag, min_shear_dir, max_shear_dir,
+        data_type=data_type,
     )
     if not matching:
         raise HTTPException(status_code=400, detail="No cases match the specified criteria.")
@@ -1195,7 +1225,7 @@ def composite_azimuthal_mean(
     # Filter to cases with valid RMW
     cases_with_rmw = []
     for ci in matching:
-        rmw = _metadata_cache.get(ci, {}).get("rmw_km")
+        rmw = meta_cache.get(ci, {}).get("rmw_km")
         if rmw is not None and not np.isnan(float(rmw)) and float(rmw) > 0:
             cases_with_rmw.append((ci, float(rmw)))
     if not cases_with_rmw:
@@ -1206,6 +1236,8 @@ def composite_azimuthal_mean(
 
     accum_sum = None
     accum_count = None
+    ov_accum_sum = None
+    ov_accum_count = None
     r_centers = None
     height_km = None
     n_processed = 0
@@ -1228,6 +1260,24 @@ def composite_azimuthal_mean(
             valid = ~np.isnan(az_mean)
             accum_sum[valid] += az_mean[valid]
             accum_count[valid] += 1
+
+            # Overlay accumulation
+            if overlay:
+                try:
+                    ov_vol, _ = _extract_3d_volume(ds, local_idx, overlay)
+                    ov_az, _, _ = _compute_azimuthal_mean(
+                        ov_vol, x_coords, y_coords, height_km, h_axis,
+                        max_r_rmw, dr_rmw, coverage_min, rmw=rmw
+                    )
+                    if ov_accum_sum is None:
+                        ov_accum_sum = np.zeros_like(ov_az)
+                        ov_accum_count = np.zeros_like(ov_az)
+                    ov_valid = ~np.isnan(ov_az)
+                    ov_accum_sum[ov_valid] += ov_az[ov_valid]
+                    ov_accum_count[ov_valid] += 1
+                except Exception:
+                    pass  # skip overlay for this case
+
             n_processed += 1
         except Exception as e:
             print(f"Composite: skipping case {case_idx}: {e}")
@@ -1238,7 +1288,7 @@ def composite_azimuthal_mean(
 
     composite = np.where(accum_count > 0, accum_sum / accum_count, np.nan)
 
-    return JSONResponse({
+    result = {
         "azimuthal_mean": _clean_2d(composite),
         "radius_rrmw": [round(float(r), 3) for r in r_centers],
         "height_km": [round(float(h), 2) for h in height_km],
@@ -1263,12 +1313,30 @@ def composite_azimuthal_mean(
             "shear_mag": [min_shear_mag, max_shear_mag],
             "shear_dir": [min_shear_dir, max_shear_dir],
         },
-    })
+    }
+
+    # Add overlay if computed
+    if overlay and ov_accum_sum is not None:
+        ov_composite = np.where(ov_accum_count > 0, ov_accum_sum / ov_accum_count, np.nan)
+        ov_display, _, ov_cmap, ov_units, ov_vmin, ov_vmax = VARIABLES[overlay]
+        clean_ov = _clean_2d(ov_composite)
+        flat = [v for row in clean_ov for v in row if v is not None]
+        result["overlay"] = {
+            "display_name": ov_display,
+            "key": overlay,
+            "units": ov_units,
+            "azimuthal_mean": clean_ov,
+            "vmin": min(flat) if flat else ov_vmin,
+            "vmax": max(flat) if flat else ov_vmax,
+        }
+
+    return JSONResponse(result)
 
 
 @app.get("/composite/quadrant_mean")
 def composite_quadrant_mean(
     variable:      str   = Query(DEFAULT_VARIABLE,       description="Variable key"),
+    overlay:       str   = Query("",                     description="Optional overlay variable key"),
     data_type:     str   = Query("swath",                description="'swath' or 'merge'"),
     max_r_rmw:     float = Query(8.0,   ge=1, le=20,    description="Max radius in R/RMW"),
     dr_rmw:        float = Query(0.25,  ge=0.1, le=2,   description="Radial bin width in R/RMW"),
@@ -1283,13 +1351,17 @@ def composite_quadrant_mean(
     """Compute RMW-normalised composite shear-relative quadrant means."""
     if variable not in VARIABLES:
         raise HTTPException(status_code=400, detail=f"Unknown variable '{variable}'.")
+    if overlay and overlay not in VARIABLES:
+        raise HTTPException(status_code=400, detail=f"Unknown overlay variable '{overlay}'.")
     if data_type not in ("swath", "merge"):
         raise HTTPException(status_code=400, detail="data_type must be 'swath' or 'merge'")
 
+    meta_cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
     matching = _filter_cases_for_composite(
         min_intensity, max_intensity, min_vmax_change, max_vmax_change,
         min_tilt, max_tilt, min_year, max_year,
         min_shear_mag, max_shear_mag, min_shear_dir, max_shear_dir,
+        data_type=data_type,
     )
     if not matching:
         raise HTTPException(status_code=400, detail="No cases match the specified criteria.")
@@ -1302,7 +1374,7 @@ def composite_quadrant_mean(
     # Cases need both valid SDDC and valid RMW
     valid_cases = []
     for ci in matching:
-        meta = _metadata_cache.get(ci, {})
+        meta = meta_cache.get(ci, {})
         sddc = meta.get("sddc")
         rmw = meta.get("rmw_km")
         if sddc is not None and rmw is not None and not np.isnan(float(rmw)) and float(rmw) > 0:
@@ -1312,6 +1384,8 @@ def composite_quadrant_mean(
 
     accum_sum = None
     accum_count = None
+    ov_accum_sum = None
+    ov_accum_count = None
     r_centers = None
     height_km = None
     n_processed = 0
@@ -1335,6 +1409,25 @@ def composite_quadrant_mean(
                 valid = ~np.isnan(quad_means[q])
                 accum_sum[q][valid] += quad_means[q][valid]
                 accum_count[q][valid] += 1
+
+            # Overlay accumulation
+            if overlay:
+                try:
+                    ov_vol, _ = _extract_3d_volume(ds, local_idx, overlay)
+                    ov_quad_means, _ = _compute_quadrant_means(
+                        ov_vol, x_coords, y_coords, height_km, h_axis,
+                        sddc, max_r_rmw, dr_rmw, coverage_min, rmw=rmw
+                    )
+                    if ov_accum_sum is None:
+                        ov_accum_sum = {q: np.zeros_like(ov_quad_means[q]) for q in QUADRANT_DEFS}
+                        ov_accum_count = {q: np.zeros_like(ov_quad_means[q]) for q in QUADRANT_DEFS}
+                    for q in QUADRANT_DEFS:
+                        ov_valid = ~np.isnan(ov_quad_means[q])
+                        ov_accum_sum[q][ov_valid] += ov_quad_means[q][ov_valid]
+                        ov_accum_count[q][ov_valid] += 1
+                except Exception:
+                    pass  # skip overlay for this case
+
             n_processed += 1
         except Exception as e:
             print(f"Composite quad: skipping case {case_idx}: {e}")
@@ -1347,7 +1440,7 @@ def composite_quadrant_mean(
     for q in QUADRANT_DEFS:
         composite[q] = np.where(accum_count[q] > 0, accum_sum[q] / accum_count[q], np.nan)
 
-    return JSONResponse({
+    result = {
         "quadrant_means": {q: {"data": _clean_2d(composite[q])} for q in QUADRANT_DEFS},
         "radius_rrmw": [round(float(r), 3) for r in r_centers],
         "height_km": [round(float(h), 2) for h in height_km],
@@ -1372,7 +1465,28 @@ def composite_quadrant_mean(
             "shear_mag": [min_shear_mag, max_shear_mag],
             "shear_dir": [min_shear_dir, max_shear_dir],
         },
-    })
+    }
+
+    # Add overlay if computed
+    if overlay and ov_accum_sum is not None:
+        ov_display, _, ov_cmap, ov_units, ov_vmin, ov_vmax = VARIABLES[overlay]
+        ov_composite = {}
+        all_flat = []
+        for q in QUADRANT_DEFS:
+            ov_composite[q] = np.where(ov_accum_count[q] > 0, ov_accum_sum[q] / ov_accum_count[q], np.nan)
+            clean_q = _clean_2d(ov_composite[q])
+            ov_composite[q] = clean_q
+            all_flat.extend(v for row in clean_q for v in row if v is not None)
+        result["overlay"] = {
+            "display_name": ov_display,
+            "key": overlay,
+            "units": ov_units,
+            "quadrant_means": {q: {"data": ov_composite[q]} for q in QUADRANT_DEFS},
+            "vmin": min(all_flat) if all_flat else ov_vmin,
+            "vmax": max(all_flat) if all_flat else ov_vmax,
+        }
+
+    return JSONResponse(result)
 
 
 @app.get("/plot")
