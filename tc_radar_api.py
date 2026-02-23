@@ -283,15 +283,100 @@ def startup():
     print(f"Data backend: {backend}")
 
     # Pre-warm swath datasets in background threads
-    def prewarm(data_type, era):
+    # Also enrich metadata with SHIPS shear values once datasets are loaded
+    def prewarm_and_enrich(data_type, era):
         try:
-            get_dataset(data_type, era)
+            ds = get_dataset(data_type, era)
             print(f"Pre-warmed {data_type}/{era}")
+            _enrich_metadata_with_ships(ds, data_type, era)
         except Exception as e:
             print(f"Pre-warm failed {data_type}/{era}: {e}")
 
     for era in ("early", "recent"):
-        threading.Thread(target=prewarm, args=("swath", era), daemon=True).start()
+        threading.Thread(target=prewarm_and_enrich, args=("swath", era), daemon=True).start()
+
+
+def _enrich_metadata_with_ships(ds, data_type, era):
+    """
+    Enrich _metadata_cache with SHIPS shear values (SDDC, SHDC) read
+    from the Zarr store.  Runs once per dataset at startup so that
+    composite filtering never needs to open the Zarr just to check shear.
+    """
+    early_count = CASE_COUNTS[(data_type, "early")]
+    offset = 0 if era == "early" else early_count
+    n_cases = ds.sizes.get("num_cases", 0)
+    enriched = 0
+    for local_idx in range(n_cases):
+        case_index = local_idx + offset
+        if case_index not in _metadata_cache:
+            continue
+        sddc = _get_ships_value(ds, local_idx, "sddc_ships")
+        shdc = _get_ships_value(ds, local_idx, "shdc_ships")
+        if sddc is not None:
+            _metadata_cache[case_index]["sddc"] = sddc
+        if shdc is not None:
+            _metadata_cache[case_index]["shdc"] = shdc
+        enriched += 1
+    print(f"Enriched {enriched} cases with SHIPS shear data ({data_type}/{era})")
+
+
+def _filter_cases_for_composite(
+    min_intensity: float, max_intensity: float,
+    min_vmax_change: float, max_vmax_change: float,
+    min_tilt: float, max_tilt: float,
+    min_year: int, max_year: int,
+    min_shear_mag: float, max_shear_mag: float,
+    min_shear_dir: float, max_shear_dir: float,
+) -> list[int]:
+    """Return list of case_index values that pass all composite filters."""
+    matching = []
+    for idx, meta in _metadata_cache.items():
+        vmax = meta.get("vmax_kt")
+        if vmax is None:
+            continue
+        if vmax < min_intensity or vmax > max_intensity:
+            continue
+
+        vc = meta.get("24-h_vmax_change_kt")
+        if min_vmax_change > -100 or max_vmax_change < 85:
+            if vc is None:
+                continue
+            if vc < min_vmax_change or vc > max_vmax_change:
+                continue
+
+        tilt = meta.get("tilt_magnitude_km")
+        if min_tilt > 0 or max_tilt < 200:
+            if tilt is None:
+                continue
+            if tilt < min_tilt or tilt > max_tilt:
+                continue
+
+        year = meta.get("year")
+        if year is not None and (year < min_year or year > max_year):
+            continue
+
+        shdc = meta.get("shdc")
+        if min_shear_mag > 0 or max_shear_mag < 100:
+            if shdc is None:
+                continue
+            if shdc < min_shear_mag or shdc > max_shear_mag:
+                continue
+
+        sddc = meta.get("sddc")
+        if min_shear_dir > 0 or max_shear_dir < 360:
+            if sddc is None:
+                continue
+            # Handle wraparound: if min > max, it's a range crossing 360°
+            if min_shear_dir <= max_shear_dir:
+                if sddc < min_shear_dir or sddc > max_shear_dir:
+                    continue
+            else:
+                # e.g. min=315, max=45 means "NW through NE"
+                if sddc < min_shear_dir and sddc > max_shear_dir:
+                    continue
+
+        matching.append(idx)
+    return matching
 
 
 # ---------------------------------------------------------------------------
@@ -641,21 +726,28 @@ def _build_case_meta(case_index, ds=None, local_idx=None):
 
 
 def _compute_azimuthal_mean(vol, x_coords, y_coords, height_vals, h_axis,
-                            max_radius_km, dr_km, coverage_min):
+                            max_radius, dr, coverage_min, rmw=None):
     """
     Compute azimuthal mean from a 3D Cartesian volume.
+
+    If rmw is provided, radii are normalised by RMW (output bins in R/RMW).
+    Otherwise bins are in km.
 
     Returns:
         az_mean: 2D array (n_heights × n_rbins) — NaN where coverage < threshold
         coverage: 2D array (n_heights × n_rbins) — fraction of valid data
-        r_bins: 1D array of radius bin centres
+        r_bins: 1D array of radius bin centres (km or R/RMW)
     """
     # Build 2D radius grid from coordinate arrays
     xx, yy = np.meshgrid(x_coords, y_coords)
     rr = np.sqrt(xx**2 + yy**2)
 
+    # If RMW-normalising, convert radius grid to R/RMW
+    if rmw is not None and rmw > 0:
+        rr = rr / rmw
+
     # Define radius bins
-    r_edges = np.arange(0, max_radius_km + dr_km, dr_km)
+    r_edges = np.arange(0, max_radius + dr, dr)
     r_centers = (r_edges[:-1] + r_edges[1:]) / 2.0
     n_rbins = len(r_centers)
     n_heights = len(height_vals)
@@ -809,24 +901,30 @@ QUADRANT_DEFS = {
 
 
 def _compute_quadrant_means(vol, x_coords, y_coords, height_vals, h_axis,
-                            sddc, max_radius_km, dr_km, coverage_min):
+                            sddc, max_radius, dr, coverage_min, rmw=None):
     """
     Compute shear-relative quadrant means from a 3D Cartesian volume.
+
+    If rmw is provided, radii are normalised by RMW (output bins in R/RMW).
 
     Parameters
     ----------
     vol : 3D array — full volume with axes depending on h_axis
     sddc : float — deep-layer shear heading (met deg, 0=N, 90=E, CW)
-    Others same as _compute_azimuthal_mean
+    rmw : float or None — if provided, normalise radius by RMW
 
     Returns
     -------
     quad_means : dict[str, 2D array] — {DSL, DSR, USL, USR} each (n_heights × n_rbins)
-    r_centers  : 1D array of radial bin centres
+    r_centers  : 1D array of radial bin centres (km or R/RMW)
     """
     # Build 2D radius and azimuth grids
     xx, yy = np.meshgrid(x_coords, y_coords)
     rr = np.sqrt(xx**2 + yy**2)
+
+    # If RMW-normalising, convert radius grid to R/RMW
+    if rmw is not None and rmw > 0:
+        rr = rr / rmw
 
     # Math angle → meteorological heading
     azimuth_math_deg = np.degrees(np.arctan2(yy, xx))        # -180..180, CCW from +x
@@ -836,7 +934,7 @@ def _compute_quadrant_means(vol, x_coords, y_coords, height_vals, h_axis,
     shear_rel_az = (azimuth_met - sddc) % 360.0
 
     # Radial bins
-    r_edges = np.arange(0, max_radius_km + dr_km, dr_km)
+    r_edges = np.arange(0, max_radius + dr, dr)
     r_centers = (r_edges[:-1] + r_edges[1:]) / 2.0
     n_rbins = len(r_centers)
     n_heights = len(height_vals)
@@ -988,6 +1086,293 @@ def quadrant_mean(
             pass
 
     return JSONResponse(result)
+
+
+# ---------------------------------------------------------------------------
+# Composite endpoints
+# ---------------------------------------------------------------------------
+_COMPOSITE_MAX_CASES = 500  # safety cap
+
+# Common query parameters for composite filters
+def _composite_filter_params(
+    min_intensity:  float = Query(0,    ge=0,   le=200,  description="Min Vmax (kt)"),
+    max_intensity:  float = Query(200,  ge=0,   le=200,  description="Max Vmax (kt)"),
+    min_vmax_change:float = Query(-100, ge=-100,le=85,   description="Min 24-h Vmax change (kt)"),
+    max_vmax_change:float = Query(85,   ge=-100,le=85,   description="Max 24-h Vmax change (kt)"),
+    min_tilt:       float = Query(0,    ge=0,   le=200,  description="Min tilt magnitude (km)"),
+    max_tilt:       float = Query(200,  ge=0,   le=200,  description="Max tilt magnitude (km)"),
+    min_year:       int   = Query(1997, ge=1997,le=2024,  description="Min year"),
+    max_year:       int   = Query(2024, ge=1997,le=2024,  description="Max year"),
+    min_shear_mag:  float = Query(0,    ge=0,   le=100,  description="Min shear magnitude (kt)"),
+    max_shear_mag:  float = Query(100,  ge=0,   le=100,  description="Max shear magnitude (kt)"),
+    min_shear_dir:  float = Query(0,    ge=0,   le=360,  description="Min shear direction (deg)"),
+    max_shear_dir:  float = Query(360,  ge=0,   le=360,  description="Max shear direction (deg)"),
+):
+    return dict(
+        min_intensity=min_intensity, max_intensity=max_intensity,
+        min_vmax_change=min_vmax_change, max_vmax_change=max_vmax_change,
+        min_tilt=min_tilt, max_tilt=max_tilt,
+        min_year=min_year, max_year=max_year,
+        min_shear_mag=min_shear_mag, max_shear_mag=max_shear_mag,
+        min_shear_dir=min_shear_dir, max_shear_dir=max_shear_dir,
+    )
+
+
+def _resolve_grid_and_haxis(ds, ref_varname):
+    """Determine spatial grid and height axis from a dataset + variable."""
+    var_dims = set(ds[ref_varname].dims)
+    if "eastward_distance" in var_dims and "northward_distance" in var_dims:
+        x_coords = ds["eastward_distance"].values
+        y_coords = ds["northward_distance"].values
+    elif "latitude" in var_dims and "longitude" in var_dims:
+        nx = ds.sizes["longitude"]
+        ny = ds.sizes["latitude"]
+        x_coords = np.linspace(-(nx - 1), (nx - 1), nx)
+        y_coords = np.linspace(-(ny - 1), (ny - 1), ny)
+    else:
+        raise ValueError("Cannot determine spatial grid")
+    dim_list = [d for d in ds[ref_varname].dims if d != "num_cases"]
+    if "height" not in dim_list:
+        raise ValueError("Cannot determine height axis")
+    h_axis = dim_list.index("height")
+    return x_coords, y_coords, h_axis
+
+
+@app.get("/composite/count")
+def composite_count(
+    min_intensity:  float = Query(0,    ge=0,   le=200),
+    max_intensity:  float = Query(200,  ge=0,   le=200),
+    min_vmax_change:float = Query(-100, ge=-100,le=85),
+    max_vmax_change:float = Query(85,   ge=-100,le=85),
+    min_tilt:       float = Query(0,    ge=0,   le=200),
+    max_tilt:       float = Query(200,  ge=0,   le=200),
+    min_year:       int   = Query(1997, ge=1997,le=2024),
+    max_year:       int   = Query(2024, ge=1997,le=2024),
+    min_shear_mag:  float = Query(0,    ge=0,   le=100),
+    max_shear_mag:  float = Query(100,  ge=0,   le=100),
+    min_shear_dir:  float = Query(0,    ge=0,   le=360),
+    max_shear_dir:  float = Query(360,  ge=0,   le=360),
+):
+    """Quick endpoint to get case count for given filter criteria (no data loading)."""
+    cases = _filter_cases_for_composite(
+        min_intensity, max_intensity, min_vmax_change, max_vmax_change,
+        min_tilt, max_tilt, min_year, max_year,
+        min_shear_mag, max_shear_mag, min_shear_dir, max_shear_dir,
+    )
+    return {"count": len(cases), "case_indices": cases[:20]}  # preview first 20
+
+
+@app.get("/composite/azimuthal_mean")
+def composite_azimuthal_mean(
+    variable:      str   = Query(DEFAULT_VARIABLE,       description="Variable key"),
+    data_type:     str   = Query("swath",                description="'swath' or 'merge'"),
+    max_r_rmw:     float = Query(8.0,   ge=1, le=20,    description="Max radius in R/RMW"),
+    dr_rmw:        float = Query(0.25,  ge=0.1, le=2,   description="Radial bin width in R/RMW"),
+    coverage_min:  float = Query(0.5,   ge=0.0, le=1.0),
+    min_intensity:  float = Query(0),    max_intensity:  float = Query(200),
+    min_vmax_change:float = Query(-100), max_vmax_change:float = Query(85),
+    min_tilt:       float = Query(0),    max_tilt:       float = Query(200),
+    min_year:       int   = Query(1997), max_year:       int   = Query(2024),
+    min_shear_mag:  float = Query(0),    max_shear_mag:  float = Query(100),
+    min_shear_dir:  float = Query(0),    max_shear_dir:  float = Query(360),
+):
+    """Compute RMW-normalised composite azimuthal mean across matching cases."""
+    if variable not in VARIABLES:
+        raise HTTPException(status_code=400, detail=f"Unknown variable '{variable}'.")
+    if data_type not in ("swath", "merge"):
+        raise HTTPException(status_code=400, detail="data_type must be 'swath' or 'merge'")
+
+    matching = _filter_cases_for_composite(
+        min_intensity, max_intensity, min_vmax_change, max_vmax_change,
+        min_tilt, max_tilt, min_year, max_year,
+        min_shear_mag, max_shear_mag, min_shear_dir, max_shear_dir,
+    )
+    if not matching:
+        raise HTTPException(status_code=400, detail="No cases match the specified criteria.")
+    if len(matching) > _COMPOSITE_MAX_CASES:
+        matching = matching[:_COMPOSITE_MAX_CASES]
+
+    # Filter to cases with valid RMW
+    cases_with_rmw = []
+    for ci in matching:
+        rmw = _metadata_cache.get(ci, {}).get("rmw_km")
+        if rmw is not None and not np.isnan(float(rmw)) and float(rmw) > 0:
+            cases_with_rmw.append((ci, float(rmw)))
+    if not cases_with_rmw:
+        raise HTTPException(status_code=400, detail="No matching cases have valid RMW data.")
+
+    display_name, varname, cmap, units, vmin, vmax = VARIABLES[variable]
+    ref_varname = DERIVED_VARIABLES[variable][0] if variable in DERIVED_VARIABLES else varname
+
+    accum_sum = None
+    accum_count = None
+    r_centers = None
+    height_km = None
+    n_processed = 0
+
+    for case_idx, rmw in cases_with_rmw:
+        try:
+            ds, local_idx = resolve_case(case_idx, data_type)
+            if height_km is None:
+                height_km = ds["height"].values
+                x_coords, y_coords, h_axis = _resolve_grid_and_haxis(ds, ref_varname)
+            vol, _ = _extract_3d_volume(ds, local_idx, variable)
+            az_mean, _, rc = _compute_azimuthal_mean(
+                vol, x_coords, y_coords, height_km, h_axis,
+                max_r_rmw, dr_rmw, coverage_min, rmw=rmw
+            )
+            if accum_sum is None:
+                r_centers = rc
+                accum_sum = np.zeros_like(az_mean)
+                accum_count = np.zeros_like(az_mean)
+            valid = ~np.isnan(az_mean)
+            accum_sum[valid] += az_mean[valid]
+            accum_count[valid] += 1
+            n_processed += 1
+        except Exception as e:
+            print(f"Composite: skipping case {case_idx}: {e}")
+            continue
+
+    if n_processed == 0:
+        raise HTTPException(status_code=500, detail="Could not process any matching cases.")
+
+    composite = np.where(accum_count > 0, accum_sum / accum_count, np.nan)
+
+    return JSONResponse({
+        "azimuthal_mean": _clean_2d(composite),
+        "radius_rrmw": [round(float(r), 3) for r in r_centers],
+        "height_km": [round(float(h), 2) for h in height_km],
+        "normalized": True,
+        "coverage_min": coverage_min,
+        "n_cases": n_processed,
+        "n_matched": len(matching),
+        "n_with_rmw": len(cases_with_rmw),
+        "variable": {
+            "key": variable,
+            "display_name": display_name,
+            "units": units,
+            "vmin": vmin,
+            "vmax": vmax,
+            "colorscale": _cmap_to_plotly(cmap),
+        },
+        "filters": {
+            "intensity": [min_intensity, max_intensity],
+            "vmax_change": [min_vmax_change, max_vmax_change],
+            "tilt": [min_tilt, max_tilt],
+            "year": [min_year, max_year],
+            "shear_mag": [min_shear_mag, max_shear_mag],
+            "shear_dir": [min_shear_dir, max_shear_dir],
+        },
+    })
+
+
+@app.get("/composite/quadrant_mean")
+def composite_quadrant_mean(
+    variable:      str   = Query(DEFAULT_VARIABLE,       description="Variable key"),
+    data_type:     str   = Query("swath",                description="'swath' or 'merge'"),
+    max_r_rmw:     float = Query(8.0,   ge=1, le=20,    description="Max radius in R/RMW"),
+    dr_rmw:        float = Query(0.25,  ge=0.1, le=2,   description="Radial bin width in R/RMW"),
+    coverage_min:  float = Query(0.5,   ge=0.0, le=1.0),
+    min_intensity:  float = Query(0),    max_intensity:  float = Query(200),
+    min_vmax_change:float = Query(-100), max_vmax_change:float = Query(85),
+    min_tilt:       float = Query(0),    max_tilt:       float = Query(200),
+    min_year:       int   = Query(1997), max_year:       int   = Query(2024),
+    min_shear_mag:  float = Query(0),    max_shear_mag:  float = Query(100),
+    min_shear_dir:  float = Query(0),    max_shear_dir:  float = Query(360),
+):
+    """Compute RMW-normalised composite shear-relative quadrant means."""
+    if variable not in VARIABLES:
+        raise HTTPException(status_code=400, detail=f"Unknown variable '{variable}'.")
+    if data_type not in ("swath", "merge"):
+        raise HTTPException(status_code=400, detail="data_type must be 'swath' or 'merge'")
+
+    matching = _filter_cases_for_composite(
+        min_intensity, max_intensity, min_vmax_change, max_vmax_change,
+        min_tilt, max_tilt, min_year, max_year,
+        min_shear_mag, max_shear_mag, min_shear_dir, max_shear_dir,
+    )
+    if not matching:
+        raise HTTPException(status_code=400, detail="No cases match the specified criteria.")
+    if len(matching) > _COMPOSITE_MAX_CASES:
+        matching = matching[:_COMPOSITE_MAX_CASES]
+
+    display_name, varname, cmap, units, vmin, vmax = VARIABLES[variable]
+    ref_varname = DERIVED_VARIABLES[variable][0] if variable in DERIVED_VARIABLES else varname
+
+    # Cases need both valid SDDC and valid RMW
+    valid_cases = []
+    for ci in matching:
+        meta = _metadata_cache.get(ci, {})
+        sddc = meta.get("sddc")
+        rmw = meta.get("rmw_km")
+        if sddc is not None and rmw is not None and not np.isnan(float(rmw)) and float(rmw) > 0:
+            valid_cases.append((ci, sddc, float(rmw)))
+    if not valid_cases:
+        raise HTTPException(status_code=400, detail="No matching cases have both shear direction and valid RMW.")
+
+    accum_sum = None
+    accum_count = None
+    r_centers = None
+    height_km = None
+    n_processed = 0
+
+    for case_idx, sddc, rmw in valid_cases:
+        try:
+            ds, local_idx = resolve_case(case_idx, data_type)
+            if height_km is None:
+                height_km = ds["height"].values
+                x_coords, y_coords, h_axis = _resolve_grid_and_haxis(ds, ref_varname)
+            vol, _ = _extract_3d_volume(ds, local_idx, variable)
+            quad_means, rc = _compute_quadrant_means(
+                vol, x_coords, y_coords, height_km, h_axis,
+                sddc, max_r_rmw, dr_rmw, coverage_min, rmw=rmw
+            )
+            if accum_sum is None:
+                r_centers = rc
+                accum_sum = {q: np.zeros_like(quad_means[q]) for q in QUADRANT_DEFS}
+                accum_count = {q: np.zeros_like(quad_means[q]) for q in QUADRANT_DEFS}
+            for q in QUADRANT_DEFS:
+                valid = ~np.isnan(quad_means[q])
+                accum_sum[q][valid] += quad_means[q][valid]
+                accum_count[q][valid] += 1
+            n_processed += 1
+        except Exception as e:
+            print(f"Composite quad: skipping case {case_idx}: {e}")
+            continue
+
+    if n_processed == 0:
+        raise HTTPException(status_code=500, detail="Could not process any matching cases.")
+
+    composite = {}
+    for q in QUADRANT_DEFS:
+        composite[q] = np.where(accum_count[q] > 0, accum_sum[q] / accum_count[q], np.nan)
+
+    return JSONResponse({
+        "quadrant_means": {q: {"data": _clean_2d(composite[q])} for q in QUADRANT_DEFS},
+        "radius_rrmw": [round(float(r), 3) for r in r_centers],
+        "height_km": [round(float(h), 2) for h in height_km],
+        "normalized": True,
+        "coverage_min": coverage_min,
+        "n_cases": n_processed,
+        "n_matched": len(matching),
+        "n_with_shear_and_rmw": len(valid_cases),
+        "variable": {
+            "key": variable,
+            "display_name": display_name,
+            "units": units,
+            "vmin": vmin,
+            "vmax": vmax,
+            "colorscale": _cmap_to_plotly(cmap),
+        },
+        "filters": {
+            "intensity": [min_intensity, max_intensity],
+            "vmax_change": [min_vmax_change, max_vmax_change],
+            "tilt": [min_tilt, max_tilt],
+            "year": [min_year, max_year],
+            "shear_mag": [min_shear_mag, max_shear_mag],
+            "shear_dir": [min_shear_dir, max_shear_dir],
+        },
+    })
 
 
 @app.get("/plot")
