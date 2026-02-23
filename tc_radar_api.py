@@ -753,6 +753,21 @@ def _build_case_meta(case_index, ds=None, local_idx=None, data_type="swath"):
     return meta
 
 
+def _build_case_list(processed_indices: list[int], data_type: str = "swath") -> list[dict]:
+    """Build a compact list of case metadata for composite reproducibility."""
+    cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
+    case_list = []
+    for ci in processed_indices:
+        meta = cache.get(ci, {})
+        case_list.append({
+            "case_index": ci,
+            "storm_name": meta.get("storm_name", ""),
+            "datetime": meta.get("datetime", ""),
+            "vmax_kt": meta.get("vmax_kt"),
+        })
+    return case_list
+
+
 def _compute_azimuthal_mean(vol, x_coords, y_coords, height_vals, h_axis,
                             max_radius, dr, coverage_min, rmw=None):
     """
@@ -1246,6 +1261,7 @@ def composite_azimuthal_mean(
     r_centers = None
     height_km = None
     n_processed = 0
+    processed_indices = []
 
     for case_idx, rmw in cases_with_rmw:
         try:
@@ -1284,6 +1300,7 @@ def composite_azimuthal_mean(
                     pass  # skip overlay for this case
 
             n_processed += 1
+            processed_indices.append(case_idx)
         except Exception as e:
             print(f"Composite: skipping case {case_idx}: {e}")
             continue
@@ -1302,6 +1319,7 @@ def composite_azimuthal_mean(
         "n_cases": n_processed,
         "n_matched": len(matching),
         "n_with_rmw": len(cases_with_rmw),
+        "case_list": _build_case_list(processed_indices, data_type),
         "variable": {
             "key": variable,
             "display_name": display_name,
@@ -1394,6 +1412,7 @@ def composite_quadrant_mean(
     r_centers = None
     height_km = None
     n_processed = 0
+    processed_indices = []
 
     for case_idx, sddc, rmw in valid_cases:
         try:
@@ -1434,6 +1453,7 @@ def composite_quadrant_mean(
                     pass  # skip overlay for this case
 
             n_processed += 1
+            processed_indices.append(case_idx)
         except Exception as e:
             print(f"Composite quad: skipping case {case_idx}: {e}")
             continue
@@ -1454,6 +1474,7 @@ def composite_quadrant_mean(
         "n_cases": n_processed,
         "n_matched": len(matching),
         "n_with_shear_and_rmw": len(valid_cases),
+        "case_list": _build_case_list(processed_indices, data_type),
         "variable": {
             "key": variable,
             "display_name": display_name,
