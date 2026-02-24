@@ -690,6 +690,120 @@ def cross_section(
     return JSONResponse(result)
 
 
+@app.get("/volume")
+def get_volume(
+    case_index: int   = Query(...,              ge=0,          description="0-based case index"),
+    variable:   str   = Query(DEFAULT_VARIABLE,                description="Variable key — see /variables"),
+    data_type:  str   = Query("swath",                         description="'swath' or 'merge'"),
+    stride:     int   = Query(2,                ge=1, le=5,    description="Spatial subsampling stride (2 = half res)"),
+    max_height_km: float = Query(15.0,          ge=1, le=18,   description="Maximum height to include (km)"),
+):
+    """
+    Return the full 3D volume as flattened arrays for Plotly isosurface rendering.
+
+    The grid is subsampled spatially by `stride` to reduce transfer size.
+    NaN values are replaced with a sentinel (-9999) so the grid stays regular;
+    the client should set isomin above this sentinel.
+    """
+    if variable not in VARIABLES:
+        raise HTTPException(status_code=400, detail=f"Unknown variable '{variable}'. See /variables.")
+    if data_type not in ("swath", "merge"):
+        raise HTTPException(status_code=400, detail="data_type must be 'swath' or 'merge'")
+
+    try:
+        ds, local_idx = resolve_case(case_index, data_type)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not open dataset: {e}")
+
+    display_name, varname, cmap, units, vmin, vmax = VARIABLES[variable]
+    height_vals = ds["height"].values
+
+    # Cap height
+    h_mask = height_vals <= max_height_km + 0.01
+    height_sub = height_vals[h_mask]
+
+    # Extract full 3D volume
+    vol, ref_varname = _extract_3d_volume(ds, local_idx, variable)
+
+    # Determine spatial grid and height axis position
+    dim_list = [d for d in ds[ref_varname].dims if d != "num_cases"]
+    if "height" not in dim_list:
+        raise HTTPException(status_code=500, detail="Cannot determine height axis")
+    h_axis = dim_list.index("height")
+
+    var_dims = set(ds[ref_varname].dims)
+    if "eastward_distance" in var_dims and "northward_distance" in var_dims:
+        x_full = ds["eastward_distance"].values
+        y_full = ds["northward_distance"].values
+    elif "latitude" in var_dims and "longitude" in var_dims:
+        nx = ds.sizes["longitude"]
+        ny = ds.sizes["latitude"]
+        x_full = np.linspace(-(nx - 1), (nx - 1), nx)
+        y_full = np.linspace(-(ny - 1), (ny - 1), ny)
+    else:
+        x_full = np.arange(vol.shape[-1], dtype=float)
+        y_full = np.arange(vol.shape[-2], dtype=float)
+
+    # Subsample spatial dimensions
+    x_sub = x_full[::stride]
+    y_sub = y_full[::stride]
+    n_h = int(h_mask.sum())
+
+    # Slice the volume: need to handle varying axis orders
+    if h_axis == 0:
+        vol_sub = vol[:n_h, ::stride, ::stride]
+    elif h_axis == 2:
+        vol_sub = vol[::stride, ::stride, :n_h]
+    else:
+        vol_sub = vol[::stride, :n_h, ::stride]
+
+    # Reorder to (height, y, x) if needed
+    if h_axis == 1:
+        vol_sub = np.transpose(vol_sub, (1, 0, 2))  # (y, h, x) -> (h, y, x)
+    elif h_axis == 2:
+        vol_sub = np.transpose(vol_sub, (2, 0, 1))  # (y, x, h) -> (h, y, x)
+
+    nz, ny, nx = vol_sub.shape
+
+    # Build flattened coordinate arrays via meshgrid
+    Z, Y, X = np.meshgrid(height_sub, y_sub, x_sub, indexing='ij')
+    x_flat = np.round(X.ravel(), 2)
+    y_flat = np.round(Y.ravel(), 2)
+    z_flat = np.round(Z.ravel(), 2)
+    v_flat = vol_sub.ravel()
+
+    # Compute actual data range (excluding NaN)
+    valid = v_flat[np.isfinite(v_flat)]
+    data_min = float(np.nanmin(valid)) if len(valid) > 0 else vmin
+    data_max = float(np.nanmax(valid)) if len(valid) > 0 else vmax
+
+    # Replace NaN with sentinel for regular-grid isosurface
+    SENTINEL = -9999.0
+    v_flat = np.where(np.isfinite(v_flat), np.round(v_flat, 3), SENTINEL)
+
+    case_meta = _build_case_meta(case_index, ds, local_idx, data_type)
+
+    return JSONResponse({
+        "x": x_flat.tolist(),
+        "y": y_flat.tolist(),
+        "z": z_flat.tolist(),
+        "value": v_flat.tolist(),
+        "sentinel": SENTINEL,
+        "grid_shape": [nz, ny, nx],
+        "variable": {
+            "key": variable,
+            "display_name": display_name,
+            "units": units,
+            "vmin": vmin,
+            "vmax": vmax,
+            "data_min": round(data_min, 3),
+            "data_max": round(data_max, 3),
+            "colorscale": _cmap_to_plotly(cmap),
+        },
+        "case_meta": case_meta,
+    })
+
+
 def _extract_3d_volume(ds, local_idx, variable_key):
     """Extract the full 3D volume (height × y × x) for a variable."""
     _, varname, _, _, _, _ = VARIABLES[variable_key]
