@@ -843,6 +843,7 @@ def get_volume(
     data_type:  str   = Query("swath",                         description="'swath' or 'merge'"),
     stride:     int   = Query(2,                ge=1, le=5,    description="Spatial subsampling stride (2 = half res)"),
     max_height_km: float = Query(15.0,          ge=1, le=18,   description="Maximum height to include (km)"),
+    compact:    bool  = Query(False,                            description="If true, send 1D axis vectors instead of flattened meshgrid"),
 ):
     """
     Return the full 3D volume as flattened arrays for Plotly isosurface rendering.
@@ -850,6 +851,10 @@ def get_volume(
     The grid is subsampled spatially by `stride` to reduce transfer size.
     NaN values are replaced with a sentinel (-9999) so the grid stays regular;
     the client should set isomin above this sentinel.
+
+    compact=true mode sends 1D axis vectors (x_axis, y_axis, z_axis) instead
+    of the full flattened meshgrid (x, y, z), reducing payload ~4× before gzip.
+    The client reconstructs the meshgrid from axes + grid_shape.
     """
     if variable not in VARIABLES:
         raise HTTPException(status_code=400, detail=f"Unknown variable '{variable}'. See /variables.")
@@ -910,12 +915,6 @@ def get_volume(
         vol_sub = np.transpose(vol_sub, (2, 0, 1))  # (y, x, h) -> (h, y, x)
 
     nz, ny, nx = vol_sub.shape
-
-    # Build flattened coordinate arrays via meshgrid
-    Z, Y, X = np.meshgrid(height_sub, y_sub, x_sub, indexing='ij')
-    x_flat = np.round(X.ravel(), 2)
-    y_flat = np.round(Y.ravel(), 2)
-    z_flat = np.round(Z.ravel(), 2)
     v_flat = vol_sub.ravel()
 
     # Compute actual data range (excluding NaN)
@@ -929,10 +928,7 @@ def get_volume(
 
     case_meta = _build_case_meta(case_index, ds, local_idx, data_type)
 
-    return JSONResponse({
-        "x": x_flat.tolist(),
-        "y": y_flat.tolist(),
-        "z": z_flat.tolist(),
+    result = {
         "value": v_flat.tolist(),
         "sentinel": SENTINEL,
         "grid_shape": [nz, ny, nx],
@@ -947,7 +943,22 @@ def get_volume(
             "colorscale": _cmap_to_plotly(cmap),
         },
         "case_meta": case_meta,
-    })
+    }
+
+    if compact:
+        # Compact mode: send 1D axis vectors (~232 values total)
+        # Client reconstructs meshgrid from axes + grid_shape
+        result["x_axis"] = np.round(x_sub, 2).tolist()
+        result["y_axis"] = np.round(y_sub, 2).tolist()
+        result["z_axis"] = np.round(height_sub, 2).tolist()
+    else:
+        # Legacy mode: send full flattened meshgrid (~918K values)
+        Z, Y, X = np.meshgrid(height_sub, y_sub, x_sub, indexing='ij')
+        result["x"] = np.round(X.ravel(), 2).tolist()
+        result["y"] = np.round(Y.ravel(), 2).tolist()
+        result["z"] = np.round(Z.ravel(), 2).tolist()
+
+    return JSONResponse(result)
 
 
 def _extract_3d_volume(ds, local_idx, variable_key):
