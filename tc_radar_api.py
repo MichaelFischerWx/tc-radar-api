@@ -1916,7 +1916,10 @@ def composite_azimuthal_mean(
     if n_processed == 0:
         raise HTTPException(status_code=500, detail="Could not process any matching cases.")
 
-    composite = np.where(accum_count > 0, accum_sum / accum_count, np.nan)
+    # Require each grid cell to have data from at least 33% of processed cases
+    # (or 3, whichever is greater) to suppress noisy bins with sparse sampling
+    min_cases = max(3, int(np.ceil(0.33 * n_processed)))
+    composite = np.where(accum_count >= min_cases, accum_sum / accum_count, np.nan)
 
     result = {
         "azimuthal_mean": _clean_2d(composite),
@@ -1924,6 +1927,7 @@ def composite_azimuthal_mean(
         "height_km": [round(float(h), 2) for h in height_km],
         "normalized": True,
         "coverage_min": coverage_min,
+        "min_cases_per_bin": min_cases,
         "n_cases": n_processed,
         "n_matched": len(matching),
         "n_with_rmw": len(cases_with_rmw),
@@ -1948,7 +1952,7 @@ def composite_azimuthal_mean(
 
     # Add overlay if computed
     if overlay and ov_accum_sum is not None:
-        ov_composite = np.where(ov_accum_count > 0, ov_accum_sum / ov_accum_count, np.nan)
+        ov_composite = np.where(ov_accum_count >= min_cases, ov_accum_sum / ov_accum_count, np.nan)
         ov_display, _, ov_cmap, ov_units, ov_vmin, ov_vmax = VARIABLES[overlay]
         clean_ov = _clean_2d(ov_composite)
         flat = [v for row in clean_ov for v in row if v is not None]
@@ -2070,9 +2074,12 @@ def composite_quadrant_mean(
     if n_processed == 0:
         raise HTTPException(status_code=500, detail="Could not process any matching cases.")
 
+    # Require each grid cell to have data from at least 33% of processed cases
+    # (or 3, whichever is greater) to suppress noisy bins with sparse sampling
+    min_cases = max(3, int(np.ceil(0.33 * n_processed)))
     composite = {}
     for q in QUADRANT_DEFS:
-        composite[q] = np.where(accum_count[q] > 0, accum_sum[q] / accum_count[q], np.nan)
+        composite[q] = np.where(accum_count[q] >= min_cases, accum_sum[q] / accum_count[q], np.nan)
 
     result = {
         "quadrant_means": {q: {"data": _clean_2d(composite[q])} for q in QUADRANT_DEFS},
@@ -2080,6 +2087,7 @@ def composite_quadrant_mean(
         "height_km": [round(float(h), 2) for h in height_km],
         "normalized": True,
         "coverage_min": coverage_min,
+        "min_cases_per_bin": min_cases,
         "n_cases": n_processed,
         "n_matched": len(matching),
         "n_with_shear_and_rmw": len(valid_cases),
@@ -2108,7 +2116,7 @@ def composite_quadrant_mean(
         ov_composite = {}
         all_flat = []
         for q in QUADRANT_DEFS:
-            ov_composite[q] = np.where(ov_accum_count[q] > 0, ov_accum_sum[q] / ov_accum_count[q], np.nan)
+            ov_composite[q] = np.where(ov_accum_count[q] >= min_cases, ov_accum_sum[q] / ov_accum_count[q], np.nan)
             clean_q = _clean_2d(ov_composite[q])
             ov_composite[q] = clean_q
             all_flat.extend(v for row in clean_q for v in row if v is not None)
