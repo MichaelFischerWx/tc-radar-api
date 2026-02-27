@@ -34,6 +34,7 @@ import json
 import os
 import threading
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from datetime import datetime
 from pathlib import Path
@@ -1714,6 +1715,78 @@ def _resolve_grid_and_haxis(ds, ref_varname):
     return x_coords, y_coords, h_axis
 
 
+# Number of parallel threads for composite S3 reads.
+# 8 keeps ~8 S3 GETs in flight simultaneously — saturates I/O without
+# overwhelming memory (~8 concurrent 3D volumes × ~10 MB ≈ 80 MB peak).
+_COMPOSITE_WORKERS = 8
+
+
+def _process_one_case_azimuthal(case_idx, rmw, variable, overlay, data_type,
+                                 x_coords, y_coords, height_km, h_axis,
+                                 max_r_rmw, dr_rmw, coverage_min):
+    """
+    Process a single case for composite azimuthal mean.
+    Runs in a thread pool — all args passed explicitly, no shared mutable state.
+    Returns (case_idx, az_mean, r_centers, ov_az_or_None) or None on failure.
+    """
+    try:
+        ds, local_idx = resolve_case(case_idx, data_type)
+        vol, _ = _extract_3d_volume(ds, local_idx, variable)
+        az_mean, _, rc = _compute_azimuthal_mean(
+            vol, x_coords, y_coords, height_km, h_axis,
+            max_r_rmw, dr_rmw, coverage_min, rmw=rmw
+        )
+
+        ov_az = None
+        if overlay:
+            try:
+                ov_vol, _ = _extract_3d_volume(ds, local_idx, overlay)
+                ov_az, _, _ = _compute_azimuthal_mean(
+                    ov_vol, x_coords, y_coords, height_km, h_axis,
+                    max_r_rmw, dr_rmw, coverage_min, rmw=rmw
+                )
+            except Exception:
+                pass
+
+        return (case_idx, az_mean, rc, ov_az)
+    except Exception as e:
+        print(f"Composite az: skipping case {case_idx}: {e}")
+        return None
+
+
+def _process_one_case_quadrant(case_idx, sddc, rmw, variable, overlay, data_type,
+                                x_coords, y_coords, height_km, h_axis,
+                                max_r_rmw, dr_rmw, coverage_min):
+    """
+    Process a single case for composite quadrant mean.
+    Runs in a thread pool — all args passed explicitly, no shared mutable state.
+    Returns (case_idx, quad_means, r_centers, ov_quad_means_or_None) or None on failure.
+    """
+    try:
+        ds, local_idx = resolve_case(case_idx, data_type)
+        vol, _ = _extract_3d_volume(ds, local_idx, variable)
+        quad_means, rc = _compute_quadrant_means(
+            vol, x_coords, y_coords, height_km, h_axis,
+            sddc, max_r_rmw, dr_rmw, coverage_min, rmw=rmw
+        )
+
+        ov_quads = None
+        if overlay:
+            try:
+                ov_vol, _ = _extract_3d_volume(ds, local_idx, overlay)
+                ov_quads, _ = _compute_quadrant_means(
+                    ov_vol, x_coords, y_coords, height_km, h_axis,
+                    sddc, max_r_rmw, dr_rmw, coverage_min, rmw=rmw
+                )
+            except Exception:
+                pass
+
+        return (case_idx, quad_means, rc, ov_quads)
+    except Exception as e:
+        print(f"Composite quad: skipping case {case_idx}: {e}")
+        return None
+
+
 @app.get("/composite/count")
 def composite_count(
     data_type:      str   = Query("swath",                description="'swath' or 'merge'"),
@@ -1787,56 +1860,58 @@ def composite_azimuthal_mean(
     display_name, varname, cmap, units, vmin, vmax = VARIABLES[variable]
     ref_varname = DERIVED_VARIABLES[variable][0] if variable in DERIVED_VARIABLES else varname
 
+    # Pre-fetch grid info from the first valid case so all workers share it
+    first_ds, _ = resolve_case(cases_with_rmw[0][0], data_type)
+    height_km = first_ds["height"].values
+    x_coords, y_coords, h_axis = _resolve_grid_and_haxis(first_ds, ref_varname)
+
     accum_sum = None
     accum_count = None
     ov_accum_sum = None
     ov_accum_count = None
     r_centers = None
-    height_km = None
     n_processed = 0
     processed_indices = []
 
-    for case_idx, rmw in cases_with_rmw:
-        try:
-            ds, local_idx = resolve_case(case_idx, data_type)
-            if height_km is None:
-                height_km = ds["height"].values
-                x_coords, y_coords, h_axis = _resolve_grid_and_haxis(ds, ref_varname)
-            vol, _ = _extract_3d_volume(ds, local_idx, variable)
-            az_mean, _, rc = _compute_azimuthal_mean(
-                vol, x_coords, y_coords, height_km, h_axis,
-                max_r_rmw, dr_rmw, coverage_min, rmw=rmw
-            )
+    # Process all cases in parallel — S3 reads are I/O-bound, so threads
+    # overlap network wait times.  Accumulation stays in the main thread.
+    with ThreadPoolExecutor(max_workers=_COMPOSITE_WORKERS) as pool:
+        futures = {
+            pool.submit(
+                _process_one_case_azimuthal,
+                case_idx, rmw, variable, overlay, data_type,
+                x_coords, y_coords, height_km, h_axis,
+                max_r_rmw, dr_rmw, coverage_min,
+            ): case_idx
+            for case_idx, rmw in cases_with_rmw
+        }
+
+        for future in as_completed(futures):
+            result = future.result()
+            if result is None:
+                continue
+
+            case_idx, az_mean, rc, ov_az = result
+
             if accum_sum is None:
                 r_centers = rc
                 accum_sum = np.zeros_like(az_mean)
                 accum_count = np.zeros_like(az_mean)
+
             valid = ~np.isnan(az_mean)
             accum_sum[valid] += az_mean[valid]
             accum_count[valid] += 1
 
-            # Overlay accumulation
-            if overlay:
-                try:
-                    ov_vol, _ = _extract_3d_volume(ds, local_idx, overlay)
-                    ov_az, _, _ = _compute_azimuthal_mean(
-                        ov_vol, x_coords, y_coords, height_km, h_axis,
-                        max_r_rmw, dr_rmw, coverage_min, rmw=rmw
-                    )
-                    if ov_accum_sum is None:
-                        ov_accum_sum = np.zeros_like(ov_az)
-                        ov_accum_count = np.zeros_like(ov_az)
-                    ov_valid = ~np.isnan(ov_az)
-                    ov_accum_sum[ov_valid] += ov_az[ov_valid]
-                    ov_accum_count[ov_valid] += 1
-                except Exception:
-                    pass  # skip overlay for this case
+            if ov_az is not None:
+                if ov_accum_sum is None:
+                    ov_accum_sum = np.zeros_like(ov_az)
+                    ov_accum_count = np.zeros_like(ov_az)
+                ov_valid = ~np.isnan(ov_az)
+                ov_accum_sum[ov_valid] += ov_az[ov_valid]
+                ov_accum_count[ov_valid] += 1
 
             n_processed += 1
             processed_indices.append(case_idx)
-        except Exception as e:
-            print(f"Composite: skipping case {case_idx}: {e}")
-            continue
 
     if n_processed == 0:
         raise HTTPException(status_code=500, detail="Could not process any matching cases.")
@@ -1938,26 +2013,39 @@ def composite_quadrant_mean(
     if not valid_cases:
         raise HTTPException(status_code=400, detail="No matching cases have both shear direction and valid RMW.")
 
+    # Pre-fetch grid info from the first valid case so all workers share it
+    first_ds, _ = resolve_case(valid_cases[0][0], data_type)
+    height_km = first_ds["height"].values
+    x_coords, y_coords, h_axis = _resolve_grid_and_haxis(first_ds, ref_varname)
+
     accum_sum = None
     accum_count = None
     ov_accum_sum = None
     ov_accum_count = None
     r_centers = None
-    height_km = None
     n_processed = 0
     processed_indices = []
 
-    for case_idx, sddc, rmw in valid_cases:
-        try:
-            ds, local_idx = resolve_case(case_idx, data_type)
-            if height_km is None:
-                height_km = ds["height"].values
-                x_coords, y_coords, h_axis = _resolve_grid_and_haxis(ds, ref_varname)
-            vol, _ = _extract_3d_volume(ds, local_idx, variable)
-            quad_means, rc = _compute_quadrant_means(
-                vol, x_coords, y_coords, height_km, h_axis,
-                sddc, max_r_rmw, dr_rmw, coverage_min, rmw=rmw
-            )
+    # Process all cases in parallel — S3 reads are I/O-bound, so threads
+    # overlap network wait times.  Accumulation stays in the main thread.
+    with ThreadPoolExecutor(max_workers=_COMPOSITE_WORKERS) as pool:
+        futures = {
+            pool.submit(
+                _process_one_case_quadrant,
+                case_idx, sddc, rmw, variable, overlay, data_type,
+                x_coords, y_coords, height_km, h_axis,
+                max_r_rmw, dr_rmw, coverage_min,
+            ): case_idx
+            for case_idx, sddc, rmw in valid_cases
+        }
+
+        for future in as_completed(futures):
+            result = future.result()
+            if result is None:
+                continue
+
+            case_idx, quad_means, rc, ov_quads = result
+
             if accum_sum is None:
                 r_centers = rc
                 accum_sum = {q: np.zeros_like(quad_means[q]) for q in QUADRANT_DEFS}
@@ -1967,29 +2055,17 @@ def composite_quadrant_mean(
                 accum_sum[q][valid] += quad_means[q][valid]
                 accum_count[q][valid] += 1
 
-            # Overlay accumulation
-            if overlay:
-                try:
-                    ov_vol, _ = _extract_3d_volume(ds, local_idx, overlay)
-                    ov_quad_means, _ = _compute_quadrant_means(
-                        ov_vol, x_coords, y_coords, height_km, h_axis,
-                        sddc, max_r_rmw, dr_rmw, coverage_min, rmw=rmw
-                    )
-                    if ov_accum_sum is None:
-                        ov_accum_sum = {q: np.zeros_like(ov_quad_means[q]) for q in QUADRANT_DEFS}
-                        ov_accum_count = {q: np.zeros_like(ov_quad_means[q]) for q in QUADRANT_DEFS}
-                    for q in QUADRANT_DEFS:
-                        ov_valid = ~np.isnan(ov_quad_means[q])
-                        ov_accum_sum[q][ov_valid] += ov_quad_means[q][ov_valid]
-                        ov_accum_count[q][ov_valid] += 1
-                except Exception:
-                    pass  # skip overlay for this case
+            if ov_quads is not None:
+                if ov_accum_sum is None:
+                    ov_accum_sum = {q: np.zeros_like(ov_quads[q]) for q in QUADRANT_DEFS}
+                    ov_accum_count = {q: np.zeros_like(ov_quads[q]) for q in QUADRANT_DEFS}
+                for q in QUADRANT_DEFS:
+                    ov_valid = ~np.isnan(ov_quads[q])
+                    ov_accum_sum[q][ov_valid] += ov_quads[q][ov_valid]
+                    ov_accum_count[q][ov_valid] += 1
 
             n_processed += 1
             processed_indices.append(case_idx)
-        except Exception as e:
-            print(f"Composite quad: skipping case {case_idx}: {e}")
-            continue
 
     if n_processed == 0:
         raise HTTPException(status_code=500, detail="Could not process any matching cases.")
