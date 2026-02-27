@@ -1020,7 +1020,7 @@ def _render_ir_png(frame_2d, vmin=190.0, vmax=310.0):
 def get_ir(case_index: int = Query(..., ge=0)):
     """
     Return IR metadata and the t=0 frame (most recent) for instant display.
-    The client should call /ir_frames afterwards to get all animation frames.
+    The client then calls /ir_frame for each additional lag index to progressively
     """
     ir_store = get_ir_dataset()
     if ir_store is None:
@@ -1075,11 +1075,11 @@ def get_ir(case_index: int = Query(..., ge=0)):
     }
 
 
-@app.get("/ir_frames")
-def get_ir_frames(case_index: int = Query(..., ge=0)):
+@app.get("/ir_frame")
+def get_ir_frame(case_index: int = Query(..., ge=0), lag_index: int = Query(..., ge=0)):
     """
-    Return all server-rendered IR PNG frames for animation.
-    Called in background after /ir provides the initial t=0 frame.
+    Return a single server-rendered IR PNG frame.
+    Called progressively by the client to build up the animation.
     """
     ir_store = get_ir_dataset()
     if ir_store is None:
@@ -1094,19 +1094,20 @@ def get_ir_frames(case_index: int = Query(..., ge=0)):
         raise HTTPException(status_code=404, detail=f"No IR data for case {case_index}")
 
     import numpy as np
-    tb = ir_store['Tb'][case_index]  # shape: (n_lags, n_lat, n_lon)
+    n_lags = ir_store['Tb'].shape[1]
+    if lag_index >= n_lags:
+        raise HTTPException(status_code=404, detail=f"lag_index {lag_index} out of range (max {n_lags-1})")
 
-    frames = []
-    for lag_i in range(tb.shape[0]):
-        frame = tb[lag_i]
-        if np.all(np.isnan(frame)):
-            frames.append(None)
-        else:
-            frames.append(_render_ir_png(frame, vmin=190.0, vmax=310.0))
+    frame = ir_store['Tb'][case_index, lag_index]
+    if np.all(np.isnan(frame)):
+        png = None
+    else:
+        png = _render_ir_png(frame, vmin=190.0, vmax=310.0)
 
     return {
         "case_index": case_index,
-        "frames": frames,
+        "lag_index": lag_index,
+        "frame": png,
     }
 
 
