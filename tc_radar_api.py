@@ -46,6 +46,7 @@ import xarray as xr
 import fsspec
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.responses import Response, JSONResponse
 
 # ---------------------------------------------------------------------------
@@ -199,6 +200,46 @@ app.add_middleware(
     allow_methods=["GET"],
     allow_headers=["*"],
 )
+
+
+# ---------------------------------------------------------------------------
+# HTTP cache headers — scientific data is immutable, cache aggressively
+# ---------------------------------------------------------------------------
+
+class CacheHeaderMiddleware(BaseHTTPMiddleware):
+    """
+    Add Cache-Control headers based on endpoint data mutability.
+
+    Immutable endpoints (radar data, IR, ERA5) get long TTLs — the data
+    will never change for a given case_index + variable + level.
+    Semi-stable endpoints (composites) get shorter TTLs since new cases
+    could be added.  Metadata/health get brief caching.
+    """
+    IMMUTABLE_PREFIXES = (
+        '/data', '/ir', '/ir_frame', '/era5',
+        '/azimuthal_mean', '/quadrant_mean',
+        '/cross_section', '/plot', '/volume',
+    )
+    SEMI_STABLE_PREFIXES = ('/composite',)
+    SHORT_CACHE_PATHS = ('/health', '/metadata', '/variables', '/levels')
+
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        path = request.url.path
+
+        # Only cache successful responses
+        if response.status_code == 200:
+            if any(path.startswith(p) for p in self.IMMUTABLE_PREFIXES):
+                response.headers['Cache-Control'] = 'public, max-age=86400, immutable'
+            elif any(path.startswith(p) for p in self.SEMI_STABLE_PREFIXES):
+                response.headers['Cache-Control'] = 'public, max-age=3600'
+            elif path in self.SHORT_CACHE_PATHS:
+                response.headers['Cache-Control'] = 'public, max-age=300'
+
+        return response
+
+
+app.add_middleware(CacheHeaderMiddleware)
 
 # ---------------------------------------------------------------------------
 # Dataset loading
@@ -366,6 +407,9 @@ _metadata_cache: dict[int, dict] = {}
 _merge_metadata_cache: dict[int, dict] = {}
 _plot_cache: OrderedDict = OrderedDict()
 _PLOT_CACHE_MAX = 500  # ~500 plots × ~150 KB ≈ 75 MB max
+
+_data_cache: OrderedDict = OrderedDict()
+_DATA_CACHE_MAX = 200  # ~200 entries × ~100 KB ≈ 20 MB max
 
 
 @app.on_event("startup")
@@ -588,6 +632,12 @@ def get_data(
     if overlay and overlay not in VARIABLES:
         raise HTTPException(status_code=400, detail=f"Unknown overlay variable '{overlay}'. See /variables.")
 
+    # Serve from cache if available (instant — no S3 read or computation)
+    cache_key = (case_index, variable, round(level_km, 1), data_type, overlay)
+    if cache_key in _data_cache:
+        _data_cache.move_to_end(cache_key)
+        return JSONResponse(_data_cache[cache_key], headers={"X-Cache": "HIT"})
+
     try:
         ds, local_idx = resolve_case(case_index, data_type)
     except Exception as e:
@@ -649,7 +699,12 @@ def get_data(
         except Exception:
             pass  # silently skip overlay if variable unavailable
 
-    return JSONResponse(result)
+    # Store in cache
+    _data_cache[cache_key] = result
+    if len(_data_cache) > _DATA_CACHE_MAX:
+        _data_cache.popitem(last=False)  # evict oldest entry
+
+    return JSONResponse(result, headers={"X-Cache": "MISS"})
 
 
 def _extract_cross_section(ds, local_idx, variable_key, x_coords, y_coords, xi_idx, yi_idx, h_axis, n_heights, n_points):
