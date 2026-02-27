@@ -407,10 +407,10 @@ MERGE_METADATA_PATH = Path(os.environ.get("MERGE_METADATA_PATH", "./tc_radar_met
 _metadata_cache: dict[int, dict] = {}
 _merge_metadata_cache: dict[int, dict] = {}
 _plot_cache: OrderedDict = OrderedDict()
-_PLOT_CACHE_MAX = 500  # ~500 plots × ~150 KB ≈ 75 MB max
+_PLOT_CACHE_MAX = 150  # ~150 plots × ~150 KB ≈ 22 MB max
 
 _data_cache: OrderedDict = OrderedDict()
-_DATA_CACHE_MAX = 200  # ~200 entries × ~100 KB ≈ 20 MB max
+_DATA_CACHE_MAX = 100  # ~100 entries × ~100 KB ≈ 10 MB max
 
 
 @app.on_event("startup")
@@ -1716,9 +1716,9 @@ def _resolve_grid_and_haxis(ds, ref_varname):
 
 
 # Number of parallel threads for composite S3 reads.
-# 8 keeps ~8 S3 GETs in flight simultaneously — saturates I/O without
-# overwhelming memory (~8 concurrent 3D volumes × ~10 MB ≈ 80 MB peak).
-_COMPOSITE_WORKERS = 8
+# 4 keeps concurrent memory usage manageable on the 512 MB Render free tier
+# (~4 concurrent 3D volumes × ~10 MB ≈ 40 MB peak, vs ~80 MB at 8 workers).
+_COMPOSITE_WORKERS = 4
 
 
 def _process_one_case_azimuthal(case_idx, rmw, variable, overlay, data_type,
