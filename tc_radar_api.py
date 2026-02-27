@@ -24,10 +24,11 @@ AOML HTTP range-request mode automatically.
 
 Local dev
 ---------
-    pip install fastapi uvicorn h5netcdf h5py fsspec xarray zarr s3fs matplotlib numpy
+    pip install fastapi uvicorn h5netcdf h5py fsspec xarray zarr s3fs matplotlib numpy Pillow
     TC_RADAR_S3_BUCKET=your-bucket uvicorn tc_radar_api:app --reload --port 8000
 """
 
+import base64
 import io
 import json
 import os
@@ -941,15 +942,88 @@ def _get_shdc(ds, local_idx):
 
 
 # ---------------------------------------------------------------------------
-# IR satellite imagery endpoint
+# IR satellite imagery – server-side PNG rendering
 # ---------------------------------------------------------------------------
+
+# Build a 256-entry RGBA lookup table matching the JS IR colormap.
+# The colormap maps normalized (1 - (Tb-vmin)/(vmax-vmin)) to RGB.
+def _build_ir_lut():
+    """Create a 256-entry uint8 RGBA LUT for IR brightness temperatures."""
+    stops = [
+        (0.00,   8,   8,   8),
+        (0.15,  40,  40,  40),
+        (0.30,  90,  90,  90),
+        (0.40, 140, 140, 140),
+        (0.50, 200, 200, 200),
+        (0.55,   0, 180, 255),
+        (0.60,   0, 100, 255),
+        (0.65,   0, 255,   0),
+        (0.70, 255, 255,   0),
+        (0.75, 255, 180,   0),
+        (0.80, 255,  80,   0),
+        (0.85, 255,   0,   0),
+        (0.90, 180,   0, 180),
+        (0.95, 255, 180, 255),
+        (1.00, 255, 255, 255),
+    ]
+    lut = np.zeros((256, 4), dtype=np.uint8)
+    for i in range(256):
+        frac = i / 255.0
+        # Find bounding stops
+        lo, hi = stops[0], stops[-1]
+        for s in range(len(stops) - 1):
+            if frac >= stops[s][0] and frac <= stops[s + 1][0]:
+                lo, hi = stops[s], stops[s + 1]
+                break
+        t = 0.0 if hi[0] == lo[0] else (frac - lo[0]) / (hi[0] - lo[0])
+        lut[i, 0] = int(lo[1] + t * (hi[1] - lo[1]) + 0.5)
+        lut[i, 1] = int(lo[2] + t * (hi[2] - lo[2]) + 0.5)
+        lut[i, 2] = int(lo[3] + t * (hi[3] - lo[3]) + 0.5)
+        lut[i, 3] = 220  # alpha
+    return lut
+
+_IR_LUT = _build_ir_lut()
+
+
+def _render_ir_png(frame_2d, vmin=190.0, vmax=310.0):
+    """
+    Render a 2D Tb array to a base64-encoded PNG string.
+    Returns a data-URL ready for use as an image src.
+    """
+    from PIL import Image
+
+    arr = np.asarray(frame_2d, dtype=np.float32)
+    # Normalize: cold clouds (low Tb) → high index → bright colors
+    frac = 1.0 - (arr - vmin) / (vmax - vmin)
+    frac = np.clip(frac, 0.0, 1.0)
+    indices = (frac * 255).astype(np.uint8)
+
+    # Apply LUT
+    rgba = _IR_LUT[indices]  # shape (H, W, 4)
+
+    # Set NaN / invalid pixels to transparent
+    mask = ~np.isfinite(arr) | (arr <= 0)
+    rgba[mask] = [0, 0, 0, 0]
+
+    # Flip vertically (lat ascending → image top-to-bottom)
+    rgba = rgba[::-1]
+
+    # Encode as PNG
+    img = Image.fromarray(rgba, 'RGBA')
+    buf = io.BytesIO()
+    img.save(buf, format='PNG', optimize=True)
+    b64 = base64.b64encode(buf.getvalue()).decode('ascii')
+    return f"data:image/png;base64,{b64}"
+
+
 @app.get("/ir")
 def get_ir(case_index: int = Query(..., ge=0)):
     """
-    Return IR brightness temperature data for a TC-RADAR case.
+    Return server-rendered IR PNG frames for a TC-RADAR case.
 
-    Returns all lag frames (9 half-hourly snapshots over 4 hours)
-    plus coordinate offsets for geo-referencing.
+    Returns 9 pre-colormapped PNG images (base64 data-URLs) plus
+    coordinate offsets for geo-referencing.  ~180 KB total vs ~4 MB
+    for raw JSON arrays.
     """
     ir_store = get_ir_dataset()
     if ir_store is None:
@@ -973,17 +1047,14 @@ def get_ir(case_index: int = Query(..., ge=0)):
     lon_offsets = ir_store['lon_offsets'][:].tolist()
     lag_hours = ir_store['lag_hours'][:].tolist()
 
-    # Convert Tb to list, replacing NaN with null
-    tb_list = []
+    # Render each frame as a colormapped PNG (base64 data-URL)
+    frames = []
     for lag_i in range(tb.shape[0]):
         frame = tb[lag_i]
-        frame_clean = []
-        for row in frame:
-            frame_clean.append([
-                None if (np.isnan(v) or v <= 0) else round(float(v), 1)
-                for v in row
-            ])
-        tb_list.append(frame_clean)
+        if np.all(np.isnan(frame)):
+            frames.append(None)
+        else:
+            frames.append(_render_ir_png(frame, vmin=190.0, vmax=310.0))
 
     # Read IR datetimes
     ir_dt_raw = ir_store['ir_datetime'][case_index]  # epoch minutes
@@ -1004,10 +1075,7 @@ def get_ir(case_index: int = Query(..., ge=0)):
         "lon_offsets": lon_offsets,
         "lag_hours": lag_hours,
         "ir_datetimes": ir_datetimes,
-        "Tb": tb_list,
-        "colormap": IR_COLORMAP,
-        "vmin": 190.0,
-        "vmax": 310.0,
+        "frames": frames,
         "units": "K",
     }
 
