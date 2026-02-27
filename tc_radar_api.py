@@ -34,6 +34,7 @@ import os
 import threading
 from collections import OrderedDict
 from functools import lru_cache
+from datetime import datetime
 from pathlib import Path
 
 import matplotlib
@@ -70,6 +71,70 @@ AOML_FILES = {
     ("swath", "recent"): f"{AOML_BASE}/tc_radar_v3m_2020_2024_xy_rel_swath_ships.nc",
     ("merge", "early"):  f"{AOML_BASE}/tc_radar_v3m_1997_2019_xy_rel_merge_ships.nc",
     ("merge", "recent"): f"{AOML_BASE}/tc_radar_v3m_2020_2024_xy_rel_merge_ships.nc",
+}
+
+
+# IR satellite imagery (MergIR) Zarr store
+IR_S3_PATH = f"s3://{S3_BUCKET}/{S3_PREFIX}/mergir" if S3_BUCKET else ""
+
+# IR colormap: NOAA-style enhanced IR (warm=dark, cold=bright/colorful)
+IR_COLORMAP = [
+    [0.0,    "rgb(8,8,8)"],
+    [0.15,   "rgb(40,40,40)"],
+    [0.30,   "rgb(90,90,90)"],
+    [0.40,   "rgb(140,140,140)"],
+    [0.50,   "rgb(200,200,200)"],
+    [0.55,   "rgb(0,180,255)"],
+    [0.60,   "rgb(0,100,255)"],
+    [0.65,   "rgb(0,255,0)"],
+    [0.70,   "rgb(255,255,0)"],
+    [0.75,   "rgb(255,180,0)"],
+    [0.80,   "rgb(255,80,0)"],
+    [0.85,   "rgb(255,0,0)"],
+    [0.90,   "rgb(180,0,180)"],
+    [0.95,   "rgb(255,180,255)"],
+    [1.0,    "rgb(255,255,255)"],
+]
+
+# ERA5 environmental diagnostics Zarr store
+ERA5_S3_PATH = f"s3://{S3_BUCKET}/{S3_PREFIX}/era5" if S3_BUCKET else ""
+
+ERA5_FIELD_CONFIG = {
+    "shear_mag": {
+        "display_name": "Deep-Layer Shear (200\u2013850 hPa)",
+        "units": "m/s", "vmin": 0, "vmax": 30,
+        "colorscale": [
+            [0.0, "rgb(255,255,204)"], [0.15, "rgb(255,237,160)"],
+            [0.30, "rgb(254,217,118)"], [0.45, "rgb(254,178,76)"],
+            [0.60, "rgb(253,141,60)"], [0.75, "rgb(240,59,32)"],
+            [0.90, "rgb(189,0,38)"], [1.0, "rgb(128,0,38)"],
+        ],
+        "has_vectors": True,
+        "vector_u": "shear_u", "vector_v": "shear_v",
+    },
+    "rh_mid": {
+        "display_name": "Mid-Level RH (500\u2013700 hPa)",
+        "units": "%", "vmin": 0, "vmax": 100,
+        "colorscale": [
+            [0.0, "rgb(140,81,10)"], [0.15, "rgb(191,129,45)"],
+            [0.30, "rgb(223,194,125)"], [0.45, "rgb(245,245,220)"],
+            [0.55, "rgb(199,234,229)"], [0.70, "rgb(128,205,193)"],
+            [0.85, "rgb(53,151,143)"], [1.0, "rgb(1,102,94)"],
+        ],
+        "has_vectors": False,
+    },
+    "div200": {
+        "display_name": "200 hPa Divergence",
+        "units": "s\u207b\u00b9", "vmin": -3e-5, "vmax": 3e-5,
+        "colorscale": [
+            [0.0, "rgb(178,24,43)"], [0.15, "rgb(214,96,77)"],
+            [0.30, "rgb(244,165,130)"], [0.45, "rgb(253,219,199)"],
+            [0.55, "rgb(209,229,240)"], [0.70, "rgb(146,197,222)"],
+            [0.85, "rgb(67,147,195)"], [1.0, "rgb(33,102,172)"],
+        ],
+        "has_vectors": True,
+        "vector_u": "u200", "vector_v": "v200",
+    },
 }
 
 CASE_COUNTS = {
@@ -159,6 +224,31 @@ def get_dataset(data_type: str, era: str) -> xr.Dataset:
         ds  = xr.open_dataset(of.open(), engine="h5netcdf")
         print(f"Opened NetCDF from AOML: {url}")
     return ds
+
+
+
+@lru_cache(maxsize=1)
+def get_ir_dataset():
+    """Open the MergIR Zarr store from S3."""
+    if not USE_S3 or not IR_S3_PATH:
+        return None
+    import s3fs
+    fs = s3fs.S3FileSystem(anon=False, client_kwargs={"region_name": AWS_REGION})
+    store = s3fs.S3Map(root=IR_S3_PATH, s3=fs, check=False)
+    import zarr
+    return zarr.open(store, mode='r')
+
+
+@lru_cache(maxsize=1)
+def get_era5_dataset():
+    """Open the ERA5 Zarr store from S3."""
+    if not USE_S3 or not ERA5_S3_PATH:
+        return None
+    import s3fs
+    fs = s3fs.S3FileSystem(anon=False, client_kwargs={"region_name": AWS_REGION})
+    store = s3fs.S3Map(root=ERA5_S3_PATH, s3=fs, check=False)
+    import zarr
+    return zarr.open(store, mode='r')
 
 
 def resolve_case(case_index: int, data_type: str) -> tuple[xr.Dataset, int]:
@@ -847,6 +937,170 @@ def _get_shdc(ds, local_idx):
     """SHDC: deep-layer shear magnitude (kt)."""
     return _get_ships_value(ds, local_idx, "shdc_ships")
 
+
+
+
+# ---------------------------------------------------------------------------
+# IR satellite imagery endpoint
+# ---------------------------------------------------------------------------
+@app.get("/ir")
+def get_ir(case_index: int = Query(..., ge=0)):
+    """
+    Return IR brightness temperature data for a TC-RADAR case.
+
+    Returns all lag frames (9 half-hourly snapshots over 4 hours)
+    plus coordinate offsets for geo-referencing.
+    """
+    ir_store = get_ir_dataset()
+    if ir_store is None:
+        raise HTTPException(status_code=503, detail="IR data not available (S3 not configured)")
+
+    # Check status
+    try:
+        status = int(ir_store['status'][case_index])
+    except (IndexError, KeyError):
+        raise HTTPException(status_code=404, detail=f"Case {case_index} not found in IR store")
+
+    if status != 1:
+        raise HTTPException(status_code=404, detail=f"No IR data for case {case_index}")
+
+    # Read data
+    import numpy as np
+    tb = ir_store['Tb'][case_index]  # shape: (n_lags, n_lat, n_lon)
+    center_lat = float(ir_store['center_lat'][case_index])
+    center_lon = float(ir_store['center_lon'][case_index])
+    lat_offsets = ir_store['lat_offsets'][:].tolist()
+    lon_offsets = ir_store['lon_offsets'][:].tolist()
+    lag_hours = ir_store['lag_hours'][:].tolist()
+
+    # Convert Tb to list, replacing NaN with null
+    tb_list = []
+    for lag_i in range(tb.shape[0]):
+        frame = tb[lag_i]
+        frame_clean = []
+        for row in frame:
+            frame_clean.append([
+                None if (np.isnan(v) or v <= 0) else round(float(v), 1)
+                for v in row
+            ])
+        tb_list.append(frame_clean)
+
+    # Read IR datetimes
+    ir_dt_raw = ir_store['ir_datetime'][case_index]  # epoch minutes
+    ir_datetimes = []
+    for val in ir_dt_raw:
+        val = int(val)
+        if val > 0:
+            dt = datetime.utcfromtimestamp(val * 60)
+            ir_datetimes.append(dt.strftime('%Y-%m-%d %H:%M UTC'))
+        else:
+            ir_datetimes.append(None)
+
+    return {
+        "case_index": case_index,
+        "center_lat": center_lat,
+        "center_lon": center_lon,
+        "lat_offsets": lat_offsets,
+        "lon_offsets": lon_offsets,
+        "lag_hours": lag_hours,
+        "ir_datetimes": ir_datetimes,
+        "Tb": tb_list,
+        "colormap": IR_COLORMAP,
+        "vmin": 190.0,
+        "vmax": 310.0,
+        "units": "K",
+    }
+
+
+
+# ---------------------------------------------------------------------------
+# ERA5 environmental diagnostics endpoint
+# ---------------------------------------------------------------------------
+@app.get("/era5")
+def get_era5(
+    case_index: int = Query(..., ge=0),
+    field: str = Query("shear_mag"),
+    include_profiles: bool = Query(True),
+):
+    """
+    Return ERA5 environmental diagnostics for a TC-RADAR case.
+
+    Parameters
+    ----------
+    case_index : int
+    field : str - 2D field to return (shear_mag, rh_mid, div200)
+    include_profiles : bool - include vertical profiles & hodograph data
+    """
+    era5 = get_era5_dataset()
+    if era5 is None:
+        raise HTTPException(status_code=503, detail="ERA5 data not available")
+
+    try:
+        status = int(era5['status'][case_index])
+    except (IndexError, KeyError):
+        raise HTTPException(status_code=404, detail=f"Case {case_index} not in ERA5 store")
+    if status != 1:
+        raise HTTPException(status_code=404, detail=f"No ERA5 data for case {case_index}")
+
+    if field not in ERA5_FIELD_CONFIG:
+        raise HTTPException(status_code=400, detail=f"Unknown field: {field}. Valid: {list(ERA5_FIELD_CONFIG.keys())}")
+
+    cfg = ERA5_FIELD_CONFIG[field]
+
+    # Read 2D field
+    data_2d = era5[field][case_index]  # (81, 81)
+    field_list = []
+    for row in data_2d:
+        field_list.append([
+            None if (np.isnan(v)) else round(float(v), 4)
+            for v in row
+        ])
+
+    result = {
+        "case_index": case_index,
+        "field": field,
+        "field_config": cfg,
+        "data": field_list,
+        "center_lat": float(era5['center_lat'][case_index]),
+        "center_lon": float(era5['center_lon'][case_index]),
+        "lat_offsets": era5['lat_offsets'][:].tolist(),
+        "lon_offsets": era5['lon_offsets'][:].tolist(),
+    }
+
+    # Add vector components if field has them (subsampled every 4 pts = ~1°)
+    if cfg.get("has_vectors"):
+        stride = 4
+        u_sub = era5[cfg["vector_u"]][case_index][::stride, ::stride]
+        v_sub = era5[cfg["vector_v"]][case_index][::stride, ::stride]
+        result["vectors"] = {
+            "u": [[round(float(v), 2) if not np.isnan(v) else None for v in row] for row in u_sub],
+            "v": [[round(float(v), 2) if not np.isnan(v) else None for v in row] for row in v_sub],
+            "stride": stride,
+        }
+
+    # Scalar diagnostics
+    result["scalars"] = {}
+    for sname in ['shear_mag_env', 'shear_dir_env', 'rh_mid_env', 'div200_env']:
+        try:
+            val = float(era5[sname][case_index])
+            result["scalars"][sname] = round(val, 4) if 'div' in sname else round(val, 1)
+        except Exception:
+            result["scalars"][sname] = None
+
+    # Vertical profiles (200-600 km annulus mean)
+    if include_profiles:
+        try:
+            result["profiles"] = {
+                "plev": era5['plev'][:].tolist(),
+                "u": [round(float(v), 2) if not np.isnan(v) else None for v in era5['u_profile'][case_index]],
+                "v": [round(float(v), 2) if not np.isnan(v) else None for v in era5['v_profile'][case_index]],
+                "rh": [round(float(v), 1) if not np.isnan(v) else None for v in era5['rh_profile'][case_index]],
+                "t": [round(float(v), 2) if not np.isnan(v) else None for v in era5['t_profile'][case_index]],
+            }
+        except Exception:
+            result["profiles"] = None
+
+    return result
 
 def _build_case_meta(case_index, ds=None, local_idx=None, data_type="swath"):
     """Build case_meta dict with SDDC included."""
