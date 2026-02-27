@@ -1008,10 +1008,10 @@ def _render_ir_png(frame_2d, vmin=190.0, vmax=310.0):
     # Flip vertically (lat ascending → image top-to-bottom)
     rgba = rgba[::-1]
 
-    # Encode as PNG
+    # Encode as PNG (level=1: 4× faster, ~same size as optimize)
     img = Image.fromarray(rgba, 'RGBA')
     buf = io.BytesIO()
-    img.save(buf, format='PNG', optimize=True)
+    img.save(buf, format='PNG', compress_level=1)
     b64 = base64.b64encode(buf.getvalue()).decode('ascii')
     return f"data:image/png;base64,{b64}"
 
@@ -1019,11 +1019,8 @@ def _render_ir_png(frame_2d, vmin=190.0, vmax=310.0):
 @app.get("/ir")
 def get_ir(case_index: int = Query(..., ge=0)):
     """
-    Return server-rendered IR PNG frames for a TC-RADAR case.
-
-    Returns 9 pre-colormapped PNG images (base64 data-URLs) plus
-    coordinate offsets for geo-referencing.  ~180 KB total vs ~4 MB
-    for raw JSON arrays.
+    Return IR metadata and the t=0 frame (most recent) for instant display.
+    The client should call /ir_frames afterwards to get all animation frames.
     """
     ir_store = get_ir_dataset()
     if ir_store is None:
@@ -1038,23 +1035,20 @@ def get_ir(case_index: int = Query(..., ge=0)):
     if status != 1:
         raise HTTPException(status_code=404, detail=f"No IR data for case {case_index}")
 
-    # Read data
+    # Read metadata
     import numpy as np
-    tb = ir_store['Tb'][case_index]  # shape: (n_lags, n_lat, n_lon)
     center_lat = float(ir_store['center_lat'][case_index])
     center_lon = float(ir_store['center_lon'][case_index])
     lat_offsets = ir_store['lat_offsets'][:].tolist()
     lon_offsets = ir_store['lon_offsets'][:].tolist()
     lag_hours = ir_store['lag_hours'][:].tolist()
 
-    # Render each frame as a colormapped PNG (base64 data-URL)
-    frames = []
-    for lag_i in range(tb.shape[0]):
-        frame = tb[lag_i]
-        if np.all(np.isnan(frame)):
-            frames.append(None)
-        else:
-            frames.append(_render_ir_png(frame, vmin=190.0, vmax=310.0))
+    # Render ONLY the t=0 frame (index 0) for instant display
+    tb_frame0 = ir_store['Tb'][case_index, 0]  # shape: (n_lat, n_lon)
+    if np.all(np.isnan(tb_frame0)):
+        frame0_png = None
+    else:
+        frame0_png = _render_ir_png(tb_frame0, vmin=190.0, vmax=310.0)
 
     # Read IR datetimes
     ir_dt_raw = ir_store['ir_datetime'][case_index]  # epoch minutes
@@ -1075,8 +1069,44 @@ def get_ir(case_index: int = Query(..., ge=0)):
         "lon_offsets": lon_offsets,
         "lag_hours": lag_hours,
         "ir_datetimes": ir_datetimes,
-        "frames": frames,
+        "n_frames": len(lag_hours),
+        "frame0": frame0_png,
         "units": "K",
+    }
+
+
+@app.get("/ir_frames")
+def get_ir_frames(case_index: int = Query(..., ge=0)):
+    """
+    Return all server-rendered IR PNG frames for animation.
+    Called in background after /ir provides the initial t=0 frame.
+    """
+    ir_store = get_ir_dataset()
+    if ir_store is None:
+        raise HTTPException(status_code=503, detail="IR data not available (S3 not configured)")
+
+    try:
+        status = int(ir_store['status'][case_index])
+    except (IndexError, KeyError):
+        raise HTTPException(status_code=404, detail=f"Case {case_index} not found in IR store")
+
+    if status != 1:
+        raise HTTPException(status_code=404, detail=f"No IR data for case {case_index}")
+
+    import numpy as np
+    tb = ir_store['Tb'][case_index]  # shape: (n_lags, n_lat, n_lon)
+
+    frames = []
+    for lag_i in range(tb.shape[0]):
+        frame = tb[lag_i]
+        if np.all(np.isnan(frame)):
+            frames.append(None)
+        else:
+            frames.append(_render_ir_png(frame, vmin=190.0, vmax=310.0))
+
+    return {
+        "case_index": case_index,
+        "frames": frames,
     }
 
 
