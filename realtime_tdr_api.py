@@ -5,6 +5,10 @@ Add-on module for tc_radar_api.py that provides endpoints for browsing
 and visualizing real-time Tail Doppler Radar (TDR) analyses from
 seb.omao.noaa.gov/pub/flight/radar/.
 
+Also provides GOES IR satellite imagery endpoints for real-time
+storm context, sourcing ABI Band 13 (10.3 µm clean IR window) data
+from NOAA's public AWS S3 buckets with xarray byte-range subsetting.
+
 How to integrate:
     In tc_radar_api.py, add near the bottom:
         from realtime_tdr_api import router as realtime_router
@@ -14,13 +18,16 @@ Or simply paste the router endpoints into tc_radar_api.py directly.
 
 Dependencies (all already in tc_radar_api.py):
     fastapi, xarray, numpy, matplotlib, requests (add if not present)
+Additional for GOES IR: s3fs, pyproj, Pillow
 """
 
+import base64
 import gzip
 import io
 import re
 import time
 from collections import OrderedDict
+from datetime import datetime as _dt, timedelta, timezone
 from html.parser import HTMLParser
 from typing import Optional
 
@@ -37,6 +44,19 @@ try:
 except ImportError:
     import urllib.request as _urllib
     _requests = None
+
+# Optional GOES IR dependencies
+try:
+    import s3fs as _s3fs
+    _HAS_S3FS = True
+except ImportError:
+    _HAS_S3FS = False
+
+try:
+    import pyproj as _pyproj
+    _HAS_PYPROJ = True
+except ImportError:
+    _HAS_PYPROJ = False
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -72,12 +92,86 @@ RT_DERIVED = {
 DEFAULT_RT_VARIABLE = "TANGENTIAL_WIND"
 
 # ---------------------------------------------------------------------------
+# GOES IR Satellite Configuration
+# ---------------------------------------------------------------------------
+# Satellite buckets (public, no auth needed)
+#   GOES-East: GOES-16 (pre Apr 2025) / GOES-19 (post Apr 2025)
+#   GOES-West: GOES-18
+GOES_BUCKETS = {
+    "east_16": "noaa-goes16",
+    "east_19": "noaa-goes19",
+    "west":    "noaa-goes18",
+}
+# Sub-satellite longitude for geostationary projection
+GOES_LON_0 = {"east": -75.2, "west": -137.2}
+GOES_SAT_HEIGHT = 35786023.0        # metres above Earth centre
+GOES_TRANSITION_DT = _dt(2025, 4, 4, 15, 0, 0, tzinfo=timezone.utc)  # GOES-19 operational
+
+IR_PRODUCT = "ABI-L2-CMIPF"         # full-disk Cloud & Moisture Imagery
+IR_BAND = 13                         # 10.3 µm clean longwave IR window
+IR_VARIABLE = "CMI"                  # variable name inside CMI single-band file
+IR_LOOKBACK_H = 4                    # hours of lookback
+IR_INTERVAL_MIN = 15                 # minutes between animation frames
+IR_N_FRAMES = int(IR_LOOKBACK_H * 60 / IR_INTERVAL_MIN) + 1  # 17 (t=0 … t−4h)
+IR_BOX_DEG = 10.0                    # geographic crop box (degrees)
+IR_VMIN = 190.0                      # brightness temperature colour limits (K)
+IR_VMAX = 310.0
+
+# Enhanced IR colormap LUT (cold → bright/colourful, warm → dark grey)
+# Same stops as the archive MergIR LUT in tc_radar_api.py
+_IR_STOPS = [
+    (0.00,   8,   8,   8),
+    (0.15,  40,  40,  40),
+    (0.30,  90,  90,  90),
+    (0.40, 140, 140, 140),
+    (0.50, 200, 200, 200),
+    (0.55,   0, 180, 255),
+    (0.60,   0, 100, 255),
+    (0.65,   0, 255,   0),
+    (0.70, 255, 255,   0),
+    (0.75, 255, 180,   0),
+    (0.80, 255,  80,   0),
+    (0.85, 255,   0,   0),
+    (0.90, 180,   0, 180),
+    (0.95, 255, 180, 255),
+    (1.00, 255, 255, 255),
+]
+
+
+def _build_ir_lut() -> np.ndarray:
+    """Build a 256-entry uint8 RGBA LUT for IR brightness temperatures."""
+    lut = np.zeros((256, 4), dtype=np.uint8)
+    for i in range(256):
+        frac = i / 255.0
+        lo, hi = _IR_STOPS[0], _IR_STOPS[-1]
+        for s in range(len(_IR_STOPS) - 1):
+            if _IR_STOPS[s][0] <= frac <= _IR_STOPS[s + 1][0]:
+                lo, hi = _IR_STOPS[s], _IR_STOPS[s + 1]
+                break
+        t = 0.0 if hi[0] == lo[0] else (frac - lo[0]) / (hi[0] - lo[0])
+        lut[i, 0] = int(lo[1] + t * (hi[1] - lo[1]) + 0.5)
+        lut[i, 1] = int(lo[2] + t * (hi[2] - lo[2]) + 0.5)
+        lut[i, 2] = int(lo[3] + t * (hi[3] - lo[3]) + 0.5)
+        lut[i, 3] = 220  # semi-transparent alpha
+    return lut
+
+
+_IR_LUT = _build_ir_lut()
+
+# ---------------------------------------------------------------------------
 # Caching
 # ---------------------------------------------------------------------------
 _rt_ds_cache = OrderedDict()       # file_url → (xr.Dataset, timestamp)
 _rt_dir_cache = OrderedDict()      # dir_url  → (link_list, timestamp)
 _RT_DS_CACHE_MAX = 8
 _RT_DIR_CACHE_TTL = 300            # 5 minutes for directory listings
+
+# GOES IR frame cache: (file_url, frame_index) → rendered result dict
+_rt_ir_cache = OrderedDict()
+_RT_IR_CACHE_MAX = 120
+
+# Shared S3 filesystem (lazy-initialised)
+_goes_fs = None
 
 router = APIRouter(tags=["realtime"])
 
@@ -286,6 +380,219 @@ def _build_case_meta(ds) -> dict:
         "analysis_level": str(attrs.get("ANALYSIS LEVEL (1--REAL-TIME,2--RESEARCH QUALITY)", "")).strip(),
         "melting_height_km": float(attrs.get("HEIGHT OF CENTER OF MELTING BAND (KM)", -999)),
         "vmax_kt": None,  # Not available in real-time files
+    }
+
+
+# ---------------------------------------------------------------------------
+# GOES IR Helpers
+# ---------------------------------------------------------------------------
+
+def _get_goes_fs():
+    """Return a shared s3fs filesystem for public NOAA GOES buckets."""
+    global _goes_fs
+    if _goes_fs is None:
+        if not _HAS_S3FS:
+            return None
+        _goes_fs = _s3fs.S3FileSystem(anon=True)
+    return _goes_fs
+
+
+def _select_goes_sat(longitude: float, analysis_dt: _dt) -> tuple[str, str]:
+    """
+    Select GOES satellite based on storm longitude and analysis date.
+
+    Returns (bucket_name, sat_key) where sat_key is 'east' or 'west'.
+    GOES-East: lon > −115°  (GOES-16 before Apr 2025, GOES-19 after)
+    GOES-West: lon ≤ −115°  (GOES-18)
+    """
+    if longitude > -115:
+        sat_key = "east"
+        # GOES-19 became operational GOES-East on 2025-04-04 15:00 UTC
+        if analysis_dt.replace(tzinfo=timezone.utc) >= GOES_TRANSITION_DT:
+            bucket = GOES_BUCKETS["east_19"]
+        else:
+            bucket = GOES_BUCKETS["east_16"]
+    else:
+        sat_key = "west"
+        bucket = GOES_BUCKETS["west"]
+    return bucket, sat_key
+
+
+def _find_goes_file(bucket: str, target_dt: _dt, tolerance_min: int = 10) -> Optional[str]:
+    """
+    Find the GOES ABI Band 13 full-disk file closest to target_dt.
+
+    Searches the S3 directory for the target hour, parses start-time from
+    each filename, and returns the full S3 key of the best match (or None).
+    """
+    fs = _get_goes_fs()
+    if fs is None:
+        return None
+
+    jday = target_dt.timetuple().tm_yday
+    prefix = f"{bucket}/{IR_PRODUCT}/{target_dt.year}/{jday:03d}/{target_dt.hour:02d}/"
+
+    try:
+        files = fs.ls(prefix, detail=False)
+    except Exception:
+        return None
+
+    # Filter to Band 13 files only
+    band_tag = f"C{IR_BAND:02d}"
+    candidates = [f for f in files if band_tag in f.split("/")[-1]]
+    if not candidates:
+        return None
+
+    # Parse start timestamp from filename:
+    #   OR_ABI-L2-CMIPF-M6C13-G16-s20231501200432_e…_c….nc
+    best_file = None
+    best_delta = timedelta(minutes=tolerance_min + 1)
+    ts_re = re.compile(r"-s(\d{4})(\d{3})(\d{2})(\d{2})(\d{2})")
+
+    for fpath in candidates:
+        fname = fpath.split("/")[-1]
+        m = ts_re.search(fname)
+        if not m:
+            continue
+        try:
+            yr, jd, hh, mm, ss = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5))
+            file_dt = _dt(yr, 1, 1, hh, mm, ss, tzinfo=timezone.utc) + timedelta(days=jd - 1)
+            delta = abs(file_dt - target_dt.replace(tzinfo=timezone.utc))
+            if delta < best_delta:
+                best_delta = delta
+                best_file = fpath
+        except Exception:
+            continue
+
+    if best_delta > timedelta(minutes=tolerance_min):
+        return None
+    return best_file
+
+
+def _latlon_to_goes_xy(lat: float, lon: float, sat_key: str) -> tuple[float, float]:
+    """
+    Convert geographic (lat, lon) to GOES fixed-grid (x, y) in radians.
+
+    Uses the geostationary projection with sweep='x' (GOES-R convention).
+    Returns (x_rad, y_rad).
+    """
+    if not _HAS_PYPROJ:
+        raise RuntimeError("pyproj is required for GOES IR subsetting")
+    lon_0 = GOES_LON_0[sat_key]
+    proj = _pyproj.Proj(proj="geos", h=GOES_SAT_HEIGHT, lon_0=lon_0, sweep="x")
+    x_m, y_m = proj(lon, lat)
+    # Convert metres → scanning-angle radians (divide by satellite height)
+    return x_m / GOES_SAT_HEIGHT, y_m / GOES_SAT_HEIGHT
+
+
+def _open_goes_subset(s3_key: str, center_lat: float, center_lon: float,
+                      sat_key: str) -> np.ndarray:
+    """
+    Open a GOES CMI file from S3 and return a geographically-subsetted
+    2D brightness-temperature array (y, x) in Kelvin.
+
+    Uses xarray + s3fs byte-range reads so only the subset chunks are
+    downloaded (~2-4 MB instead of ~25 MB).
+    """
+    fs = _get_goes_fs()
+    if fs is None:
+        raise RuntimeError("s3fs not available")
+
+    half = IR_BOX_DEG / 2.0
+    x_min, y_min = _latlon_to_goes_xy(center_lat - half, center_lon - half, sat_key)
+    x_max, y_max = _latlon_to_goes_xy(center_lat + half, center_lon + half, sat_key)
+    # Ensure ascending order for x, descending for y (GOES convention)
+    x_lo, x_hi = min(x_min, x_max), max(x_min, x_max)
+    y_lo, y_hi = min(y_min, y_max), max(y_min, y_max)
+
+    fobj = fs.open(f"s3://{s3_key}", "rb")
+    ds = xr.open_dataset(fobj, engine="h5netcdf")
+
+    # Subset — GOES y-axis is descending, x is ascending
+    ds_sub = ds.sel(x=slice(x_lo, x_hi), y=slice(y_hi, y_lo))
+
+    # Extract brightness temperature
+    if IR_VARIABLE in ds_sub:
+        tb = ds_sub[IR_VARIABLE].values.astype(np.float32)
+    else:
+        # Some files use CMI_C13 instead of CMI
+        alt_var = f"CMI_C{IR_BAND:02d}"
+        if alt_var in ds_sub:
+            tb = ds_sub[alt_var].values.astype(np.float32)
+        else:
+            raise ValueError(f"Neither {IR_VARIABLE} nor {alt_var} found in dataset")
+
+    ds.close()
+    fobj.close()
+    return tb
+
+
+def _render_ir_png(frame_2d: np.ndarray) -> Optional[str]:
+    """
+    Render a 2D Tb array to a base64-encoded PNG data-URL.
+    Uses the enhanced IR colormap LUT (cold → bright colours).
+    Returns None if all data is NaN.
+    """
+    from PIL import Image
+
+    arr = np.asarray(frame_2d, dtype=np.float32)
+    if not np.any(np.isfinite(arr)):
+        return None
+
+    # Normalise: cold clouds (low Tb) → high index → bright colours
+    frac = 1.0 - (arr - IR_VMIN) / (IR_VMAX - IR_VMIN)
+    frac = np.clip(frac, 0.0, 1.0)
+    indices = (frac * 255).astype(np.uint8)
+
+    # Apply LUT
+    rgba = _IR_LUT[indices]  # (H, W, 4)
+
+    # Set NaN / invalid pixels to transparent
+    mask = ~np.isfinite(arr) | (arr <= 0)
+    rgba[mask] = [0, 0, 0, 0]
+
+    # Flip vertically (y ascending → image top-to-bottom)
+    rgba = rgba[::-1]
+
+    img = Image.fromarray(rgba, "RGBA")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", compress_level=1)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
+
+
+def _build_frame_times(analysis_dt: _dt) -> list[_dt]:
+    """
+    Build list of target GOES scan times for the IR animation.
+    Returns IR_N_FRAMES datetimes from t=0 (most recent) to t−4h.
+    """
+    base = analysis_dt.replace(tzinfo=timezone.utc) if analysis_dt.tzinfo is None else analysis_dt
+    return [base - timedelta(minutes=i * IR_INTERVAL_MIN) for i in range(IR_N_FRAMES)]
+
+
+def _parse_tdr_datetime(meta: dict) -> _dt:
+    """Parse the analysis datetime from TDR case_meta dict."""
+    dt_str = meta.get("datetime", "")
+    if not dt_str:
+        raise ValueError("No datetime in TDR metadata")
+    # Format: "YYYY-MM-DD HH:MM:SSZ"
+    dt_str = dt_str.rstrip("Z").strip()
+    return _dt.fromisoformat(dt_str).replace(tzinfo=timezone.utc)
+
+
+def _get_ir_bounds_km(center_lat: float) -> dict:
+    """
+    Return the IR box extents in km (for Plotly underlay positioning).
+    Box is IR_BOX_DEG × IR_BOX_DEG centred on the storm.
+    """
+    half = IR_BOX_DEG / 2.0
+    km_per_deg_lat = 111.0
+    km_per_deg_lon = 111.0 * np.cos(np.radians(center_lat))
+    return {
+        "y_min_km": -half * km_per_deg_lat,
+        "y_max_km":  half * km_per_deg_lat,
+        "x_min_km": -half * km_per_deg_lon,
+        "x_max_km":  half * km_per_deg_lon,
     }
 
 
@@ -553,3 +860,160 @@ def get_rt_volume(
         "variable": var_info,
         "case_meta": case_meta,
     })
+
+
+# ---------------------------------------------------------------------------
+# GOES IR Satellite Imagery Endpoints
+# ---------------------------------------------------------------------------
+
+@router.get("/ir")
+def get_realtime_ir(
+    file_url: str = Query(..., description="URL to the TDR xy.nc(.gz) file"),
+):
+    """
+    Return GOES IR metadata and the t=0 frame (most recent) for instant display.
+
+    The client then calls /ir_frame for each additional frame index to
+    progressively build the animation (same two-phase pattern as the
+    archive IR system).
+    """
+    if not _HAS_S3FS or not _HAS_PYPROJ:
+        missing = []
+        if not _HAS_S3FS:
+            missing.append("s3fs")
+        if not _HAS_PYPROJ:
+            missing.append("pyproj")
+        raise HTTPException(
+            status_code=503,
+            detail=f"GOES IR not available — missing packages: {', '.join(missing)}",
+        )
+
+    # Open TDR file (likely already cached) and extract metadata
+    try:
+        ds = _open_rt_dataset(file_url)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not open TDR file: {e}")
+
+    meta = _build_case_meta(ds)
+    center_lat = meta["latitude"]
+    center_lon = meta["longitude"]
+
+    try:
+        analysis_dt = _parse_tdr_datetime(meta)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Select GOES satellite
+    bucket, sat_key = _select_goes_sat(center_lon, analysis_dt)
+    sat_label = f"GOES-East ({bucket.split('-')[-1].upper()})" if sat_key == "east" else "GOES-West (G18)"
+
+    # Build frame time list
+    frame_times = _build_frame_times(analysis_dt)
+    lag_minutes = [i * IR_INTERVAL_MIN for i in range(len(frame_times))]
+
+    # Fetch t=0 frame for instant display
+    frame0_png = None
+    frame0_dt_iso = None
+    try:
+        t0_key = _find_goes_file(bucket, frame_times[0])
+        if t0_key:
+            tb = _open_goes_subset(t0_key, center_lat, center_lon, sat_key)
+            frame0_png = _render_ir_png(tb)
+            frame0_dt_iso = frame_times[0].isoformat()
+            # Cache it
+            _rt_ir_cache[(file_url, 0)] = {
+                "frame_index": 0,
+                "datetime_iso": frame0_dt_iso,
+                "frame": frame0_png,
+            }
+            if len(_rt_ir_cache) > _RT_IR_CACHE_MAX:
+                _rt_ir_cache.popitem(last=False)
+    except Exception as e:
+        # Non-fatal: t=0 frame unavailable, client will show placeholder
+        frame0_png = None
+
+    # Build frame datetime list for the client
+    frame_datetimes = []
+    for ft in frame_times:
+        frame_datetimes.append(ft.strftime("%Y-%m-%d %H:%M UTC"))
+
+    # IR box bounds in km (for Plotly underlay positioning)
+    bounds_km = _get_ir_bounds_km(center_lat)
+
+    return JSONResponse({
+        "center_lat": center_lat,
+        "center_lon": center_lon,
+        "satellite": sat_key,
+        "satellite_label": sat_label,
+        "bucket": bucket,
+        "n_frames": len(frame_times),
+        "lag_minutes": lag_minutes,
+        "frame_datetimes": frame_datetimes,
+        "frame0": frame0_png,
+        "bounds_km": bounds_km,
+        "units": "K",
+    })
+
+
+@router.get("/ir_frame")
+def get_realtime_ir_frame(
+    file_url:    str = Query(..., description="URL to the TDR xy.nc(.gz) file"),
+    frame_index: int = Query(..., ge=0, description="Frame index (0 = most recent)"),
+):
+    """
+    Return a single server-rendered IR PNG frame.
+    Called progressively by the client to build up the animation.
+    """
+    if not _HAS_S3FS or not _HAS_PYPROJ:
+        raise HTTPException(status_code=503, detail="GOES IR not available")
+
+    # Check cache first
+    cache_key = (file_url, frame_index)
+    if cache_key in _rt_ir_cache:
+        _rt_ir_cache.move_to_end(cache_key)
+        return JSONResponse(_rt_ir_cache[cache_key])
+
+    # Open TDR file for metadata
+    try:
+        ds = _open_rt_dataset(file_url)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not open TDR file: {e}")
+
+    meta = _build_case_meta(ds)
+    center_lat = meta["latitude"]
+    center_lon = meta["longitude"]
+
+    try:
+        analysis_dt = _parse_tdr_datetime(meta)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    frame_times = _build_frame_times(analysis_dt)
+    if frame_index >= len(frame_times):
+        raise HTTPException(status_code=400, detail=f"frame_index {frame_index} out of range (max {len(frame_times)-1})")
+
+    bucket, sat_key = _select_goes_sat(center_lon, analysis_dt)
+    target_dt = frame_times[frame_index]
+
+    # Fetch and render
+    png = None
+    try:
+        s3_key = _find_goes_file(bucket, target_dt)
+        if s3_key:
+            tb = _open_goes_subset(s3_key, center_lat, center_lon, sat_key)
+            png = _render_ir_png(tb)
+    except Exception:
+        png = None
+
+    result = {
+        "frame_index": frame_index,
+        "datetime_iso": target_dt.strftime("%Y-%m-%d %H:%M UTC"),
+        "frame": png,
+    }
+
+    # Cache
+    _rt_ir_cache[cache_key] = result
+    if len(_rt_ir_cache) > _RT_IR_CACHE_MAX:
+        _rt_ir_cache.popitem(last=False)
+
+    return JSONResponse(result)
