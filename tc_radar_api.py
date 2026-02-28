@@ -140,6 +140,28 @@ ERA5_FIELD_CONFIG = {
         "has_vectors": True,
         "vector_u": "u200", "vector_v": "v200",
     },
+    "sst": {
+        "display_name": "Sea Surface Temperature",
+        "units": "°C", "vmin": 18, "vmax": 32,
+        "colorscale": [
+            [0.0, "rgb(49,54,149)"], [0.15, "rgb(69,117,180)"],
+            [0.30, "rgb(116,173,209)"], [0.45, "rgb(171,217,233)"],
+            [0.55, "rgb(253,174,97)"], [0.70, "rgb(244,109,67)"],
+            [0.85, "rgb(215,48,39)"], [1.0, "rgb(165,0,38)"],
+        ],
+        "has_vectors": False,
+    },
+    "entropy_def": {
+        "display_name": "Entropy Deficit (χₘ)",
+        "units": "", "vmin": 0, "vmax": 2.0,
+        "colorscale": [
+            [0.0, "rgb(247,252,245)"], [0.15, "rgb(199,233,192)"],
+            [0.30, "rgb(161,217,155)"], [0.45, "rgb(116,196,118)"],
+            [0.60, "rgb(49,163,84)"], [0.75, "rgb(0,109,44)"],
+            [0.90, "rgb(0,68,27)"], [1.0, "rgb(0,40,16)"],
+        ],
+        "has_vectors": False,
+    },
 }
 
 CASE_COUNTS = {
@@ -1325,6 +1347,101 @@ def get_era5(
             result["profiles"] = None
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# ERA5 scalar recomputation at user-specified annuli
+# ---------------------------------------------------------------------------
+@app.get("/era5_scalars")
+def get_era5_scalars(
+    case_index: int = Query(..., ge=0),
+    inner_km: float = Query(200, ge=0, le=1000, description="Inner annulus radius (km)"),
+    outer_km: float = Query(800, ge=50, le=1200, description="Outer annulus radius (km)"),
+):
+    """
+    Recompute area-mean scalar diagnostics from the gridded ERA5 2D fields
+    at a user-specified annulus.
+
+    This allows users to explore sensitivity of environmental diagnostics
+    to the averaging domain without requiring Zarr-level precomputation.
+    """
+    era5 = get_era5_dataset()
+    if era5 is None:
+        raise HTTPException(status_code=503, detail="ERA5 data not available")
+
+    try:
+        status = int(era5['status'][case_index])
+    except (IndexError, KeyError):
+        raise HTTPException(status_code=404, detail=f"Case {case_index} not in ERA5 store")
+    if status != 1:
+        raise HTTPException(status_code=404, detail=f"No ERA5 data for case {case_index}")
+
+    center_lat = float(era5['center_lat'][case_index])
+    lat_offsets = era5['lat_offsets'][:]
+    lon_offsets = era5['lon_offsets'][:]
+    cos_lat = np.cos(np.deg2rad(center_lat))
+
+    # Build distance grid (km)
+    dlon_grid, dlat_grid = np.meshgrid(lon_offsets, lat_offsets)
+    dist_km = np.sqrt((dlat_grid * 111.0)**2 + (dlon_grid * 111.0 * cos_lat)**2)
+    mask = (dist_km >= inner_km) & (dist_km <= outer_km)
+
+    if mask.sum() < 4:
+        raise HTTPException(status_code=400,
+                            detail=f"Annulus {inner_km}-{outer_km} km contains too few grid points")
+
+    result = {
+        "case_index": case_index,
+        "inner_km": inner_km,
+        "outer_km": outer_km,
+        "n_points": int(mask.sum()),
+    }
+
+    # Recompute shear from vector components
+    try:
+        shear_u = era5['shear_u'][case_index]
+        shear_v = era5['shear_v'][case_index]
+        su = float(np.nanmean(shear_u[mask]))
+        sv = float(np.nanmean(shear_v[mask]))
+        result["shear_mag_env"] = round(float(np.sqrt(su**2 + sv**2)), 1)
+        shear_dir_math = np.degrees(np.arctan2(sv, su))
+        result["shear_dir_env"] = round(float((270 - shear_dir_math) % 360), 0)
+    except Exception:
+        result["shear_mag_env"] = None
+        result["shear_dir_env"] = None
+
+    # Recompute RH mid
+    try:
+        rh_mid = era5['rh_mid'][case_index]
+        result["rh_mid_env"] = round(float(np.nanmean(rh_mid[mask])), 0)
+    except Exception:
+        result["rh_mid_env"] = None
+
+    # Recompute divergence
+    try:
+        div200 = era5['div200'][case_index]
+        result["div200_env"] = round(float(np.nanmean(div200[mask])), 4)
+    except Exception:
+        result["div200_env"] = None
+
+    # Recompute SST
+    try:
+        sst = era5['sst'][case_index]
+        result["sst_env"] = round(float(np.nanmean(sst[mask])), 1)
+    except Exception:
+        result["sst_env"] = None
+
+    # PI, chi_m, and vent_index are precomputed and not recomputable
+    # from 2D grids alone (require vertical profiles), so return stored values
+    for sname in ['chi_m', 'v_pi', 'vent_index']:
+        try:
+            val = float(era5[sname][case_index])
+            result[sname] = round(val, 3) if not np.isnan(val) else None
+        except Exception:
+            result[sname] = None
+
+    return result
+
 
 def _build_case_meta(case_index, ds=None, local_idx=None, data_type="swath"):
     """Build case_meta dict with SDDC included."""
