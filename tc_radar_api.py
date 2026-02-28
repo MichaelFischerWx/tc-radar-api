@@ -1345,7 +1345,7 @@ def get_era5(
                 "t": [round(float(v), 2) if not np.isnan(v) else None for v in t_arr],
                 "theta": [round(float(v), 1) if not np.isnan(v) else None for v in theta],
                 "theta_e": [round(float(v), 1) if not np.isnan(v) else None for v in theta_e],
-                "q": [round(float(v), 2) if not np.isnan(v) else None for v in q_arr],
+                "q": [round(float(v), 6) if not np.isnan(v) else None for v in q_arr],
             }
         except Exception:
             result["profiles"] = None
@@ -1518,7 +1518,7 @@ def get_era5_sounding(
             result["profiles"] = {
                 "plev": plev.tolist(),
                 "t": [round(float(v), 2) if not np.isnan(v) else None for v in t_prof],
-                "q": [round(float(v), 2) if not np.isnan(v) else None for v in q_prof],
+                "q": [round(float(v), 6) if not np.isnan(v) else None for v in q_prof],
                 "rh": [round(float(v), 1) if not np.isnan(v) else None for v in rh_prof],
                 "theta": [round(float(v), 1) if not np.isnan(v) else None for v in theta],
                 "theta_e": [round(float(v), 1) if not np.isnan(v) else None for v in theta_e],
@@ -1544,7 +1544,7 @@ def get_era5_sounding(
         result["profiles"] = {
             "plev": plev.tolist(),
             "t": [round(float(v), 2) if not np.isnan(v) else None for v in t_arr],
-            "q": [round(float(v), 2) if not np.isnan(v) else None for v in q_arr],
+            "q": [round(float(v), 6) if not np.isnan(v) else None for v in q_arr],
             "rh": [round(float(v), 1) if not np.isnan(v) else None for v in era5['rh_profile'][case_index]],
             "theta": [round(float(v), 1) if not np.isnan(v) else None for v in theta],
             "theta_e": [round(float(v), 1) if not np.isnan(v) else None for v in theta_e],
