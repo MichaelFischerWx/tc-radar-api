@@ -3248,6 +3248,8 @@ def plot(
         _plot_cache.popitem(last=False)  # evict oldest entry
     return Response(content=png, media_type="image/png", headers={"X-Cache": "MISS"})
 
+from realtime_tdr_api import router as realtime_router
+app.include_router(realtime_router, prefix="/realtime")
 
 if __name__ == "__main__":
     import uvicorn
