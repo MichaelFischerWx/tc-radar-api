@@ -575,18 +575,22 @@ def health():
     }
 
 
-@app.get("/debug")
-def debug():
-    """Temporary debug endpoint — shows what xarray sees in the Zarr store."""
-    try:
-        ds = get_dataset("swath", "early")
-        return {
-            "dims": dict(ds.sizes),
-            "data_vars": list(ds.data_vars),
-            "coords": list(ds.coords),
-        }
-    except Exception as e:
-        return {"error": str(e)}
+# /debug endpoint removed for production — exposed internal dataset structure.
+# To re-enable for development, uncomment the block below and protect with auth.
+# @app.get("/debug")
+# def debug():
+#     """Debug endpoint — shows what xarray sees in the Zarr store."""
+#     try:
+#         ds = get_dataset("swath", "early")
+#         return {"dims": dict(ds.sizes), "data_vars": list(ds.data_vars), "coords": list(ds.coords)}
+#     except Exception as e:
+#         return {"error": str(e)}
+
+
+@app.get("/health")
+def health_check():
+    """Lightweight health/readiness check for monitoring cold-start status."""
+    return {"status": "ok", "version": "2.0"}
 
 
 @app.get("/variables")
