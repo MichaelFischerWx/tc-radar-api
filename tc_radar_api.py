@@ -2780,6 +2780,360 @@ def composite_plan_view(
     return JSONResponse(result)
 
 
+# ---------------------------------------------------------------------------
+# Environmental composite endpoints (ERA5)
+# ---------------------------------------------------------------------------
+
+# Common target grid for storm-relative km compositing
+_ENV_COMP_GRID_KM = np.linspace(-1100, 1100, 81)  # ±1100 km at ~27 km spacing
+
+
+def _process_one_case_era5_plan_view(case_idx, field, include_vectors, target_x_km, target_y_km):
+    """
+    Process a single case for ERA5 environmental plan-view composite.
+    Regrids from degree-offset to a common km grid.
+    Returns (case_idx, data_km, vec_u_km, vec_v_km) or None.
+    """
+    try:
+        era5 = get_era5_dataset()
+        if era5 is None:
+            return None
+        status = int(era5['status'][case_idx])
+        if status != 1:
+            return None
+
+        data_deg = era5[field][case_idx]  # (81, 81) in degree offsets
+        center_lat = float(era5['center_lat'][case_idx])
+        lat_offsets = era5['lat_offsets'][:]
+        lon_offsets = era5['lon_offsets'][:]
+
+        # Convert degree offsets to km
+        y_km_src = lat_offsets * 111.0
+        x_km_src = lon_offsets * 111.0 * np.cos(np.deg2rad(center_lat))
+
+        # Regrid onto common km grid
+        interp = RegularGridInterpolator(
+            (y_km_src, x_km_src), np.array(data_deg, dtype=np.float64),
+            method='linear', bounds_error=False, fill_value=np.nan
+        )
+        yy, xx = np.meshgrid(target_y_km, target_x_km, indexing='ij')
+        data_km = interp((yy, xx)).astype(np.float32)
+
+        vec_u_km = None
+        vec_v_km = None
+        if include_vectors:
+            cfg = ERA5_FIELD_CONFIG.get(field, {})
+            if cfg.get('has_vectors'):
+                u_data = era5[cfg['vector_u']][case_idx]
+                v_data = era5[cfg['vector_v']][case_idx]
+                interp_u = RegularGridInterpolator(
+                    (y_km_src, x_km_src), np.array(u_data, dtype=np.float64),
+                    method='linear', bounds_error=False, fill_value=np.nan
+                )
+                interp_v = RegularGridInterpolator(
+                    (y_km_src, x_km_src), np.array(v_data, dtype=np.float64),
+                    method='linear', bounds_error=False, fill_value=np.nan
+                )
+                vec_u_km = interp_u((yy, xx)).astype(np.float32)
+                vec_v_km = interp_v((yy, xx)).astype(np.float32)
+
+        return (case_idx, data_km, vec_u_km, vec_v_km)
+    except Exception as e:
+        print(f"Composite era5_plan_view: skipping case {case_idx}: {e}")
+        return None
+
+
+@app.get("/composite/era5_plan_view")
+def composite_era5_plan_view(
+    filters: dict = Depends(_composite_filter_params),
+    field: str = Query("shear_mag", description="ERA5 field name"),
+    radius_km: float = Query(500, ge=100, le=1100, description="Crop radius (km)"),
+    include_vectors: bool = Query(False, description="Include vector components"),
+    data_type: str = Query("swath", description="'swath' or 'merge'"),
+):
+    """Composite mean + std of an ERA5 2D field in storm-relative km coordinates."""
+    era5 = get_era5_dataset()
+    if era5 is None:
+        raise HTTPException(status_code=503, detail="ERA5 data not available")
+    if field not in ERA5_FIELD_CONFIG:
+        raise HTTPException(status_code=400, detail=f"Unknown field: {field}")
+
+    matching = _filter_cases_for_composite(**filters, data_type=data_type)
+    if not matching:
+        raise HTTPException(status_code=404, detail="No matching cases")
+
+    # Filter to cases with ERA5 data
+    era5_status = era5['status'][:]
+    matching = [ci for ci in matching if ci < len(era5_status) and int(era5_status[ci]) == 1]
+    if not matching:
+        raise HTTPException(status_code=404, detail="No matching cases with ERA5 data")
+
+    target_x_km = _ENV_COMP_GRID_KM.copy()
+    target_y_km = _ENV_COMP_GRID_KM.copy()
+    grid_shape = (len(target_y_km), len(target_x_km))
+
+    accum_sum = np.zeros(grid_shape, dtype=np.float64)
+    accum_sq = np.zeros(grid_shape, dtype=np.float64)
+    accum_count = np.zeros(grid_shape, dtype=np.float64)
+    vec_u_sum = np.zeros(grid_shape, dtype=np.float64) if include_vectors else None
+    vec_v_sum = np.zeros(grid_shape, dtype=np.float64) if include_vectors else None
+    vec_count = np.zeros(grid_shape, dtype=np.float64) if include_vectors else None
+    processed = []
+
+    with ThreadPoolExecutor(max_workers=_COMPOSITE_WORKERS) as pool:
+        futures = {
+            pool.submit(
+                _process_one_case_era5_plan_view,
+                ci, field, include_vectors, target_x_km, target_y_km
+            ): ci for ci in matching[:_COMPOSITE_MAX_CASES]
+        }
+        for future in as_completed(futures):
+            result = future.result()
+            if result is None:
+                continue
+            ci, data_km, vu, vv = result
+            valid = np.isfinite(data_km)
+            accum_sum[valid] += data_km[valid]
+            accum_sq[valid] += data_km[valid] ** 2
+            accum_count[valid] += 1
+            if include_vectors and vu is not None:
+                vu_valid = np.isfinite(vu)
+                vec_u_sum[vu_valid] += vu[vu_valid]
+                vv_valid = np.isfinite(vv)
+                vec_v_sum[vv_valid] += vv[vv_valid]
+                vec_count[vu_valid] += 1
+            processed.append(ci)
+
+    n_cases = len(processed)
+    if n_cases == 0:
+        raise HTTPException(status_code=404, detail="No valid ERA5 cases processed")
+
+    min_cases = max(2, int(0.33 * n_cases))
+    mean_2d = np.where(accum_count >= min_cases, accum_sum / accum_count, np.nan)
+    variance = np.where(
+        accum_count >= min_cases,
+        accum_sq / accum_count - (accum_sum / accum_count) ** 2,
+        np.nan
+    )
+    std_2d = np.sqrt(np.maximum(variance, 0))
+
+    # Crop to radius_km
+    yy, xx = np.meshgrid(target_y_km, target_x_km, indexing='ij')
+    dist = np.sqrt(xx**2 + yy**2)
+    crop_mask = dist > radius_km
+    mean_2d[crop_mask] = np.nan
+    std_2d[crop_mask] = np.nan
+
+    cfg = ERA5_FIELD_CONFIG[field]
+    response = {
+        "field": field,
+        "field_config": cfg,
+        "mean": _clean_2d(mean_2d),
+        "std": _clean_2d(std_2d),
+        "x_km": [round(float(v), 1) for v in target_x_km],
+        "y_km": [round(float(v), 1) for v in target_y_km],
+        "n_cases": n_cases,
+        "case_list": _build_case_list(processed, data_type),
+    }
+
+    if include_vectors and vec_u_sum is not None:
+        vec_mean_u = np.where(vec_count >= min_cases, vec_u_sum / vec_count, np.nan)
+        vec_mean_v = np.where(vec_count >= min_cases, vec_v_sum / vec_count, np.nan)
+        vec_mean_u[crop_mask] = np.nan
+        vec_mean_v[crop_mask] = np.nan
+        stride = max(1, len(target_x_km) // 12)
+        response["vectors"] = {
+            "u": _clean_2d(vec_mean_u[::stride, ::stride]),
+            "v": _clean_2d(vec_mean_v[::stride, ::stride]),
+            "stride": stride,
+        }
+
+    return JSONResponse(response)
+
+
+@app.get("/composite/era5_profiles")
+def composite_era5_profiles(
+    filters: dict = Depends(_composite_filter_params),
+    data_type: str = Query("swath", description="'swath' or 'merge'"),
+):
+    """
+    Composite mean +/- std vertical profiles (T, Td, RH, u, v, theta, theta_e)
+    from precomputed ERA5 200-600 km annulus profiles.
+    """
+    era5 = get_era5_dataset()
+    if era5 is None:
+        raise HTTPException(status_code=503, detail="ERA5 data not available")
+
+    matching = _filter_cases_for_composite(**filters, data_type=data_type)
+    if not matching:
+        raise HTTPException(status_code=404, detail="No matching cases")
+
+    era5_status = era5['status'][:]
+    matching = [ci for ci in matching if ci < len(era5_status) and int(era5_status[ci]) == 1]
+    if not matching:
+        raise HTTPException(status_code=404, detail="No matching cases with ERA5 data")
+
+    matching = matching[:_COMPOSITE_MAX_CASES]
+
+    plev = era5['plev'][:].astype(float)
+    n_lev = len(plev)
+    n_cases = len(matching)
+
+    t_all = np.full((n_cases, n_lev), np.nan, dtype=np.float64)
+    q_all = np.full((n_cases, n_lev), np.nan, dtype=np.float64)
+    rh_all = np.full((n_cases, n_lev), np.nan, dtype=np.float64)
+    u_all = np.full((n_cases, n_lev), np.nan, dtype=np.float64)
+    v_all = np.full((n_cases, n_lev), np.nan, dtype=np.float64)
+
+    valid_count = 0
+    for i, ci in enumerate(matching):
+        try:
+            t_all[i] = era5['t_profile'][ci].astype(float)
+            q_all[i] = era5['q_profile'][ci].astype(float)
+            rh_all[i] = era5['rh_profile'][ci].astype(float)
+            u_all[i] = era5['u_profile'][ci].astype(float)
+            v_all[i] = era5['v_profile'][ci].astype(float)
+            valid_count += 1
+        except Exception:
+            pass
+
+    if valid_count < 2:
+        raise HTTPException(status_code=404, detail="Insufficient valid profiles")
+
+    q_kgkg = q_all.copy()
+    if np.nanmax(q_all) > 0.5:
+        q_kgkg = q_all / 1000.0
+
+    # Dewpoint from specific humidity and pressure (vectorized per level)
+    td_all = np.full_like(t_all, np.nan)
+    for lev in range(n_lev):
+        p_pa = plev[lev] * 100.0
+        q_lev = q_kgkg[:, lev]
+        t_lev = t_all[:, lev]
+        valid_mask = np.isfinite(q_lev) & (q_lev > 0) & np.isfinite(t_lev)
+        if not valid_mask.any():
+            continue
+        e = q_lev[valid_mask] * p_pa / (0.622 + 0.378 * q_lev[valid_mask])
+        e_sat = 610.94 * np.exp(17.625 * (t_lev[valid_mask] - 273.15) / (t_lev[valid_mask] - 273.15 + 243.04))
+        e = np.minimum(e, e_sat)
+        e = np.maximum(e, 1e-3)
+        ln_e = np.log(e / 611.2)
+        td_c = 243.5 * ln_e / (17.67 - ln_e)
+        td_all[valid_mask, lev] = td_c + 273.15
+
+    Rd_Cp = 287.04 / 1005.7
+    theta_all = t_all * (1000.0 / plev[np.newaxis, :]) ** Rd_Cp
+    Lv, Cpd = 2.501e6, 1005.7
+    theta_e_all = theta_all * np.exp(Lv * q_kgkg / (Cpd * t_all))
+
+    def _profile_stats(arr, decimals=2):
+        mean = np.nanmean(arr, axis=0)
+        std = np.nanstd(arr, axis=0)
+        med = np.nanmedian(arr, axis=0)
+        p25 = np.nanpercentile(arr, 25, axis=0)
+        p75 = np.nanpercentile(arr, 75, axis=0)
+        pmin = np.nanmin(arr, axis=0)
+        pmax = np.nanmax(arr, axis=0)
+        count = np.sum(np.isfinite(arr), axis=0)
+
+        def _to_list(a, d=decimals):
+            return [round(float(v), d) if np.isfinite(v) else None for v in a]
+
+        return {
+            "mean": _to_list(mean), "std": _to_list(std),
+            "median": _to_list(med), "p25": _to_list(p25), "p75": _to_list(p75),
+            "min": _to_list(pmin), "max": _to_list(pmax),
+            "n_valid": [int(v) for v in count],
+        }
+
+    return JSONResponse({
+        "plev": plev.tolist(),
+        "n_cases": valid_count,
+        "t": _profile_stats(t_all),
+        "td": _profile_stats(td_all),
+        "q": _profile_stats(q_all, decimals=4),
+        "rh": _profile_stats(rh_all, decimals=1),
+        "u": _profile_stats(u_all),
+        "v": _profile_stats(v_all),
+        "theta": _profile_stats(theta_all, decimals=1),
+        "theta_e": _profile_stats(theta_e_all, decimals=1),
+        "case_list": _build_case_list(matching, data_type),
+    })
+
+
+@app.get("/composite/era5_scalars")
+def composite_era5_scalars(
+    filters: dict = Depends(_composite_filter_params),
+    data_type: str = Query("swath", description="'swath' or 'merge'"),
+):
+    """Composite statistics for all ERA5 scalar diagnostics."""
+    era5 = get_era5_dataset()
+    if era5 is None:
+        raise HTTPException(status_code=503, detail="ERA5 data not available")
+
+    matching = _filter_cases_for_composite(**filters, data_type=data_type)
+    if not matching:
+        raise HTTPException(status_code=404, detail="No matching cases")
+
+    era5_status = era5['status'][:]
+    matching = [ci for ci in matching if ci < len(era5_status) and int(era5_status[ci]) == 1]
+    if not matching:
+        raise HTTPException(status_code=404, detail="No matching cases with ERA5 data")
+
+    matching = matching[:_COMPOSITE_MAX_CASES]
+    indices = np.array(matching)
+
+    scalar_names = [
+        'shear_mag_env', 'shear_dir_env', 'rh_mid_env', 'div200_env',
+        'sst_env', 'chi_m', 'v_pi', 'vent_index',
+    ]
+    scalar_meta = {
+        'shear_mag_env': {"display_name": "Deep-Layer Shear", "units": "m/s", "decimals": 1},
+        'shear_dir_env': {"display_name": "Shear Direction", "units": "\u00b0", "decimals": 0},
+        'rh_mid_env': {"display_name": "Mid-Level RH", "units": "%", "decimals": 0},
+        'div200_env': {"display_name": "200-hPa Divergence", "units": "\u00d710\u207b\u2075 s\u207b\u00b9", "decimals": 2, "scale": 1e5},
+        'sst_env': {"display_name": "SST", "units": "\u00b0C", "decimals": 1},
+        'chi_m': {"display_name": "Entropy Deficit (\u03c7\u2098)", "units": "", "decimals": 2},
+        'v_pi': {"display_name": "Potential Intensity", "units": "m/s", "decimals": 1},
+        'vent_index': {"display_name": "Ventilation Index", "units": "", "decimals": 3},
+    }
+
+    scalars = {}
+    for sname in scalar_names:
+        try:
+            values = np.array([float(era5[sname][ci]) for ci in indices])
+            valid = values[np.isfinite(values)]
+            if len(valid) == 0:
+                scalars[sname] = None
+                continue
+
+            meta = scalar_meta.get(sname, {"display_name": sname, "units": "", "decimals": 2})
+            scale = meta.get("scale", 1.0)
+            d = meta["decimals"]
+
+            scalars[sname] = {
+                "display_name": meta["display_name"],
+                "units": meta["units"],
+                "mean": round(float(np.mean(valid)) * scale, d),
+                "std": round(float(np.std(valid)) * scale, d),
+                "median": round(float(np.median(valid)) * scale, d),
+                "p25": round(float(np.percentile(valid, 25)) * scale, d),
+                "p75": round(float(np.percentile(valid, 75)) * scale, d),
+                "min": round(float(np.min(valid)) * scale, d),
+                "max": round(float(np.max(valid)) * scale, d),
+                "n_valid": len(valid),
+                "values": [round(float(v) * scale, d) for v in valid],
+            }
+        except Exception:
+            scalars[sname] = None
+
+    return JSONResponse({
+        "n_cases": len(matching),
+        "scalars": scalars,
+        "case_list": _build_case_list(matching, data_type),
+    })
+
+
 @app.get("/plot")
 def plot(
     case_index: int   = Query(...,              ge=0,          description="0-based case index"),
