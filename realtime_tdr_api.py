@@ -22,6 +22,7 @@ Additional for GOES IR: s3fs, pyproj, Pillow
 """
 
 import base64
+import gc
 import gzip
 import io
 import re
@@ -45,18 +46,35 @@ except ImportError:
     import urllib.request as _urllib
     _requests = None
 
-# Optional GOES IR dependencies
-try:
-    import s3fs as _s3fs
-    _HAS_S3FS = True
-except ImportError:
-    _HAS_S3FS = False
+# Optional GOES IR dependencies — LAZY loaded to save ~80 MB RAM at startup.
+# The actual imports happen inside _get_s3fs_module() and _get_pyproj_module()
+# only when an IR endpoint is called.
+_s3fs_mod = None      # lazy: import s3fs
+_pyproj_mod = None    # lazy: import pyproj
 
-try:
-    import pyproj as _pyproj
-    _HAS_PYPROJ = True
-except ImportError:
-    _HAS_PYPROJ = False
+
+def _get_s3fs_module():
+    """Lazy-import s3fs on first use."""
+    global _s3fs_mod
+    if _s3fs_mod is None:
+        try:
+            import s3fs
+            _s3fs_mod = s3fs
+        except ImportError:
+            return None
+    return _s3fs_mod
+
+
+def _get_pyproj_module():
+    """Lazy-import pyproj on first use."""
+    global _pyproj_mod
+    if _pyproj_mod is None:
+        try:
+            import pyproj
+            _pyproj_mod = pyproj
+        except ImportError:
+            return None
+    return _pyproj_mod
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -111,9 +129,9 @@ IR_PRODUCT = "ABI-L2-CMIPF"         # full-disk Cloud & Moisture Imagery
 IR_BAND = 13                         # 10.3 µm clean longwave IR window
 IR_VARIABLE = "CMI"                  # variable name inside CMI single-band file
 IR_LOOKBACK_H = 4                    # hours of lookback
-IR_INTERVAL_MIN = 15                 # minutes between animation frames
-IR_N_FRAMES = int(IR_LOOKBACK_H * 60 / IR_INTERVAL_MIN) + 1  # 17 (t=0 … t−4h)
-IR_BOX_DEG = 10.0                    # geographic crop box (degrees)
+IR_INTERVAL_MIN = 30                 # minutes between animation frames (was 15)
+IR_N_FRAMES = int(IR_LOOKBACK_H * 60 / IR_INTERVAL_MIN) + 1  # 9 (t=0 … t−4h)
+IR_BOX_DEG = 8.0                     # geographic crop box (degrees, was 10)
 IR_VMIN = 190.0                      # brightness temperature colour limits (K)
 IR_VMAX = 310.0
 
@@ -163,12 +181,12 @@ _IR_LUT = _build_ir_lut()
 # ---------------------------------------------------------------------------
 _rt_ds_cache = OrderedDict()       # file_url → (xr.Dataset, timestamp)
 _rt_dir_cache = OrderedDict()      # dir_url  → (link_list, timestamp)
-_RT_DS_CACHE_MAX = 8
+_RT_DS_CACHE_MAX = 3               # was 8 — keep fewer datasets in RAM
 _RT_DIR_CACHE_TTL = 300            # 5 minutes for directory listings
 
 # GOES IR frame cache: (file_url, frame_index) → rendered result dict
 _rt_ir_cache = OrderedDict()
-_RT_IR_CACHE_MAX = 120
+_RT_IR_CACHE_MAX = 20              # was 120 — keep fewer PNG frames in RAM
 
 # Shared S3 filesystem (lazy-initialised)
 _goes_fs = None
@@ -391,9 +409,10 @@ def _get_goes_fs():
     """Return a shared s3fs filesystem for public NOAA GOES buckets."""
     global _goes_fs
     if _goes_fs is None:
-        if not _HAS_S3FS:
+        s3fs = _get_s3fs_module()
+        if s3fs is None:
             return None
-        _goes_fs = _s3fs.S3FileSystem(anon=True)
+        _goes_fs = s3fs.S3FileSystem(anon=True)
     return _goes_fs
 
 
@@ -476,10 +495,11 @@ def _latlon_to_goes_xy(lat: float, lon: float, sat_key: str) -> tuple[float, flo
     Uses the geostationary projection with sweep='x' (GOES-R convention).
     Returns (x_rad, y_rad).
     """
-    if not _HAS_PYPROJ:
+    pyproj = _get_pyproj_module()
+    if pyproj is None:
         raise RuntimeError("pyproj is required for GOES IR subsetting")
     lon_0 = GOES_LON_0[sat_key]
-    proj = _pyproj.Proj(proj="geos", h=GOES_SAT_HEIGHT, lon_0=lon_0, sweep="x")
+    proj = pyproj.Proj(proj="geos", h=GOES_SAT_HEIGHT, lon_0=lon_0, sweep="x")
     x_m, y_m = proj(lon, lat)
     # Convert metres → scanning-angle radians (divide by satellite height)
     return x_m / GOES_SAT_HEIGHT, y_m / GOES_SAT_HEIGHT
@@ -506,24 +526,27 @@ def _open_goes_subset(s3_key: str, center_lat: float, center_lon: float,
     y_lo, y_hi = min(y_min, y_max), max(y_min, y_max)
 
     fobj = fs.open(f"s3://{s3_key}", "rb")
-    ds = xr.open_dataset(fobj, engine="h5netcdf")
+    try:
+        ds = xr.open_dataset(fobj, engine="h5netcdf")
 
-    # Subset — GOES y-axis is descending, x is ascending
-    ds_sub = ds.sel(x=slice(x_lo, x_hi), y=slice(y_hi, y_lo))
+        # Subset — GOES y-axis is descending, x is ascending
+        ds_sub = ds.sel(x=slice(x_lo, x_hi), y=slice(y_hi, y_lo))
 
-    # Extract brightness temperature
-    if IR_VARIABLE in ds_sub:
-        tb = ds_sub[IR_VARIABLE].values.astype(np.float32)
-    else:
-        # Some files use CMI_C13 instead of CMI
-        alt_var = f"CMI_C{IR_BAND:02d}"
-        if alt_var in ds_sub:
-            tb = ds_sub[alt_var].values.astype(np.float32)
+        # Extract brightness temperature
+        if IR_VARIABLE in ds_sub:
+            tb = ds_sub[IR_VARIABLE].values.astype(np.float32)
         else:
-            raise ValueError(f"Neither {IR_VARIABLE} nor {alt_var} found in dataset")
-
-    ds.close()
-    fobj.close()
+            # Some files use CMI_C13 instead of CMI
+            alt_var = f"CMI_C{IR_BAND:02d}"
+            if alt_var in ds_sub:
+                tb = ds_sub[alt_var].values.astype(np.float32)
+            else:
+                raise ValueError(f"Neither {IR_VARIABLE} nor {alt_var} found in dataset")
+    finally:
+        ds.close()
+        fobj.close()
+        del ds, ds_sub  # noqa: F821
+        gc.collect()
     return tb
 
 
@@ -877,12 +900,13 @@ def get_realtime_ir(
     progressively build the animation (same two-phase pattern as the
     archive IR system).
     """
-    if not _HAS_S3FS or not _HAS_PYPROJ:
-        missing = []
-        if not _HAS_S3FS:
-            missing.append("s3fs")
-        if not _HAS_PYPROJ:
-            missing.append("pyproj")
+    # Lazy-load IR dependencies on first call (saves ~80 MB at startup)
+    missing = []
+    if _get_s3fs_module() is None:
+        missing.append("s3fs")
+    if _get_pyproj_module() is None:
+        missing.append("pyproj")
+    if missing:
         raise HTTPException(
             status_code=503,
             detail=f"GOES IR not available — missing packages: {', '.join(missing)}",
@@ -919,6 +943,7 @@ def get_realtime_ir(
         if t0_key:
             tb = _open_goes_subset(t0_key, center_lat, center_lon, sat_key)
             frame0_png = _render_ir_png(tb)
+            del tb  # free raw array immediately
             frame0_dt_iso = frame_times[0].isoformat()
             # Cache it
             _rt_ir_cache[(file_url, 0)] = {
@@ -974,7 +999,7 @@ def get_realtime_ir_frame(
     Return a single server-rendered IR PNG frame.
     Called progressively by the client to build up the animation.
     """
-    if not _HAS_S3FS or not _HAS_PYPROJ:
+    if _get_s3fs_module() is None or _get_pyproj_module() is None:
         raise HTTPException(status_code=503, detail="GOES IR not available")
 
     # Check cache first
@@ -1012,8 +1037,11 @@ def get_realtime_ir_frame(
         if s3_key:
             tb = _open_goes_subset(s3_key, center_lat, center_lon, sat_key)
             png = _render_ir_png(tb)
+            del tb
     except Exception:
         png = None
+    finally:
+        gc.collect()
 
     result = {
         "frame_index": frame_index,
