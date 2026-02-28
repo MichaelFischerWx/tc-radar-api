@@ -1269,23 +1269,57 @@ def get_era5(
         }
 
     # Scalar diagnostics
+    # Scalar diagnostics — include all available fields
     result["scalars"] = {}
-    for sname in ['shear_mag_env', 'shear_dir_env', 'rh_mid_env', 'div200_env']:
+    for sname in ['shear_mag_env', 'shear_dir_env', 'rh_mid_env', 'div200_env',
+                   'sst_env', 'chi_m', 'v_pi', 'vent_index']:
         try:
             val = float(era5[sname][case_index])
-            result["scalars"][sname] = round(val, 4) if 'div' in sname else round(val, 1)
+            if np.isnan(val):
+                result["scalars"][sname] = None
+            elif 'div' in sname:
+                result["scalars"][sname] = round(val, 4)
+            elif sname == 'vent_index':
+                result["scalars"][sname] = round(val, 3)
+            elif sname == 'chi_m':
+                result["scalars"][sname] = round(val, 2)
+            else:
+                result["scalars"][sname] = round(val, 1)
         except Exception:
             result["scalars"][sname] = None
 
-    # Vertical profiles (200-600 km annulus mean)
+    # Vertical profiles (200-600 km annulus mean) with derived thermodynamics
     if include_profiles:
         try:
+            plev = era5['plev'][:].astype(float)           # hPa
+            t_arr = era5['t_profile'][case_index].astype(float)   # K
+            q_arr = era5['q_profile'][case_index].astype(float)   # g/kg from Zarr
+
+            # Convert q from g/kg to kg/kg if stored as g/kg
+            q_kgkg = q_arr / 1000.0 if np.nanmax(q_arr) > 0.5 else q_arr
+
+            # Potential temperature: θ = T * (1000/p)^(Rd/Cp)
+            Rd_Cp = 287.04 / 1005.7
+            theta = t_arr * (1000.0 / plev) ** Rd_Cp
+
+            # Equivalent potential temperature (Bolton 1980):
+            # θe = θ_d * exp(Lv * r_s / (Cp_d * T_LCL))
+            # Simplified: θe ≈ T * (1000/p)^0.2854*(1-0.28*q) * exp((3036/T_LCL - 1.78)*q*(1+0.448*q))
+            # Using the more standard approximation:
+            # θe = θ * exp(Lv * q / (Cpd * T))
+            Lv = 2.501e6  # J/kg
+            Cpd = 1005.7  # J/kg/K
+            theta_e = theta * np.exp(Lv * q_kgkg / (Cpd * t_arr))
+
             result["profiles"] = {
-                "plev": era5['plev'][:].tolist(),
+                "plev": plev.tolist(),
                 "u": [round(float(v), 2) if not np.isnan(v) else None for v in era5['u_profile'][case_index]],
                 "v": [round(float(v), 2) if not np.isnan(v) else None for v in era5['v_profile'][case_index]],
                 "rh": [round(float(v), 1) if not np.isnan(v) else None for v in era5['rh_profile'][case_index]],
-                "t": [round(float(v), 2) if not np.isnan(v) else None for v in era5['t_profile'][case_index]],
+                "t": [round(float(v), 2) if not np.isnan(v) else None for v in t_arr],
+                "theta": [round(float(v), 1) if not np.isnan(v) else None for v in theta],
+                "theta_e": [round(float(v), 1) if not np.isnan(v) else None for v in theta_e],
+                "q": [round(float(v), 2) if not np.isnan(v) else None for v in q_arr],
             }
         except Exception:
             result["profiles"] = None
