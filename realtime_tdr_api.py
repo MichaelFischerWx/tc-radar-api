@@ -150,8 +150,10 @@ def _open_rt_dataset(file_url: str) -> xr.Dataset:
 
     raw = _fetch_bytes(file_url, timeout=120)
 
-    # Decompress if gzipped
-    if file_url.endswith(".gz"):
+    # Decompress if gzipped — check the actual bytes, not just the URL,
+    # because the HTTP server may transparently decompress via Content-Encoding.
+    # Gzip magic number is b'\x1f\x8b'; HDF5/NetCDF4 starts with b'\x89HDF' or b'CDF'.
+    if raw[:2] == b'\x1f\x8b':
         raw = gzip.decompress(raw)
 
     ds = xr.open_dataset(io.BytesIO(raw), engine="h5netcdf")
