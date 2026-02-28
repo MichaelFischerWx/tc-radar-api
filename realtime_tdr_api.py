@@ -940,6 +940,15 @@ def get_realtime_ir(
     # IR box bounds in km (for Plotly underlay positioning)
     bounds_km = _get_ir_bounds_km(center_lat)
 
+    # Lat/lon bounds (for Leaflet overlay positioning)
+    half_deg = IR_BOX_DEG / 2.0
+    bounds_deg = {
+        "lat_min": center_lat - half_deg,
+        "lat_max": center_lat + half_deg,
+        "lon_min": center_lon - half_deg,
+        "lon_max": center_lon + half_deg,
+    }
+
     return JSONResponse({
         "center_lat": center_lat,
         "center_lon": center_lon,
@@ -951,6 +960,7 @@ def get_realtime_ir(
         "frame_datetimes": frame_datetimes,
         "frame0": frame0_png,
         "bounds_km": bounds_km,
+        "bounds_deg": bounds_deg,
         "units": "K",
     })
 
