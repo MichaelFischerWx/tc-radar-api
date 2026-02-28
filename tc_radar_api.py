@@ -45,6 +45,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
 import fsspec
+from scipy import ndimage as _ndimage
+from scipy.interpolate import RegularGridInterpolator
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -1715,6 +1717,58 @@ def _resolve_grid_and_haxis(ds, ref_varname):
     return x_coords, y_coords, h_axis
 
 
+# ---------------------------------------------------------------------------
+# Plan-view composite helpers
+# ---------------------------------------------------------------------------
+
+def _rotate_2d_grid(data, angle_deg):
+    """
+    Rotate a 2D array counter-clockwise by *angle_deg* degrees.
+
+    Uses bilinear interpolation; out-of-bounds filled with NaN.
+    Returns an array of the same shape (no reshape).
+    """
+    return _ndimage.rotate(data, angle_deg, order=1, cval=np.nan, reshape=False)
+
+
+def _regrid_to_rmw_normalized(data_2d, x_phys, y_phys, rmw,
+                               max_r_rmw=5.0, dr_rmw=0.1):
+    """
+    Re-grid a physical-coordinate 2D slice onto an RMW-normalised Cartesian
+    grid spanning ±max_r_rmw with spacing dr_rmw.
+
+    Parameters
+    ----------
+    data_2d : 2D ndarray (ny, nx)
+    x_phys, y_phys : 1D arrays — physical distance coordinates (km)
+    rmw : float — radius of maximum wind (km)
+    max_r_rmw, dr_rmw : float — target grid extent & resolution in R/RMW
+
+    Returns
+    -------
+    data_norm : 2D ndarray on the normalised grid
+    x_norm, y_norm : 1D coordinate arrays in R/RMW
+    """
+    # Build target coordinate arrays (R/RMW)
+    half_n = int(round(max_r_rmw / dr_rmw))
+    x_norm = np.linspace(-max_r_rmw, max_r_rmw, 2 * half_n + 1)
+    y_norm = np.linspace(-max_r_rmw, max_r_rmw, 2 * half_n + 1)
+
+    # Target grid in physical space
+    xx_norm, yy_norm = np.meshgrid(x_norm, y_norm)
+    xx_phys_target = xx_norm * rmw
+    yy_phys_target = yy_norm * rmw
+
+    # Build interpolator on the original physical grid
+    interp = RegularGridInterpolator(
+        (y_phys, x_phys), data_2d,
+        method="linear", bounds_error=False, fill_value=np.nan,
+    )
+    pts = np.column_stack([yy_phys_target.ravel(), xx_phys_target.ravel()])
+    data_norm = interp(pts).reshape(len(y_norm), len(x_norm))
+    return data_norm, x_norm, y_norm
+
+
 # Number of parallel threads for composite S3 reads.
 # 4 keeps concurrent memory usage manageable on the 512 MB Render free tier
 # (~4 concurrent 3D volumes × ~10 MB ≈ 40 MB peak, vs ~80 MB at 8 workers).
@@ -1784,6 +1838,59 @@ def _process_one_case_quadrant(case_idx, sddc, rmw, variable, overlay, data_type
         return (case_idx, quad_means, rc, ov_quads)
     except Exception as e:
         print(f"Composite quad: skipping case {case_idx}: {e}")
+        return None
+
+
+def _process_one_case_plan_view(case_idx, rmw, sddc, variable, overlay,
+                                 data_type, x_coords, y_coords, z_idx,
+                                 normalize_rmw, max_r_rmw, dr_rmw,
+                                 shear_relative):
+    """
+    Process a single case for plan-view composite.
+
+    Returns (case_idx, plan_2d, x_grid, y_grid, ov_plan_2d) or None.
+    """
+    try:
+        ds, local_idx = resolve_case(case_idx, data_type)
+        data_2d, _ = _extract_2d_slice(ds, local_idx, variable, z_idx)
+
+        # Shear-relative rotation: rotate so shear vector points right (+x)
+        if shear_relative and sddc is not None:
+            # ndimage.rotate rotates CCW by the given angle.
+            # We need to map SDDC (met heading) to +x (math 0°).
+            # Math angle of shear = 90 - SDDC.
+            # To rotate shear to 0° math, rotate CCW by -(90 - SDDC) = SDDC - 90.
+            # BUT ndimage.rotate(angle) rotates CCW by `angle`, so pass 90 - SDDC
+            # to bring shear to the right.
+            rotation_angle = 90.0 - float(sddc)
+            data_2d = _rotate_2d_grid(data_2d, rotation_angle)
+
+        # RMW normalisation
+        if normalize_rmw and rmw is not None and rmw > 0:
+            data_2d, x_grid, y_grid = _regrid_to_rmw_normalized(
+                data_2d, x_coords, y_coords, rmw, max_r_rmw, dr_rmw,
+            )
+        else:
+            x_grid, y_grid = x_coords, y_coords
+
+        # Overlay
+        ov_2d = None
+        if overlay:
+            try:
+                ov_data, _ = _extract_2d_slice(ds, local_idx, overlay, z_idx)
+                if shear_relative and sddc is not None:
+                    ov_data = _rotate_2d_grid(ov_data, rotation_angle)
+                if normalize_rmw and rmw is not None and rmw > 0:
+                    ov_data, _, _ = _regrid_to_rmw_normalized(
+                        ov_data, x_coords, y_coords, rmw, max_r_rmw, dr_rmw,
+                    )
+                ov_2d = ov_data
+            except Exception:
+                pass
+
+        return (case_idx, data_2d, x_grid, y_grid, ov_2d)
+    except Exception as e:
+        print(f"Composite plan_view: skipping case {case_idx}: {e}")
         return None
 
 
@@ -2127,6 +2234,214 @@ def composite_quadrant_mean(
             "quadrant_means": {q: {"data": ov_composite[q]} for q in QUADRANT_DEFS},
             "vmin": min(all_flat) if all_flat else ov_vmin,
             "vmax": max(all_flat) if all_flat else ov_vmax,
+        }
+
+    return JSONResponse(result)
+
+
+# ---------------------------------------------------------------------------
+# Composite plan-view endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/composite/plan_view")
+def composite_plan_view(
+    variable:       str   = Query(DEFAULT_VARIABLE,        description="Variable key"),
+    overlay:        str   = Query("",                      description="Optional overlay variable key"),
+    data_type:      str   = Query("swath",                 description="'swath' or 'merge'"),
+    level_km:       float = Query(2.0,  ge=0.5, le=18.0,  description="Height level (km)"),
+    normalize_rmw:  bool  = Query(False,                   description="Normalise X/Y by RMW?"),
+    max_r_rmw:      float = Query(5.0,  ge=1,   le=20,    description="Max extent in R/RMW"),
+    dr_rmw:         float = Query(0.1,  ge=0.05, le=1,    description="Grid spacing in R/RMW"),
+    shear_relative: bool  = Query(False,                   description="Rotate to shear-relative frame?"),
+    coverage_min:   float = Query(0.25, ge=0.0,  le=1.0,  description="Min coverage fraction"),
+    min_intensity:  float = Query(0),    max_intensity:  float = Query(200),
+    min_vmax_change:float = Query(-100), max_vmax_change:float = Query(85),
+    min_tilt:       float = Query(0),    max_tilt:       float = Query(200),
+    min_year:       int   = Query(1997), max_year:       int   = Query(2024),
+    min_shear_mag:  float = Query(0),    max_shear_mag:  float = Query(100),
+    min_shear_dir:  float = Query(0),    max_shear_dir:  float = Query(360),
+):
+    """Compute a composite plan-view mean at a specified height level."""
+
+    if variable not in VARIABLES:
+        raise HTTPException(status_code=400, detail=f"Unknown variable '{variable}'.")
+    if overlay and overlay not in VARIABLES:
+        raise HTTPException(status_code=400, detail=f"Unknown overlay variable '{overlay}'.")
+    if data_type not in ("swath", "merge"):
+        raise HTTPException(status_code=400, detail="data_type must be 'swath' or 'merge'")
+
+    meta_cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
+
+    matching = _filter_cases_for_composite(
+        min_intensity, max_intensity, min_vmax_change, max_vmax_change,
+        min_tilt, max_tilt, min_year, max_year,
+        min_shear_mag, max_shear_mag, min_shear_dir, max_shear_dir,
+        data_type=data_type,
+    )
+    if not matching:
+        raise HTTPException(status_code=400, detail="No cases match the specified criteria.")
+    if len(matching) > _COMPOSITE_MAX_CASES:
+        matching = matching[:_COMPOSITE_MAX_CASES]
+
+    # ------------------------------------------------------------------
+    # Collect per-case metadata (RMW, optionally SDDC)
+    # ------------------------------------------------------------------
+    cases_ready: list[tuple] = []   # (case_idx, rmw, sddc_or_None)
+    for ci in matching:
+        meta = meta_cache.get(ci, {})
+        rmw = meta.get("rmw_km")
+        if normalize_rmw:
+            # RMW is mandatory when normalising
+            if rmw is None or np.isnan(float(rmw)) or float(rmw) <= 0:
+                continue
+        else:
+            rmw = rmw if (rmw is not None and not np.isnan(float(rmw)) and float(rmw) > 0) else None
+
+        sddc = meta.get("sddc") if shear_relative else None
+        if shear_relative and sddc is None:
+            continue  # need SDDC for rotation
+
+        cases_ready.append((ci, float(rmw) if rmw is not None else None, sddc))
+
+    if not cases_ready:
+        detail = "No matching cases have valid "
+        parts = []
+        if normalize_rmw:
+            parts.append("RMW")
+        if shear_relative:
+            parts.append("shear direction")
+        detail += " and ".join(parts) + " data."
+        raise HTTPException(status_code=400, detail=detail)
+
+    # ------------------------------------------------------------------
+    # Pre-fetch grid info & locate height index
+    # ------------------------------------------------------------------
+    display_name, varname, cmap, units, vmin, vmax = VARIABLES[variable]
+    ref_varname = DERIVED_VARIABLES[variable][0] if variable in DERIVED_VARIABLES else varname
+
+    first_ds, _ = resolve_case(cases_ready[0][0], data_type)
+    height_km = first_ds["height"].values
+    z_idx = int(np.argmin(np.abs(height_km - level_km)))
+    actual_level = float(height_km[z_idx])
+    x_coords, y_coords, _ = _resolve_grid_and_haxis(first_ds, ref_varname)
+
+    # ------------------------------------------------------------------
+    # Parallel processing
+    # ------------------------------------------------------------------
+    accum_sum = None
+    accum_count = None
+    ov_accum_sum = None
+    ov_accum_count = None
+    n_processed = 0
+    processed_indices: list[int] = []
+
+    with ThreadPoolExecutor(max_workers=_COMPOSITE_WORKERS) as pool:
+        futures = {
+            pool.submit(
+                _process_one_case_plan_view,
+                ci, rmw, sddc, variable, overlay, data_type,
+                x_coords, y_coords, z_idx,
+                normalize_rmw, max_r_rmw, dr_rmw, shear_relative,
+            ): ci
+            for ci, rmw, sddc in cases_ready
+        }
+
+        for future in as_completed(futures):
+            res = future.result()
+            if res is None:
+                continue
+
+            ci, plan_2d, x_grid, y_grid, ov_2d = res
+
+            if accum_sum is None:
+                accum_sum = np.zeros((len(y_grid), len(x_grid)))
+                accum_count = np.zeros_like(accum_sum)
+
+            valid = ~np.isnan(plan_2d)
+            accum_sum[valid] += plan_2d[valid]
+            accum_count[valid] += 1
+
+            if ov_2d is not None:
+                if ov_accum_sum is None:
+                    ov_accum_sum = np.zeros_like(ov_2d)
+                    ov_accum_count = np.zeros_like(ov_2d)
+                ov_valid = ~np.isnan(ov_2d)
+                ov_accum_sum[ov_valid] += ov_2d[ov_valid]
+                ov_accum_count[ov_valid] += 1
+
+            n_processed += 1
+            processed_indices.append(ci)
+
+    if n_processed == 0:
+        raise HTTPException(status_code=500, detail="Could not process any matching cases.")
+
+    # ------------------------------------------------------------------
+    # Build composite — same 33 % minimum-cases rule as az-mean
+    # ------------------------------------------------------------------
+    min_cases = max(3, int(np.ceil(0.33 * n_processed)))
+    composite = np.where(accum_count >= min_cases, accum_sum / accum_count, np.nan)
+
+    # Determine output axis arrays & labels
+    if normalize_rmw:
+        half_n = int(round(max_r_rmw / dr_rmw))
+        x_out = np.linspace(-max_r_rmw, max_r_rmw, 2 * half_n + 1)
+        y_out = np.linspace(-max_r_rmw, max_r_rmw, 2 * half_n + 1)
+        x_label = "X / RMW"
+        y_label = "Y / RMW"
+    else:
+        x_out = x_coords
+        y_out = y_coords
+        x_label = "Eastward distance (km)"
+        y_label = "Northward distance (km)"
+
+    result = {
+        "plan_view": _clean_2d(composite),
+        "x_axis": [round(float(v), 3) for v in x_out],
+        "y_axis": [round(float(v), 3) for v in y_out],
+        "x_label": x_label,
+        "y_label": y_label,
+        "level_km": round(actual_level, 2),
+        "normalize_rmw": normalize_rmw,
+        "shear_relative": shear_relative,
+        "coverage_min": coverage_min,
+        "min_cases_per_bin": min_cases,
+        "n_cases": n_processed,
+        "n_matched": len(matching),
+        "n_with_valid_meta": len(cases_ready),
+        "case_list": _build_case_list(processed_indices, data_type),
+        "variable": {
+            "key": variable,
+            "display_name": display_name,
+            "units": units,
+            "vmin": vmin,
+            "vmax": vmax,
+            "colorscale": _cmap_to_plotly(cmap),
+        },
+        "filters": {
+            "intensity": [min_intensity, max_intensity],
+            "vmax_change": [min_vmax_change, max_vmax_change],
+            "tilt": [min_tilt, max_tilt],
+            "year": [min_year, max_year],
+            "shear_mag": [min_shear_mag, max_shear_mag],
+            "shear_dir": [min_shear_dir, max_shear_dir],
+        },
+    }
+
+    # Overlay
+    if overlay and ov_accum_sum is not None:
+        ov_composite = np.where(
+            ov_accum_count >= min_cases, ov_accum_sum / ov_accum_count, np.nan
+        )
+        ov_display, _, _, ov_units, ov_vmin, ov_vmax = VARIABLES[overlay]
+        clean_ov = _clean_2d(ov_composite)
+        flat = [v for row in clean_ov for v in row if v is not None]
+        result["overlay"] = {
+            "display_name": ov_display,
+            "key": overlay,
+            "units": ov_units,
+            "plan_view": clean_ov,
+            "vmin": min(flat) if flat else ov_vmin,
+            "vmax": max(flat) if flat else ov_vmax,
         }
 
     return JSONResponse(result)
