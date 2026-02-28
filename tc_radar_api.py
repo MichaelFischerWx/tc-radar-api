@@ -1482,6 +1482,7 @@ def get_era5_sounding(
 
     # Check if full 3D T/q fields are available for custom radius
     has_3d = all(k in era5 for k in ['t_3d', 'q_3d'])
+    result["has_3d"] = has_3d
 
     if has_3d:
         try:
@@ -1514,8 +1515,7 @@ def get_era5_sounding(
             ws = 0.622 * es / (plev - es)
             rh_prof = np.clip(q_kgkg / ws * 100.0, 0, 100)
 
-            result["source"] = "recomputed"
-            result["profiles"] = {
+            profiles = {
                 "plev": plev.tolist(),
                 "t": [round(float(v), 2) if not np.isnan(v) else None for v in t_prof],
                 "q": [round(float(v), 6) if not np.isnan(v) else None for v in q_prof],
@@ -1523,6 +1523,26 @@ def get_era5_sounding(
                 "theta": [round(float(v), 1) if not np.isnan(v) else None for v in theta],
                 "theta_e": [round(float(v), 1) if not np.isnan(v) else None for v in theta_e],
             }
+
+            # Also average u/v 3D winds if available
+            has_uv_3d = all(k in era5 for k in ['u_3d', 'v_3d'])
+            if has_uv_3d:
+                u_3d = era5['u_3d'][case_index]
+                v_3d = era5['v_3d'][case_index]
+                u_prof = np.array([float(np.nanmean(u_3d[k][mask_2d])) for k in range(len(plev))])
+                v_prof = np.array([float(np.nanmean(v_3d[k][mask_2d])) for k in range(len(plev))])
+                profiles["u"] = [round(float(v), 2) if not np.isnan(v) else None for v in u_prof]
+                profiles["v"] = [round(float(v), 2) if not np.isnan(v) else None for v in v_prof]
+            else:
+                # Fall back to precomputed u/v profiles
+                try:
+                    profiles["u"] = [round(float(v), 2) if not np.isnan(v) else None for v in era5['u_profile'][case_index]]
+                    profiles["v"] = [round(float(v), 2) if not np.isnan(v) else None for v in era5['v_profile'][case_index]]
+                except Exception:
+                    pass
+
+            result["source"] = "recomputed"
+            result["profiles"] = profiles
             return result
         except Exception:
             pass  # Fall through to precomputed profiles
@@ -1549,6 +1569,12 @@ def get_era5_sounding(
             "theta": [round(float(v), 1) if not np.isnan(v) else None for v in theta],
             "theta_e": [round(float(v), 1) if not np.isnan(v) else None for v in theta_e],
         }
+        # Include precomputed u/v profiles for wind barbs
+        try:
+            result["profiles"]["u"] = [round(float(v), 2) if not np.isnan(v) else None for v in era5['u_profile'][case_index]]
+            result["profiles"]["v"] = [round(float(v), 2) if not np.isnan(v) else None for v in era5['v_profile'][case_index]]
+        except Exception:
+            pass
     except Exception:
         result["profiles"] = None
 
