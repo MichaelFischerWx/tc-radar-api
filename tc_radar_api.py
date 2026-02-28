@@ -29,6 +29,7 @@ Local dev
 """
 
 import base64
+import gc
 import io
 import json
 import os
@@ -265,6 +266,21 @@ class CacheHeaderMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(CacheHeaderMiddleware)
+
+
+class CompositeGCMiddleware(BaseHTTPMiddleware):
+    """
+    Force garbage collection after composite endpoints to reclaim numpy arrays
+    and prevent OOM on the 512 MB Render free tier.
+    """
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith('/composite'):
+            gc.collect()
+        return response
+
+app.add_middleware(CompositeGCMiddleware)
+
 
 # ---------------------------------------------------------------------------
 # Dataset loading
@@ -2003,7 +2019,7 @@ def quadrant_mean(
 # ---------------------------------------------------------------------------
 # Composite endpoints
 # ---------------------------------------------------------------------------
-_COMPOSITE_MAX_CASES = 500  # safety cap
+_COMPOSITE_MAX_CASES = 150  # safety cap — keep low for 512 MB free-tier servers
 
 # Common query parameters for composite filters
 def _composite_filter_params(
@@ -2103,9 +2119,47 @@ def _regrid_to_rmw_normalized(data_2d, x_phys, y_phys, rmw,
 
 
 # Number of parallel threads for composite S3 reads.
-# 4 keeps concurrent memory usage manageable on the 512 MB Render free tier
-# (~4 concurrent 3D volumes × ~10 MB ≈ 40 MB peak, vs ~80 MB at 8 workers).
-_COMPOSITE_WORKERS = 4
+# 2 keeps concurrent memory usage manageable on the 512 MB Render free tier
+# (~2 concurrent 3D volumes × ~10 MB ≈ 20 MB peak).
+_COMPOSITE_WORKERS = 2
+
+# Batch size for composite processing — process this many cases at a time,
+# then GC between batches to keep peak memory bounded.
+_COMPOSITE_BATCH_SIZE = 25
+
+
+def _process_composites_batched(worker_fn, work_items, accumulate_fn):
+    """
+    Process composite cases in batches to bound peak memory on low-RAM servers.
+
+    Parameters
+    ----------
+    worker_fn : callable
+        Function to submit to thread pool. Receives unpacked args from each work item.
+    work_items : list of tuples
+        Each tuple is unpacked as args to worker_fn.
+    accumulate_fn : callable(result)
+        Called with each non-None worker result in the main thread.
+        Should accumulate into the caller's arrays.
+
+    Returns nothing — accumulation is done via side-effect through accumulate_fn.
+    """
+    total = len(work_items)
+    for batch_start in range(0, total, _COMPOSITE_BATCH_SIZE):
+        batch = work_items[batch_start:batch_start + _COMPOSITE_BATCH_SIZE]
+        with ThreadPoolExecutor(max_workers=_COMPOSITE_WORKERS) as pool:
+            futures = {
+                pool.submit(worker_fn, *item): item[0]
+                for item in batch
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    accumulate_fn(result)
+                del result
+            del futures
+        # Free thread pool + intermediate memory between batches
+        gc.collect()
 
 
 def _process_one_case_azimuthal(case_idx, rmw, variable, overlay, data_type,
@@ -2250,7 +2304,12 @@ def composite_count(
         min_shear_mag, max_shear_mag, min_shear_dir, max_shear_dir,
         data_type=data_type,
     )
-    return {"count": len(cases), "case_indices": cases[:20]}  # preview first 20
+    return {
+        "count": len(cases),
+        "max_cases": _COMPOSITE_MAX_CASES,
+        "capped": len(cases) > _COMPOSITE_MAX_CASES,
+        "case_indices": cases[:20],
+    }
 
 
 @app.get("/composite/azimuthal_mean")
@@ -2313,45 +2372,36 @@ def composite_azimuthal_mean(
     n_processed = 0
     processed_indices = []
 
-    # Process all cases in parallel — S3 reads are I/O-bound, so threads
-    # overlap network wait times.  Accumulation stays in the main thread.
-    with ThreadPoolExecutor(max_workers=_COMPOSITE_WORKERS) as pool:
-        futures = {
-            pool.submit(
-                _process_one_case_azimuthal,
-                case_idx, rmw, variable, overlay, data_type,
-                x_coords, y_coords, height_km, h_axis,
-                max_r_rmw, dr_rmw, coverage_min,
-            ): case_idx
-            for case_idx, rmw in cases_with_rmw
-        }
+    # Process cases in batches — keeps peak memory bounded on 512 MB servers.
+    work_items = [
+        (case_idx, rmw, variable, overlay, data_type,
+         x_coords, y_coords, height_km, h_axis,
+         max_r_rmw, dr_rmw, coverage_min)
+        for case_idx, rmw in cases_with_rmw
+    ]
 
-        for future in as_completed(futures):
-            result = future.result()
-            if result is None:
-                continue
+    def _accum_az(result):
+        nonlocal accum_sum, accum_count, ov_accum_sum, ov_accum_count
+        nonlocal r_centers, n_processed
+        case_idx, az_mean, rc, ov_az = result
+        if accum_sum is None:
+            r_centers = rc
+            accum_sum = np.zeros_like(az_mean)
+            accum_count = np.zeros_like(az_mean)
+        valid = ~np.isnan(az_mean)
+        accum_sum[valid] += az_mean[valid]
+        accum_count[valid] += 1
+        if ov_az is not None:
+            if ov_accum_sum is None:
+                ov_accum_sum = np.zeros_like(ov_az)
+                ov_accum_count = np.zeros_like(ov_az)
+            ov_valid = ~np.isnan(ov_az)
+            ov_accum_sum[ov_valid] += ov_az[ov_valid]
+            ov_accum_count[ov_valid] += 1
+        n_processed += 1
+        processed_indices.append(case_idx)
 
-            case_idx, az_mean, rc, ov_az = result
-
-            if accum_sum is None:
-                r_centers = rc
-                accum_sum = np.zeros_like(az_mean)
-                accum_count = np.zeros_like(az_mean)
-
-            valid = ~np.isnan(az_mean)
-            accum_sum[valid] += az_mean[valid]
-            accum_count[valid] += 1
-
-            if ov_az is not None:
-                if ov_accum_sum is None:
-                    ov_accum_sum = np.zeros_like(ov_az)
-                    ov_accum_count = np.zeros_like(ov_az)
-                ov_valid = ~np.isnan(ov_az)
-                ov_accum_sum[ov_valid] += ov_az[ov_valid]
-                ov_accum_count[ov_valid] += 1
-
-            n_processed += 1
-            processed_indices.append(case_idx)
+    _process_composites_batched(_process_one_case_azimuthal, work_items, _accum_az)
 
     if n_processed == 0:
         raise HTTPException(status_code=500, detail="Could not process any matching cases.")
@@ -2470,46 +2520,38 @@ def composite_quadrant_mean(
     n_processed = 0
     processed_indices = []
 
-    # Process all cases in parallel — S3 reads are I/O-bound, so threads
-    # overlap network wait times.  Accumulation stays in the main thread.
-    with ThreadPoolExecutor(max_workers=_COMPOSITE_WORKERS) as pool:
-        futures = {
-            pool.submit(
-                _process_one_case_quadrant,
-                case_idx, sddc, rmw, variable, overlay, data_type,
-                x_coords, y_coords, height_km, h_axis,
-                max_r_rmw, dr_rmw, coverage_min,
-            ): case_idx
-            for case_idx, sddc, rmw in valid_cases
-        }
+    # Process cases in batches — keeps peak memory bounded on 512 MB servers.
+    work_items = [
+        (case_idx, sddc, rmw, variable, overlay, data_type,
+         x_coords, y_coords, height_km, h_axis,
+         max_r_rmw, dr_rmw, coverage_min)
+        for case_idx, sddc, rmw in valid_cases
+    ]
 
-        for future in as_completed(futures):
-            result = future.result()
-            if result is None:
-                continue
-
-            case_idx, quad_means, rc, ov_quads = result
-
-            if accum_sum is None:
-                r_centers = rc
-                accum_sum = {q: np.zeros_like(quad_means[q]) for q in QUADRANT_DEFS}
-                accum_count = {q: np.zeros_like(quad_means[q]) for q in QUADRANT_DEFS}
+    def _accum_quad(result):
+        nonlocal accum_sum, accum_count, ov_accum_sum, ov_accum_count
+        nonlocal r_centers, n_processed
+        case_idx, quad_means, rc, ov_quads = result
+        if accum_sum is None:
+            r_centers = rc
+            accum_sum = {q: np.zeros_like(quad_means[q]) for q in QUADRANT_DEFS}
+            accum_count = {q: np.zeros_like(quad_means[q]) for q in QUADRANT_DEFS}
+        for q in QUADRANT_DEFS:
+            valid = ~np.isnan(quad_means[q])
+            accum_sum[q][valid] += quad_means[q][valid]
+            accum_count[q][valid] += 1
+        if ov_quads is not None:
+            if ov_accum_sum is None:
+                ov_accum_sum = {q: np.zeros_like(ov_quads[q]) for q in QUADRANT_DEFS}
+                ov_accum_count = {q: np.zeros_like(ov_quads[q]) for q in QUADRANT_DEFS}
             for q in QUADRANT_DEFS:
-                valid = ~np.isnan(quad_means[q])
-                accum_sum[q][valid] += quad_means[q][valid]
-                accum_count[q][valid] += 1
+                ov_valid = ~np.isnan(ov_quads[q])
+                ov_accum_sum[q][ov_valid] += ov_quads[q][ov_valid]
+                ov_accum_count[q][ov_valid] += 1
+        n_processed += 1
+        processed_indices.append(case_idx)
 
-            if ov_quads is not None:
-                if ov_accum_sum is None:
-                    ov_accum_sum = {q: np.zeros_like(ov_quads[q]) for q in QUADRANT_DEFS}
-                    ov_accum_count = {q: np.zeros_like(ov_quads[q]) for q in QUADRANT_DEFS}
-                for q in QUADRANT_DEFS:
-                    ov_valid = ~np.isnan(ov_quads[q])
-                    ov_accum_sum[q][ov_valid] += ov_quads[q][ov_valid]
-                    ov_accum_count[q][ov_valid] += 1
-
-            n_processed += 1
-            processed_indices.append(case_idx)
+    _process_composites_batched(_process_one_case_quadrant, work_items, _accum_quad)
 
     if n_processed == 0:
         raise HTTPException(status_code=500, detail="Could not process any matching cases.")
@@ -2668,42 +2710,34 @@ def composite_plan_view(
     n_processed = 0
     processed_indices: list[int] = []
 
-    with ThreadPoolExecutor(max_workers=_COMPOSITE_WORKERS) as pool:
-        futures = {
-            pool.submit(
-                _process_one_case_plan_view,
-                ci, rmw, sddc, variable, overlay, data_type,
-                x_coords, y_coords, z_idx,
-                normalize_rmw, max_r_rmw, dr_rmw, shear_relative,
-            ): ci
-            for ci, rmw, sddc in cases_ready
-        }
+    # Process cases in batches — keeps peak memory bounded on 512 MB servers.
+    work_items = [
+        (ci, rmw, sddc, variable, overlay, data_type,
+         x_coords, y_coords, z_idx,
+         normalize_rmw, max_r_rmw, dr_rmw, shear_relative)
+        for ci, rmw, sddc in cases_ready
+    ]
 
-        for future in as_completed(futures):
-            res = future.result()
-            if res is None:
-                continue
+    def _accum_pv(result):
+        nonlocal accum_sum, accum_count, ov_accum_sum, ov_accum_count, n_processed
+        ci, plan_2d, x_grid, y_grid, ov_2d = result
+        if accum_sum is None:
+            accum_sum = np.zeros((len(y_grid), len(x_grid)))
+            accum_count = np.zeros_like(accum_sum)
+        valid = ~np.isnan(plan_2d)
+        accum_sum[valid] += plan_2d[valid]
+        accum_count[valid] += 1
+        if ov_2d is not None:
+            if ov_accum_sum is None:
+                ov_accum_sum = np.zeros_like(ov_2d)
+                ov_accum_count = np.zeros_like(ov_2d)
+            ov_valid = ~np.isnan(ov_2d)
+            ov_accum_sum[ov_valid] += ov_2d[ov_valid]
+            ov_accum_count[ov_valid] += 1
+        n_processed += 1
+        processed_indices.append(ci)
 
-            ci, plan_2d, x_grid, y_grid, ov_2d = res
-
-            if accum_sum is None:
-                accum_sum = np.zeros((len(y_grid), len(x_grid)))
-                accum_count = np.zeros_like(accum_sum)
-
-            valid = ~np.isnan(plan_2d)
-            accum_sum[valid] += plan_2d[valid]
-            accum_count[valid] += 1
-
-            if ov_2d is not None:
-                if ov_accum_sum is None:
-                    ov_accum_sum = np.zeros_like(ov_2d)
-                    ov_accum_count = np.zeros_like(ov_2d)
-                ov_valid = ~np.isnan(ov_2d)
-                ov_accum_sum[ov_valid] += ov_2d[ov_valid]
-                ov_accum_count[ov_valid] += 1
-
-            n_processed += 1
-            processed_indices.append(ci)
+    _process_composites_batched(_process_one_case_plan_view, work_items, _accum_pv)
 
     if n_processed == 0:
         raise HTTPException(status_code=500, detail="Could not process any matching cases.")
@@ -2921,29 +2955,28 @@ def composite_era5_plan_view(
     vec_count = np.zeros(grid_shape, dtype=np.float64) if include_vectors else None
     processed = []
 
-    with ThreadPoolExecutor(max_workers=_COMPOSITE_WORKERS) as pool:
-        futures = {
-            pool.submit(
-                _process_one_case_era5_plan_view,
-                ci, field, include_vectors, target_x_km, target_y_km, sddc
-            ): ci for ci, sddc in cases_with_sddc
-        }
-        for future in as_completed(futures):
-            result = future.result()
-            if result is None:
-                continue
-            ci, data_km, vu, vv = result
-            valid = np.isfinite(data_km)
-            accum_sum[valid] += data_km[valid]
-            accum_sq[valid] += data_km[valid] ** 2
-            accum_count[valid] += 1
-            if include_vectors and vu is not None:
-                vu_valid = np.isfinite(vu)
-                vec_u_sum[vu_valid] += vu[vu_valid]
-                vv_valid = np.isfinite(vv)
-                vec_v_sum[vv_valid] += vv[vv_valid]
-                vec_count[vu_valid] += 1
-            processed.append(ci)
+    # Process cases in batches — keeps peak memory bounded on 512 MB servers.
+    work_items = [
+        (ci, field, include_vectors, target_x_km, target_y_km, sddc)
+        for ci, sddc in cases_with_sddc
+    ]
+
+    def _accum_era5(result):
+        nonlocal vec_u_sum, vec_v_sum, vec_count
+        ci, data_km, vu, vv = result
+        valid = np.isfinite(data_km)
+        accum_sum[valid] += data_km[valid]
+        accum_sq[valid] += data_km[valid] ** 2
+        accum_count[valid] += 1
+        if include_vectors and vu is not None:
+            vu_valid = np.isfinite(vu)
+            vec_u_sum[vu_valid] += vu[vu_valid]
+            vv_valid = np.isfinite(vv)
+            vec_v_sum[vv_valid] += vv[vv_valid]
+            vec_count[vu_valid] += 1
+        processed.append(ci)
+
+    _process_composites_batched(_process_one_case_era5_plan_view, work_items, _accum_era5)
 
     n_cases = len(processed)
     if n_cases == 0:
