@@ -156,7 +156,14 @@ def _open_rt_dataset(file_url: str) -> xr.Dataset:
     if raw[:2] == b'\x1f\x8b':
         raw = gzip.decompress(raw)
 
-    ds = xr.open_dataset(io.BytesIO(raw), engine="h5netcdf")
+    # Detect file format from magic bytes and choose the right xarray engine.
+    # netCDF3 classic starts with b'CDF'; HDF5/netCDF4 starts with b'\x89HDF'.
+    if raw[:3] == b'CDF':
+        engine = "scipy"
+    else:
+        engine = "h5netcdf"
+
+    ds = xr.open_dataset(io.BytesIO(raw), engine=engine)
     _rt_ds_cache[file_url] = (ds, time.time())
     if len(_rt_ds_cache) > _RT_DS_CACHE_MAX:
         _rt_ds_cache.popitem(last=False)
