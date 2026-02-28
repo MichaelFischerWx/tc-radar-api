@@ -155,10 +155,10 @@ ERA5_FIELD_CONFIG = {
         "display_name": "Entropy Deficit (χₘ)",
         "units": "", "vmin": 0, "vmax": 2.0,
         "colorscale": [
-            [0.0, "rgb(229,245,224)"], [0.15, "rgb(161,217,155)"],
-            [0.30, "rgb(65,171,93)"], [0.45, "rgb(200,200,120)"],
-            [0.60, "rgb(189,174,90)"], [0.75, "rgb(166,118,29)"],
-            [0.90, "rgb(140,81,10)"], [1.0, "rgb(102,51,0)"],
+            [0.0, "rgb(255,247,236)"], [0.15, "rgb(254,232,200)"],
+            [0.30, "rgb(253,212,158)"], [0.45, "rgb(253,187,132)"],
+            [0.60, "rgb(227,145,86)"], [0.75, "rgb(189,109,53)"],
+            [0.90, "rgb(140,81,10)"], [1.0, "rgb(84,48,5)"],
         ],
         "has_vectors": False,
     },
@@ -1443,6 +1443,114 @@ def get_era5_scalars(
             result[sname] = round(val, 3) if not np.isnan(val) else None
         except Exception:
             result[sname] = None
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# ERA5 sounding at user-specified averaging radius (for Skew-T)
+# ---------------------------------------------------------------------------
+@app.get("/era5_sounding")
+def get_era5_sounding(
+    case_index: int = Query(..., ge=0),
+    radius_km: float = Query(200, ge=50, le=800, description="Averaging radius (km) for sounding"),
+):
+    """
+    Return ERA5 vertical profiles for Skew-T rendering.
+
+    If 3D ERA5 fields are available in the Zarr store, profiles are recomputed
+    as disc-averages within the specified radius.  Otherwise falls back to the
+    precomputed 200-600 km annulus profiles.
+
+    Parameters
+    ----------
+    case_index : int
+    radius_km  : float  - disc radius for azimuthal averaging (km)
+    """
+    era5 = get_era5_dataset()
+    if era5 is None:
+        raise HTTPException(status_code=503, detail="ERA5 data not available")
+
+    try:
+        status = int(era5['status'][case_index])
+    except (IndexError, KeyError):
+        raise HTTPException(status_code=404, detail=f"Case {case_index} not in ERA5 store")
+    if status != 1:
+        raise HTTPException(status_code=404, detail=f"No ERA5 data for case {case_index}")
+
+    result = {"case_index": case_index, "radius_km": radius_km}
+
+    # Check if full 3D T/q fields are available for custom radius
+    has_3d = all(k in era5 for k in ['t_3d', 'q_3d'])
+
+    if has_3d:
+        try:
+            center_lat = float(era5['center_lat'][case_index])
+            lat_offsets = era5['lat_offsets'][:]
+            lon_offsets = era5['lon_offsets'][:]
+            cos_lat = np.cos(np.deg2rad(center_lat))
+            dlon_grid, dlat_grid = np.meshgrid(lon_offsets, lat_offsets)
+            dist_km = np.sqrt((dlat_grid * 111.0)**2 + (dlon_grid * 111.0 * cos_lat)**2)
+            mask_2d = dist_km <= radius_km
+
+            if mask_2d.sum() < 2:
+                raise ValueError("Too few points")
+
+            plev = era5['plev'][:].astype(float)
+            t_3d = era5['t_3d'][case_index]   # (nlev, nlat, nlon)
+            q_3d = era5['q_3d'][case_index]
+
+            t_prof = np.array([float(np.nanmean(t_3d[k][mask_2d])) for k in range(len(plev))])
+            q_prof = np.array([float(np.nanmean(q_3d[k][mask_2d])) for k in range(len(plev))])
+            q_kgkg = q_prof / 1000.0 if np.nanmax(q_prof) > 0.5 else q_prof
+
+            Rd_Cp = 287.04 / 1005.7
+            theta = t_prof * (1000.0 / plev) ** Rd_Cp
+            Lv, Cpd = 2.501e6, 1005.7
+            theta_e = theta * np.exp(Lv * q_kgkg / (Cpd * t_prof))
+
+            # RH from q and T
+            es = 6.112 * np.exp(17.67 * (t_prof - 273.15) / (t_prof - 273.15 + 243.5))
+            ws = 0.622 * es / (plev - es)
+            rh_prof = np.clip(q_kgkg / ws * 100.0, 0, 100)
+
+            result["source"] = "recomputed"
+            result["profiles"] = {
+                "plev": plev.tolist(),
+                "t": [round(float(v), 2) if not np.isnan(v) else None for v in t_prof],
+                "q": [round(float(v), 2) if not np.isnan(v) else None for v in q_prof],
+                "rh": [round(float(v), 1) if not np.isnan(v) else None for v in rh_prof],
+                "theta": [round(float(v), 1) if not np.isnan(v) else None for v in theta],
+                "theta_e": [round(float(v), 1) if not np.isnan(v) else None for v in theta_e],
+            }
+            return result
+        except Exception:
+            pass  # Fall through to precomputed profiles
+
+    # Fallback: return precomputed annular-mean profiles
+    try:
+        plev = era5['plev'][:].astype(float)
+        t_arr = era5['t_profile'][case_index].astype(float)
+        q_arr = era5['q_profile'][case_index].astype(float)
+        q_kgkg = q_arr / 1000.0 if np.nanmax(q_arr) > 0.5 else q_arr
+
+        Rd_Cp = 287.04 / 1005.7
+        theta = t_arr * (1000.0 / plev) ** Rd_Cp
+        Lv, Cpd = 2.501e6, 1005.7
+        theta_e = theta * np.exp(Lv * q_kgkg / (Cpd * t_arr))
+
+        result["source"] = "precomputed"
+        result["precomputed_domain"] = "200-600 km annulus"
+        result["profiles"] = {
+            "plev": plev.tolist(),
+            "t": [round(float(v), 2) if not np.isnan(v) else None for v in t_arr],
+            "q": [round(float(v), 2) if not np.isnan(v) else None for v in q_arr],
+            "rh": [round(float(v), 1) if not np.isnan(v) else None for v in era5['rh_profile'][case_index]],
+            "theta": [round(float(v), 1) if not np.isnan(v) else None for v in theta],
+            "theta_e": [round(float(v), 1) if not np.isnan(v) else None for v in theta_e],
+        }
+    except Exception:
+        result["profiles"] = None
 
     return result
 
