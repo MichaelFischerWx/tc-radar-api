@@ -2788,10 +2788,12 @@ def composite_plan_view(
 _ENV_COMP_GRID_KM = np.linspace(-1100, 1100, 81)  # ±1100 km at ~27 km spacing
 
 
-def _process_one_case_era5_plan_view(case_idx, field, include_vectors, target_x_km, target_y_km):
+def _process_one_case_era5_plan_view(case_idx, field, include_vectors, target_x_km, target_y_km,
+                                     sddc=None):
     """
     Process a single case for ERA5 environmental plan-view composite.
     Regrids from degree-offset to a common km grid.
+    If sddc is not None, rotate to shear-relative frame (shear → +x).
     Returns (case_idx, data_km, vec_u_km, vec_v_km) or None.
     """
     try:
@@ -2819,6 +2821,12 @@ def _process_one_case_era5_plan_view(case_idx, field, include_vectors, target_x_
         yy, xx = np.meshgrid(target_y_km, target_x_km, indexing='ij')
         data_km = interp((yy, xx)).astype(np.float32)
 
+        # Shear-relative rotation: rotate so shear vector points right (+x)
+        # Same convention as TDR plan-view: rotation_angle = 90 - SDDC
+        if sddc is not None:
+            rotation_angle = 90.0 - float(sddc)
+            data_km = _rotate_2d_grid(data_km, rotation_angle)
+
         vec_u_km = None
         vec_v_km = None
         if include_vectors:
@@ -2837,6 +2845,19 @@ def _process_one_case_era5_plan_view(case_idx, field, include_vectors, target_x_
                 vec_u_km = interp_u((yy, xx)).astype(np.float32)
                 vec_v_km = interp_v((yy, xx)).astype(np.float32)
 
+                # Rotate vector field to shear-relative frame
+                if sddc is not None:
+                    vec_u_km = _rotate_2d_grid(vec_u_km, rotation_angle)
+                    vec_v_km = _rotate_2d_grid(vec_v_km, rotation_angle)
+                    # Also rotate the vector components themselves
+                    # (rotating the grid moves pixels, but vectors still point
+                    #  in their original directions — we must also rotate them)
+                    theta_rad = np.deg2rad(rotation_angle)
+                    cos_t, sin_t = np.cos(theta_rad), np.sin(theta_rad)
+                    u_rot =  cos_t * vec_u_km + sin_t * vec_v_km
+                    v_rot = -sin_t * vec_u_km + cos_t * vec_v_km
+                    vec_u_km, vec_v_km = u_rot, v_rot
+
         return (case_idx, data_km, vec_u_km, vec_v_km)
     except Exception as e:
         print(f"Composite era5_plan_view: skipping case {case_idx}: {e}")
@@ -2849,6 +2870,7 @@ def composite_era5_plan_view(
     field: str = Query("shear_mag", description="ERA5 field name"),
     radius_km: float = Query(500, ge=100, le=1100, description="Crop radius (km)"),
     include_vectors: bool = Query(False, description="Include vector components"),
+    shear_relative: bool = Query(False, description="Rotate to shear-relative frame?"),
     data_type: str = Query("swath", description="'swath' or 'merge'"),
 ):
     """Composite mean + std of an ERA5 2D field in storm-relative km coordinates."""
@@ -2868,6 +2890,25 @@ def composite_era5_plan_view(
     if not matching:
         raise HTTPException(status_code=404, detail="No matching cases with ERA5 data")
 
+    # If shear_relative, look up SDDC per case from metadata and skip cases without it
+    meta_cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
+    cases_with_sddc: list[tuple] = []  # (case_idx, sddc_or_None)
+    for ci in matching[:_COMPOSITE_MAX_CASES]:
+        if shear_relative:
+            meta = meta_cache.get(ci, {})
+            sddc = meta.get("sddc")
+            if sddc is None or sddc == 9999:
+                continue  # need valid SDDC for rotation
+            cases_with_sddc.append((ci, float(sddc)))
+        else:
+            cases_with_sddc.append((ci, None))
+
+    if not cases_with_sddc:
+        detail = "No matching cases with ERA5 data"
+        if shear_relative:
+            detail += " and valid shear direction (SDDC)"
+        raise HTTPException(status_code=404, detail=detail)
+
     target_x_km = _ENV_COMP_GRID_KM.copy()
     target_y_km = _ENV_COMP_GRID_KM.copy()
     grid_shape = (len(target_y_km), len(target_x_km))
@@ -2884,8 +2925,8 @@ def composite_era5_plan_view(
         futures = {
             pool.submit(
                 _process_one_case_era5_plan_view,
-                ci, field, include_vectors, target_x_km, target_y_km
-            ): ci for ci in matching[:_COMPOSITE_MAX_CASES]
+                ci, field, include_vectors, target_x_km, target_y_km, sddc
+            ): ci for ci, sddc in cases_with_sddc
         }
         for future in as_completed(futures):
             result = future.result()
@@ -2933,6 +2974,7 @@ def composite_era5_plan_view(
         "x_km": [round(float(v), 1) for v in target_x_km],
         "y_km": [round(float(v), 1) for v in target_y_km],
         "n_cases": n_cases,
+        "shear_relative": shear_relative,
         "case_list": _build_case_list(processed, data_type),
     }
 
