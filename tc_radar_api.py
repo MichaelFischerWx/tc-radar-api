@@ -1350,6 +1350,11 @@ def get_era5(
         except Exception:
             result["profiles"] = None
 
+    # Report whether 3D fields are available (so frontend can enable/disable radius slider)
+    _3d_t_names = ['t_3d', 'temperature_3d', 't3d', 'temperature', 'temp_3d']
+    _3d_q_names = ['q_3d', 'specific_humidity_3d', 'q3d', 'specific_humidity', 'shum_3d']
+    result["has_3d"] = any(k in era5 for k in _3d_t_names) and any(k in era5 for k in _3d_q_names)
+
     return result
 
 
@@ -1481,7 +1486,18 @@ def get_era5_sounding(
     result = {"case_index": case_index, "radius_km": radius_km}
 
     # Check if full 3D T/q fields are available for custom radius
-    has_3d = all(k in era5 for k in ['t_3d', 'q_3d'])
+    # Support alternate variable names common in ERA5 stores
+    _3d_t_names = ['t_3d', 'temperature_3d', 't3d', 'temperature', 'temp_3d']
+    _3d_q_names = ['q_3d', 'specific_humidity_3d', 'q3d', 'specific_humidity', 'shum_3d']
+    _3d_u_names = ['u_3d', 'u_wind_3d', 'u3d', 'u_component_of_wind']
+    _3d_v_names = ['v_3d', 'v_wind_3d', 'v3d', 'v_component_of_wind']
+
+    t_3d_key = next((k for k in _3d_t_names if k in era5), None)
+    q_3d_key = next((k for k in _3d_q_names if k in era5), None)
+    u_3d_key = next((k for k in _3d_u_names if k in era5), None)
+    v_3d_key = next((k for k in _3d_v_names if k in era5), None)
+
+    has_3d = t_3d_key is not None and q_3d_key is not None
     result["has_3d"] = has_3d
 
     if has_3d:
@@ -1498,8 +1514,8 @@ def get_era5_sounding(
                 raise ValueError("Too few points")
 
             plev = era5['plev'][:].astype(float)
-            t_3d = era5['t_3d'][case_index]   # (nlev, nlat, nlon)
-            q_3d = era5['q_3d'][case_index]
+            t_3d = era5[t_3d_key][case_index]   # (nlev, nlat, nlon)
+            q_3d = era5[q_3d_key][case_index]
 
             t_prof = np.array([float(np.nanmean(t_3d[k][mask_2d])) for k in range(len(plev))])
             q_prof = np.array([float(np.nanmean(q_3d[k][mask_2d])) for k in range(len(plev))])
@@ -1510,10 +1526,16 @@ def get_era5_sounding(
             Lv, Cpd = 2.501e6, 1005.7
             theta_e = theta * np.exp(Lv * q_kgkg / (Cpd * t_prof))
 
-            # RH from q and T
-            es = 6.112 * np.exp(17.67 * (t_prof - 273.15) / (t_prof - 273.15 + 243.5))
-            ws = 0.622 * es / (plev - es)
-            rh_prof = np.clip(q_kgkg / ws * 100.0, 0, 100)
+            # RH: use rh_3d directly if available, else compute from q and T
+            rh_3d_key = next((k for k in ['rh_3d', 'relative_humidity_3d'] if k in era5), None)
+            if rh_3d_key:
+                rh_3d_arr = era5[rh_3d_key][case_index]
+                rh_prof = np.array([float(np.nanmean(rh_3d_arr[k][mask_2d])) for k in range(len(plev))])
+                rh_prof = np.clip(rh_prof, 0, 100)
+            else:
+                es = 6.112 * np.exp(17.67 * (t_prof - 273.15) / (t_prof - 273.15 + 243.5))
+                ws = 0.622 * es / (plev - es)
+                rh_prof = np.clip(q_kgkg / ws * 100.0, 0, 100)
 
             profiles = {
                 "plev": plev.tolist(),
@@ -1525,10 +1547,10 @@ def get_era5_sounding(
             }
 
             # Also average u/v 3D winds if available
-            has_uv_3d = all(k in era5 for k in ['u_3d', 'v_3d'])
+            has_uv_3d = u_3d_key is not None and v_3d_key is not None
             if has_uv_3d:
-                u_3d = era5['u_3d'][case_index]
-                v_3d = era5['v_3d'][case_index]
+                u_3d = era5[u_3d_key][case_index]
+                v_3d = era5[v_3d_key][case_index]
                 u_prof = np.array([float(np.nanmean(u_3d[k][mask_2d])) for k in range(len(plev))])
                 v_prof = np.array([float(np.nanmean(v_3d[k][mask_2d])) for k in range(len(plev))])
                 profiles["u"] = [round(float(v), 2) if not np.isnan(v) else None for v in u_prof]
