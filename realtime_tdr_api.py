@@ -1017,3 +1017,108 @@ def get_realtime_ir_frame(
         _rt_ir_cache.popitem(last=False)
 
     return JSONResponse(result)
+
+
+# ---------------------------------------------------------------------------
+# Azimuthal Mean
+# ---------------------------------------------------------------------------
+
+def _compute_azimuthal_mean(vol, x_coords, y_coords, height_vals,
+                            max_radius, dr, coverage_min):
+    """
+    Compute azimuthal mean from a 3D Cartesian volume (level, y, x).
+
+    Returns:
+        az_mean:  2D array (n_heights × n_rbins) — NaN where coverage < threshold
+        coverage: 2D array (n_heights × n_rbins)
+        r_bins:   1D array of radius bin centres (km)
+    """
+    xx, yy = np.meshgrid(x_coords, y_coords)
+    rr = np.sqrt(xx**2 + yy**2)
+
+    r_edges = np.arange(0, max_radius + dr, dr)
+    r_centers = (r_edges[:-1] + r_edges[1:]) / 2.0
+    n_rbins = len(r_centers)
+    n_heights = len(height_vals)
+
+    bin_idx = np.digitize(rr, r_edges) - 1  # (ny, nx), values 0..n_rbins-1
+
+    az_mean  = np.full((n_heights, n_rbins), np.nan)
+    coverage = np.full((n_heights, n_rbins), 0.0)
+
+    for h in range(n_heights):
+        slab = vol[h, :, :]  # (y, x)
+        valid = ~np.isnan(slab)
+        for r in range(n_rbins):
+            mask = (bin_idx == r)
+            n_total = np.count_nonzero(mask)
+            if n_total == 0:
+                continue
+            in_bin = mask & valid
+            n_valid = np.count_nonzero(in_bin)
+            frac = n_valid / n_total
+            coverage[h, r] = frac
+            if frac >= coverage_min:
+                az_mean[h, r] = float(np.nanmean(slab[in_bin]))
+
+    return az_mean, coverage, r_centers
+
+
+@router.get("/azimuthal_mean")
+def get_rt_azimuthal_mean(
+    file_url:      str   = Query(..., description="URL of the TDR netCDF file"),
+    variable:      str   = Query(DEFAULT_RT_VARIABLE, description="Variable key"),
+    max_radius_km: float = Query(200.0, ge=10, le=500, description="Max radius (km)"),
+    dr_km:         float = Query(2.0, ge=0.5, le=20, description="Radial bin width (km)"),
+    coverage_min:  float = Query(0.5, ge=0.0, le=1.0, description="Min data coverage fraction"),
+    overlay:       str   = Query("", description="Optional overlay variable key"),
+):
+    """Return azimuthal-mean radius-height cross-section for a real-time TDR file."""
+    if variable not in RT_VARIABLES and variable not in RT_DERIVED:
+        raise HTTPException(status_code=400, detail=f"Unknown variable '{variable}'.")
+    if overlay and overlay not in RT_VARIABLES and overlay not in RT_DERIVED:
+        raise HTTPException(status_code=400, detail=f"Unknown overlay variable '{overlay}'.")
+
+    ds = _open_rt_dataset(file_url)
+    x_coords, y_coords = _get_xy_coords(ds)
+    vol, heights = _extract_3d(ds, variable)
+
+    az_mean, cov, r_centers = _compute_azimuthal_mean(
+        vol, x_coords, y_coords, heights,
+        max_radius_km, dr_km, coverage_min
+    )
+
+    var_info = _get_variable_info(variable)
+    meta = _build_case_meta(ds)
+
+    result = {
+        "azimuthal_mean": _clean_2d(az_mean),
+        "coverage": _clean_2d(cov),
+        "radius_km": [round(float(r), 2) for r in r_centers],
+        "height_km": [round(float(h), 2) for h in heights],
+        "coverage_min": coverage_min,
+        "variable": var_info,
+        "case_meta": meta,
+    }
+
+    # Optional overlay
+    if overlay:
+        try:
+            ov_vol, ov_heights = _extract_3d(ds, overlay)
+            ov_az, _, _ = _compute_azimuthal_mean(
+                ov_vol, x_coords, y_coords, ov_heights,
+                max_radius_km, dr_km, coverage_min
+            )
+            ov_info = _get_variable_info(overlay)
+            result["overlay"] = {
+                "azimuthal_mean": _clean_2d(ov_az),
+                "key": overlay,
+                "display_name": ov_info["display_name"],
+                "units": ov_info["units"],
+                "vmin": ov_info["vmin"],
+                "vmax": ov_info["vmax"],
+            }
+        except Exception:
+            pass
+
+    return JSONResponse(result)
