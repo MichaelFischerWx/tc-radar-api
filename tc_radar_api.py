@@ -47,7 +47,7 @@ import xarray as xr
 import fsspec
 from scipy import ndimage as _ndimage
 from scipy.interpolate import RegularGridInterpolator
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.responses import Response, JSONResponse
