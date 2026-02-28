@@ -1189,6 +1189,7 @@ def get_era5(
     case_index: int = Query(..., ge=0),
     field: str = Query("shear_mag"),
     include_profiles: bool = Query(True),
+    radius_km: float = Query(0, ge=0, le=1200, description="Crop radius in km (0=full domain)"),
 ):
     """
     Return ERA5 environmental diagnostics for a TC-RADAR case.
@@ -1198,6 +1199,7 @@ def get_era5(
     case_index : int
     field : str - 2D field to return (shear_mag, rh_mid, div200)
     include_profiles : bool - include vertical profiles & hodograph data
+    radius_km : float - crop to this radius from TC center (0=full 20° domain)
     """
     era5 = get_era5_dataset()
     if era5 is None:
@@ -1215,8 +1217,21 @@ def get_era5(
 
     cfg = ERA5_FIELD_CONFIG[field]
 
-    # Read 2D field
+    # Read full 2D field and coordinate offsets
     data_2d = era5[field][case_index]  # (81, 81)
+    lat_offsets = era5['lat_offsets'][:]
+    lon_offsets = era5['lon_offsets'][:]
+
+    # Crop to radius_km if specified
+    if radius_km > 0:
+        center_lat = float(era5['center_lat'][case_index])
+        crop_deg = radius_km / 111.0  # approximate degrees
+        lat_mask = np.abs(lat_offsets) <= crop_deg
+        lon_mask = np.abs(lon_offsets) <= crop_deg
+        data_2d = data_2d[np.ix_(lat_mask, lon_mask)]
+        lat_offsets = lat_offsets[lat_mask]
+        lon_offsets = lon_offsets[lon_mask]
+
     field_list = []
     for row in data_2d:
         field_list.append([
@@ -1231,15 +1246,22 @@ def get_era5(
         "data": field_list,
         "center_lat": float(era5['center_lat'][case_index]),
         "center_lon": float(era5['center_lon'][case_index]),
-        "lat_offsets": era5['lat_offsets'][:].tolist(),
-        "lon_offsets": era5['lon_offsets'][:].tolist(),
+        "lat_offsets": lat_offsets.tolist(),
+        "lon_offsets": lon_offsets.tolist(),
     }
 
-    # Add vector components if field has them (subsampled every 4 pts = ~1°)
+    # Add vector components if field has them (subsampled for readability)
     if cfg.get("has_vectors"):
-        stride = 4
-        u_sub = era5[cfg["vector_u"]][case_index][::stride, ::stride]
-        v_sub = era5[cfg["vector_v"]][case_index][::stride, ::stride]
+        u_full = era5[cfg["vector_u"]][case_index]
+        v_full = era5[cfg["vector_v"]][case_index]
+        if radius_km > 0:
+            u_full = u_full[np.ix_(lat_mask, lon_mask)]
+            v_full = v_full[np.ix_(lat_mask, lon_mask)]
+        # Stride: aim for ~10-15 arrows per axis
+        n_pts = len(lat_offsets)
+        stride = max(1, n_pts // 12)
+        u_sub = u_full[::stride, ::stride]
+        v_sub = v_full[::stride, ::stride]
         result["vectors"] = {
             "u": [[round(float(v), 2) if not np.isnan(v) else None for v in row] for row in u_sub],
             "v": [[round(float(v), 2) if not np.isnan(v) else None for v in row] for row in v_sub],
