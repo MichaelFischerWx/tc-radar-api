@@ -887,6 +887,89 @@ def get_rt_volume(
 
 
 # ---------------------------------------------------------------------------
+# Diagnostic endpoint — remove once IR is confirmed working
+# ---------------------------------------------------------------------------
+
+@router.get("/ir_debug")
+def debug_ir(
+    file_url: str = Query(..., description="URL to the TDR xy.nc(.gz) file"),
+):
+    """Diagnostic: show what the IR pipeline sees without rendering frames."""
+    info = {"steps": []}
+
+    # Step 1: Check dependencies
+    s3fs_ok = _get_s3fs_module() is not None
+    pyproj_ok = _get_pyproj_module() is not None
+    info["s3fs_available"] = s3fs_ok
+    info["pyproj_available"] = pyproj_ok
+    if not s3fs_ok or not pyproj_ok:
+        info["error"] = "Missing dependencies"
+        return JSONResponse(info)
+    info["steps"].append("dependencies OK")
+
+    # Step 2: Open TDR file
+    try:
+        ds = _open_rt_dataset(file_url)
+        meta = _build_case_meta(ds)
+        info["meta"] = meta
+        info["steps"].append("TDR file opened")
+    except Exception as e:
+        info["error"] = f"TDR open failed: {e}"
+        return JSONResponse(info)
+
+    # Step 3: Parse datetime and select satellite
+    try:
+        analysis_dt = _parse_tdr_datetime(meta)
+        info["analysis_dt"] = analysis_dt.isoformat()
+    except Exception as e:
+        info["error"] = f"datetime parse failed: {e}"
+        return JSONResponse(info)
+
+    bucket, sat_key = _select_goes_sat(meta["longitude"], analysis_dt)
+    info["bucket"] = bucket
+    info["sat_key"] = sat_key
+    info["steps"].append(f"satellite: {bucket} ({sat_key})")
+
+    # Step 4: Build frame times and check t=0
+    frame_times = _build_frame_times(analysis_dt)
+    t0 = frame_times[0]
+    jday = t0.timetuple().tm_yday
+    prefix = f"{bucket}/{IR_PRODUCT}/{t0.year}/{jday:03d}/{t0.hour:02d}/"
+    info["s3_prefix"] = prefix
+    info["t0_target"] = t0.isoformat()
+
+    # Step 5: List S3 directory
+    fs = _get_goes_fs()
+    try:
+        files = fs.ls(prefix, detail=False)
+        info["s3_file_count"] = len(files)
+        # Show first 5 filenames
+        info["s3_files_sample"] = [f.split("/")[-1] for f in files[:5]]
+        info["steps"].append(f"S3 ls returned {len(files)} files")
+    except Exception as e:
+        info["s3_ls_error"] = str(e)
+        info["steps"].append(f"S3 ls FAILED: {e}")
+        return JSONResponse(info)
+
+    # Step 6: Filter to Band 13
+    band_tag = f"C{IR_BAND:02d}"
+    candidates = [f for f in files if band_tag in f.split("/")[-1]]
+    info["band13_count"] = len(candidates)
+    if candidates:
+        info["band13_sample"] = [f.split("/")[-1] for f in candidates[:3]]
+
+    # Step 7: Find best match
+    try:
+        best = _find_goes_file(bucket, t0)
+        info["best_file"] = best.split("/")[-1] if best else None
+        info["steps"].append(f"best match: {best}")
+    except Exception as e:
+        info["find_error"] = str(e)
+
+    return JSONResponse(info)
+
+
+# ---------------------------------------------------------------------------
 # HTTP Caching Helpers
 # ---------------------------------------------------------------------------
 
