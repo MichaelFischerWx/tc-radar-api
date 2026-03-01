@@ -347,6 +347,56 @@ def _extract_2d(ds, variable: str, level_km: float):
     return data, actual_level
 
 
+def _interp_tdr_along_track(
+    ds, variable: str, level_km: float, x_pts: np.ndarray, y_pts: np.ndarray
+) -> np.ndarray:
+    """
+    Bilinear-interpolate a TDR 2D field to arbitrary (x_km, y_km) points.
+
+    Returns an array of interpolated values (NaN where outside the domain).
+    """
+    data, actual_level = _extract_2d(ds, variable, level_km)
+    # data is (y, x) after the transpose in _extract_2d
+    x_km, y_km = _get_xy_coords(ds)
+    ny, nx = data.shape
+
+    # Grid spacing (assumed regular)
+    dx = float(x_km[1] - x_km[0]) if nx > 1 else 1.0
+    dy = float(y_km[1] - y_km[0]) if ny > 1 else 1.0
+
+    # Convert query points to fractional grid indices
+    fi = (x_pts - float(x_km[0])) / dx   # fractional x-index
+    fj = (y_pts - float(y_km[0])) / dy   # fractional y-index
+
+    result = np.full(len(x_pts), np.nan)
+    for k in range(len(x_pts)):
+        xi, yj = fi[k], fj[k]
+        i0 = int(np.floor(xi))
+        j0 = int(np.floor(yj))
+        i1, j1 = i0 + 1, j0 + 1
+        if i0 < 0 or i1 >= nx or j0 < 0 or j1 >= ny:
+            continue
+        # Bilinear weights
+        wx = xi - i0
+        wy = yj - j0
+        # data is (y, x)
+        v00 = data[j0, i0]
+        v10 = data[j0, i1]
+        v01 = data[j1, i0]
+        v11 = data[j1, i1]
+        if any(np.isnan(v) for v in [v00, v10, v01, v11]):
+            # Nearest-neighbour fallback if any corner is NaN
+            ni = int(round(xi))
+            nj = int(round(yj))
+            if 0 <= ni < nx and 0 <= nj < ny and not np.isnan(data[nj, ni]):
+                result[k] = float(data[nj, ni])
+            continue
+        val = (v00 * (1 - wx) * (1 - wy) + v10 * wx * (1 - wy) +
+               v01 * (1 - wx) * wy + v11 * wx * wy)
+        result[k] = float(val)
+    return result
+
+
 def _extract_3d(ds, variable: str, max_height_km: float = 18.0):
     """Extract the full 3D volume (level, y, x)."""
     levels = _get_level_axis(ds)
@@ -1734,6 +1784,7 @@ _IWG1 = {
 # aircraft configuration and are not yet mapped.
 _MELISSA_SFMR_INDICES = [2, 3, 4, 5]  # 4 SFMR sfc wind estimates (m/s)
 _MELISSA_EXTRAP_SFC = 6               # extrapolated sfc wind (m/s)
+_MELISSA_SLP = 72                     # sea-level pressure (hPa)
 
 # Cache
 _rt_fl_cache = OrderedDict()
@@ -1831,6 +1882,7 @@ def _parse_acdata_serial(text: str, analysis_dt: _dt, time_window_min: float) ->
             "fl_wdir_deg":    _iwg1_field(parts, _IWG1["wind_dir"]),
             # MELISSA fields
             "sfmr_wspd_ms": None,
+            "slp_hpa": None,
             "extrapolated_sfc_wspd_ms": None,
         }
 
@@ -1858,6 +1910,12 @@ def _parse_acdata_serial(text: str, analysis_dt: _dt, time_window_min: float) ->
                 if v is not None:
                     obs["extrapolated_sfc_wspd_ms"] = round(v, 2)
 
+            # Sea-level pressure
+            if _MELISSA_SLP < len(mparts):
+                v = _safe_float(mparts[_MELISSA_SLP])
+                if v is not None and 850 < v < 1100:  # sanity check
+                    obs["slp_hpa"] = round(v, 2)
+
         observations.append(obs)
 
     return observations
@@ -1879,7 +1937,7 @@ def _average_fl_window(
     _AVG_KEYS = [
         "gps_alt_m", "press_alt_ft", "ground_spd_ms", "true_airspd_ms",
         "vert_vel_ms", "static_pres_hpa", "temp_c", "dewpoint_c",
-        "fl_wspd_ms", "fl_wdir_deg", "sfmr_wspd_ms",
+        "fl_wspd_ms", "fl_wdir_deg", "sfmr_wspd_ms", "slp_hpa",
         "extrapolated_sfc_wspd_ms",
     ]
 
@@ -2033,17 +2091,35 @@ def get_flight_level(
         obs["x_km"] = round(x_km, 3)
         obs["y_km"] = round(y_km, 3)
 
+    # ── Interpolate TDR wind speed to flight-track positions ──────
+    try:
+        x_arr = np.array([o["x_km"] for o in averaged_obs], dtype=float)
+        y_arr = np.array([o["y_km"] for o in averaged_obs], dtype=float)
+
+        tdr_05 = _interp_tdr_along_track(ds, "WIND_SPEED", 0.5, x_arr, y_arr)
+        tdr_20 = _interp_tdr_along_track(ds, "WIND_SPEED", 2.0, x_arr, y_arr)
+
+        for i, obs in enumerate(averaged_obs):
+            obs["tdr_wspd_0p5km"] = round(float(tdr_05[i]), 2) if not np.isnan(tdr_05[i]) else None
+            obs["tdr_wspd_2km"]   = round(float(tdr_20[i]), 2) if not np.isnan(tdr_20[i]) else None
+    except Exception:
+        # Graceful fallback: if TDR interpolation fails, leave fields as None
+        for obs in averaged_obs:
+            obs.setdefault("tdr_wspd_0p5km", None)
+            obs.setdefault("tdr_wspd_2km", None)
+
     # Compute summary statistics from the RAW 1-Hz data for accuracy
     fl_wspds = [o["fl_wspd_ms"] for o in raw_obs if o["fl_wspd_ms"] is not None]
     sfmr_wspds = [o["sfmr_wspd_ms"] for o in raw_obs if o["sfmr_wspd_ms"] is not None]
     static_pres = [o["static_pres_hpa"] for o in raw_obs
                    if o["static_pres_hpa"] is not None and 200 < o["static_pres_hpa"] < 1100]
+    slp_vals = [o["slp_hpa"] for o in raw_obs if o.get("slp_hpa") is not None]
     temps = [o["temp_c"] for o in raw_obs if o["temp_c"] is not None]
 
     summary = {
         "max_fl_wspd_ms": round(max(fl_wspds), 2) if fl_wspds else None,
         "max_sfmr_wspd_ms": round(max(sfmr_wspds), 2) if sfmr_wspds else None,
-        "min_slp_hpa": None,  # SLP not yet reliably parsed from MELISSA
+        "min_slp_hpa": round(min(slp_vals), 2) if slp_vals else None,
         "max_temp_c": round(max(temps), 2) if temps else None,
         "min_temp_c": round(min(temps), 2) if temps else None,
         "min_static_pres_hpa": round(min(static_pres), 2) if static_pres else None,
