@@ -38,7 +38,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 try:
     import requests as _requests
@@ -185,8 +185,9 @@ _RT_DS_CACHE_MAX = 3               # was 8 — keep fewer datasets in RAM
 _RT_DIR_CACHE_TTL = 300            # 5 minutes for directory listings
 
 # GOES IR frame cache: (file_url, frame_index) → rendered result dict
+# Kept small because browsers cache via Cache-Control headers.
 _rt_ir_cache = OrderedDict()
-_RT_IR_CACHE_MAX = 20              # was 120 — keep fewer PNG frames in RAM
+_RT_IR_CACHE_MAX = 5               # minimal — browser handles long-term caching
 
 # Shared S3 filesystem (lazy-initialised)
 _goes_fs = None
@@ -886,6 +887,30 @@ def get_rt_volume(
 
 
 # ---------------------------------------------------------------------------
+# HTTP Caching Helpers
+# ---------------------------------------------------------------------------
+
+# Historical GOES IR frames are immutable — once rendered they never change.
+# We set aggressive Cache-Control headers so the browser (and any CDN) caches
+# them, eliminating repeat requests and reducing server RAM usage.
+_IR_CACHE_MAX_AGE = 86400          # 24 hours for individual frames
+_IR_META_CACHE_MAX_AGE = 300       # 5 minutes for the /ir metadata+frame0 response
+
+
+def _cached_json_response(data: dict, max_age: int = _IR_CACHE_MAX_AGE) -> Response:
+    """Return a JSONResponse with Cache-Control headers for browser caching."""
+    import ujson
+    body = ujson.dumps(data)
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={
+            "Cache-Control": f"public, max-age={max_age}, immutable",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # GOES IR Satellite Imagery Endpoints
 # ---------------------------------------------------------------------------
 
@@ -974,7 +999,7 @@ def get_realtime_ir(
         "lon_max": center_lon + half_deg,
     }
 
-    return JSONResponse({
+    return _cached_json_response({
         "center_lat": center_lat,
         "center_lon": center_lon,
         "satellite": sat_key,
@@ -987,7 +1012,7 @@ def get_realtime_ir(
         "bounds_km": bounds_km,
         "bounds_deg": bounds_deg,
         "units": "K",
-    })
+    }, max_age=_IR_META_CACHE_MAX_AGE)
 
 
 @router.get("/ir_frame")
@@ -1002,11 +1027,11 @@ def get_realtime_ir_frame(
     if _get_s3fs_module() is None or _get_pyproj_module() is None:
         raise HTTPException(status_code=503, detail="GOES IR not available")
 
-    # Check cache first
+    # Check server-side cache first (small — browser is primary cache)
     cache_key = (file_url, frame_index)
     if cache_key in _rt_ir_cache:
         _rt_ir_cache.move_to_end(cache_key)
-        return JSONResponse(_rt_ir_cache[cache_key])
+        return _cached_json_response(_rt_ir_cache[cache_key])
 
     # Open TDR file for metadata
     try:
@@ -1049,12 +1074,12 @@ def get_realtime_ir_frame(
         "frame": png,
     }
 
-    # Cache
+    # Light server-side cache (browser is primary via Cache-Control)
     _rt_ir_cache[cache_key] = result
     if len(_rt_ir_cache) > _RT_IR_CACHE_MAX:
         _rt_ir_cache.popitem(last=False)
 
-    return JSONResponse(result)
+    return _cached_json_response(result)
 
 
 # ---------------------------------------------------------------------------
