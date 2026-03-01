@@ -383,7 +383,13 @@ def _build_case_meta(ds) -> dict:
 
     datetime_str = ""
     if year > 0:
-        datetime_str = f"{year:04d}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:{second:02d}Z"
+        # Handle hour >= 24 (common in met data — e.g. hour 25 = 01Z next day)
+        if hour >= 24:
+            base_date = _dt(year, month, day, tzinfo=timezone.utc)
+            adjusted = base_date + timedelta(hours=hour, minutes=minute, seconds=second)
+            datetime_str = adjusted.strftime("%Y-%m-%d %H:%M:%SZ")
+        else:
+            datetime_str = f"{year:04d}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:{second:02d}Z"
 
     return {
         "storm_name": str(attrs.get("STORM NAME", attrs.get("STMNAME", "Unknown"))).strip(),
