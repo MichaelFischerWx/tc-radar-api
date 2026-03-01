@@ -1691,50 +1691,49 @@ def get_dropsondes(
 # ---------------------------------------------------------------------------
 
 SEB_ACDATA_BASE = "https://seb.omao.noaa.gov/pub/acdata"
-FL_TIME_WINDOW_MIN = 45  # ±45 minutes from TDR analysis centre time
+FL_TIME_WINDOW_MIN = 45  # +/-45 minutes from TDR analysis centre time
 
-# IWG1 field indices (0-based, after splitting by comma)
-# Format: IWG1,timestamp,lat,lon,gps_alt,wgs84_alt,press_alt,radar_alt,
-#         heading,track,ground_spd,true_airspd,indicated_airspd,mach,
-#         vert_vel,sideslip,angle_of_attack,static_press,...
-# See: https://www.eol.ucar.edu/content/iwg1-format
-_IWG1_FIELDS = {
-    "timestamp": 1,
-    "lat": 2,
-    "lon": 3,
-    "gps_alt": 4,        # GPS altitude (m MSL)
-    "press_alt": 6,      # pressure altitude (m)
-    "radar_alt": 7,      # radar altitude (m AGL)
-    "heading": 8,
-    "track": 9,
-    "ground_spd": 10,    # m/s
-    "true_airspd": 11,   # m/s
-    "vert_vel": 14,      # m/s
-    "static_pres": 17,   # hPa
-    "total_temp": 18,    # deg C (total / indicated air temp)
-    "temp": 19,          # deg C (deiced static temp)
-    "dewpoint": 20,      # deg C
-    "total_temp2": 21,   # deg C (secondary sensor)
-    "ir_surf_temp": 22,  # deg C
-    "flight_id": 36,     # e.g. 20251028H1
-    "tail_number": 37,   # e.g. 2313A
+# NOAA P-3 IWG1 field indices (0-based, after splitting by comma).
+# The P-3 includes a WGS-84 altitude field at position 5 that shifts all
+# subsequent fields by +1 compared to the base IWG1 standard.
+# Spec: https://archive.eol.ucar.edu/raf/Software/IWG1_Def.html
+_IWG1 = {
+    "timestamp":    1,   # ISO-8601 UTC (yyyymmddThhmmss)
+    "lat":          2,   # degrees
+    "lon":          3,   # degrees
+    "gps_alt":      4,   # GPS MSL altitude (m)
+    # 5: WGS-84 altitude (m) — often empty on P-3
+    "press_alt":    6,   # pressure altitude (feet)
+    "radar_alt":    7,   # radar altitude (feet)
+    "ground_spd":   8,   # ground speed (m/s)
+    "true_airspd":  9,   # true airspeed (m/s)
+    "ias":         10,   # indicated airspeed (knots)
+    "mach":        11,   # Mach number
+    "vert_vel":    12,   # vertical velocity (m/s)
+    "heading":     13,   # true heading (deg)
+    "track":       14,   # track angle (deg)
+    "drift":       15,   # drift angle (deg)
+    "pitch":       16,   # pitch (deg)
+    "roll":        17,   # roll (deg)
+    "sideslip":    18,   # side slip (deg)
+    "aoa":         19,   # angle of attack (deg)
+    "temp":        20,   # ambient/static temperature (deg C)
+    "dewpoint":    21,   # dew point (deg C)
+    "total_temp":  22,   # total temperature (deg C)
+    "static_pres": 23,   # static pressure (hPa)
+    "dyn_pres":    24,   # dynamic pressure (hPa)
+    "cabin_pres":  25,   # cabin pressure (hPa)
+    "wind_spd":    26,   # environmental wind speed (m/s)
+    "wind_dir":    27,   # environmental wind direction (deg)
+    "vert_wind":   28,   # vertical wind speed (m/s)
+    "flight_id":   33,   # e.g. 20251028H1 (P-3 extension)
 }
 
-# MELISSA field layout (surface wind estimates from SFMR + extra FL data)
-# MELISSA,storm_id, ... many comma-separated fields ...
-_MELISSA_FIELDS = {
-    "storm_id": 1,
-    "sfmr_wspd_1": 2,     # SFMR surface wind estimate (primary, m/s)
-    "sfmr_wspd_2": 3,     # secondary
-    "sfmr_wspd_3": 4,     # third
-    "sfmr_wspd_4": 5,     # fourth
-    "extrapolated_sfc_wspd": 6,   # extrapolated sfc wind (m/s)
-    "sfmr_rain": 26,      # rain rate (mm/hr)
-    "fl_wspd": 27,        # flight-level wind speed (m/s)
-    "fl_wdir": 28,        # flight-level wind direction (deg)
-    "slp": 29,            # sea-level pressure (hPa) — extrapolated
-    "d_value": 30,        # D-value (m)
-}
+# MELISSA fields — only the SFMR surface wind estimates (positions 2-6)
+# are reliably identified; the remaining 90+ MELISSA fields vary by
+# aircraft configuration and are not yet mapped.
+_MELISSA_SFMR_INDICES = [2, 3, 4, 5]  # 4 SFMR sfc wind estimates (m/s)
+_MELISSA_EXTRAP_SFC = 6               # extrapolated sfc wind (m/s)
 
 # Cache
 _rt_fl_cache = OrderedDict()
@@ -1764,143 +1763,169 @@ def _safe_float(val: str) -> Optional[float]:
         return None
 
 
+def _iwg1_field(parts: list, idx: int) -> Optional[float]:
+    """Extract a float from IWG1 parts at the given index, or None."""
+    if idx < len(parts):
+        return _safe_float(parts[idx])
+    return None
+
+
 def _parse_acdata_serial(text: str, analysis_dt: _dt, time_window_min: float) -> list[dict]:
     """
-    Parse a _serial.dat file containing interleaved IWG1 + MELISSA records.
+    Parse a _serial.dat file containing IWG1 + MELISSA records.
 
-    Returns a list of observation dicts, one per IWG1 record within the
-    +/-time_window_min of analysis_dt.  Each dict merges IWG1 and the
-    immediately-following MELISSA line (if present).
+    On the NOAA P-3, IWG1 and MELISSA are on the SAME line, separated
+    by a space (e.g. "...2313A MELISSA,AL132025,...").  This parser
+    splits on " MELISSA," to separate them.
+
+    Returns a list of 1-Hz observation dicts within +/-time_window_min
+    of analysis_dt.
     """
     lines = text.splitlines()
     observations = []
 
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
+    for line in lines:
+        line = line.strip()
         if not line.startswith("IWG1,"):
-            i += 1
             continue
 
-        # Parse IWG1 line
-        parts = line.split(",")
-        ts = _parse_iwg1_timestamp(parts[_IWG1_FIELDS["timestamp"]] if len(parts) > 1 else "")
+        # Split IWG1 and MELISSA (they share the same line on P-3)
+        iwg1_text = line
+        melissa_text = None
+        mel_split = line.split(" MELISSA,", 1)
+        if len(mel_split) == 2:
+            iwg1_text = mel_split[0]
+            melissa_text = "MELISSA," + mel_split[1]
 
+        parts = iwg1_text.split(",")
+        ts = _parse_iwg1_timestamp(parts[_IWG1["timestamp"]] if len(parts) > 1 else "")
         if ts is None:
-            i += 1
             continue
 
-        # Check time window
-        delta_sec = abs((ts - analysis_dt).total_seconds())
-        if delta_sec > time_window_min * 60:
-            i += 1
+        # Time-window filter
+        delta_sec = (ts - analysis_dt).total_seconds()
+        if abs(delta_sec) > time_window_min * 60:
             continue
 
-        lat = _safe_float(parts[_IWG1_FIELDS["lat"]]) if len(parts) > _IWG1_FIELDS["lat"] else None
-        lon = _safe_float(parts[_IWG1_FIELDS["lon"]]) if len(parts) > _IWG1_FIELDS["lon"] else None
-
+        lat = _iwg1_field(parts, _IWG1["lat"])
+        lon = _iwg1_field(parts, _IWG1["lon"])
         if lat is None or lon is None:
-            i += 1
             continue
 
         obs = {
             "time": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "time_offset_s": round((ts - analysis_dt).total_seconds(), 1),
+            "time_offset_s": round(delta_sec, 1),
             "lat": round(lat, 5),
             "lon": round(lon, 5),
-            "gps_alt_m": _safe_float(parts[_IWG1_FIELDS["gps_alt"]]) if len(parts) > _IWG1_FIELDS["gps_alt"] else None,
-            "press_alt_m": _safe_float(parts[_IWG1_FIELDS["press_alt"]]) if len(parts) > _IWG1_FIELDS["press_alt"] else None,
-            "heading": _safe_float(parts[_IWG1_FIELDS["heading"]]) if len(parts) > _IWG1_FIELDS["heading"] else None,
-            "track": _safe_float(parts[_IWG1_FIELDS["track"]]) if len(parts) > _IWG1_FIELDS["track"] else None,
-            "ground_spd_ms": _safe_float(parts[_IWG1_FIELDS["ground_spd"]]) if len(parts) > _IWG1_FIELDS["ground_spd"] else None,
-            "true_airspd_ms": _safe_float(parts[_IWG1_FIELDS["true_airspd"]]) if len(parts) > _IWG1_FIELDS["true_airspd"] else None,
-            "vert_vel_ms": _safe_float(parts[_IWG1_FIELDS["vert_vel"]]) if len(parts) > _IWG1_FIELDS["vert_vel"] else None,
-            "static_pres_hpa": _safe_float(parts[_IWG1_FIELDS["static_pres"]]) if len(parts) > _IWG1_FIELDS["static_pres"] else None,
-            "temp_c": _safe_float(parts[_IWG1_FIELDS["temp"]]) if len(parts) > _IWG1_FIELDS["temp"] else None,
-            "dewpoint_c": _safe_float(parts[_IWG1_FIELDS["dewpoint"]]) if len(parts) > _IWG1_FIELDS["dewpoint"] else None,
-            # MELISSA fields (filled below if available)
+            "gps_alt_m":      _iwg1_field(parts, _IWG1["gps_alt"]),
+            "press_alt_ft":   _iwg1_field(parts, _IWG1["press_alt"]),
+            "ground_spd_ms":  _iwg1_field(parts, _IWG1["ground_spd"]),
+            "true_airspd_ms": _iwg1_field(parts, _IWG1["true_airspd"]),
+            "vert_vel_ms":    _iwg1_field(parts, _IWG1["vert_vel"]),
+            "heading":        _iwg1_field(parts, _IWG1["heading"]),
+            "track":          _iwg1_field(parts, _IWG1["track"]),
+            "static_pres_hpa": _iwg1_field(parts, _IWG1["static_pres"]),
+            "temp_c":         _iwg1_field(parts, _IWG1["temp"]),
+            "dewpoint_c":     _iwg1_field(parts, _IWG1["dewpoint"]),
+            "fl_wspd_ms":     _iwg1_field(parts, _IWG1["wind_spd"]),
+            "fl_wdir_deg":    _iwg1_field(parts, _IWG1["wind_dir"]),
+            # MELISSA fields
             "sfmr_wspd_ms": None,
-            "sfmr_rain_mmhr": None,
-            "fl_wspd_ms": None,
-            "fl_wdir_deg": None,
-            "slp_hpa": None,
             "extrapolated_sfc_wspd_ms": None,
         }
 
-        # Round numeric IWG1 values
-        for key in ["gps_alt_m", "press_alt_m", "heading", "track",
-                     "ground_spd_ms", "true_airspd_ms", "vert_vel_ms",
-                     "static_pres_hpa", "temp_c", "dewpoint_c"]:
-            if obs[key] is not None:
+        # Round values
+        for key in obs:
+            if isinstance(obs[key], float) and key not in ("lat", "lon", "time_offset_s"):
                 obs[key] = round(obs[key], 2)
 
-        # Check for MELISSA line immediately following
-        i += 1
-        if i < len(lines):
-            mline = lines[i].strip()
-            if mline.startswith("MELISSA,"):
-                mparts = mline.split(",")
-                # Primary SFMR surface wind (take the first non-empty of the 4 estimates)
-                for sfmr_idx in [_MELISSA_FIELDS["sfmr_wspd_1"],
-                                  _MELISSA_FIELDS["sfmr_wspd_2"],
-                                  _MELISSA_FIELDS["sfmr_wspd_3"],
-                                  _MELISSA_FIELDS["sfmr_wspd_4"]]:
-                    if sfmr_idx < len(mparts):
-                        v = _safe_float(mparts[sfmr_idx])
-                        if v is not None and v >= 0:
-                            obs["sfmr_wspd_ms"] = round(v, 2)
-                            break
+        # Parse MELISSA line (same line, after the space)
+        if melissa_text:
+            mparts = melissa_text.split(",")
+            # SFMR surface wind: take the maximum positive of the 4 estimates
+            best_sfmr = None
+            for si in _MELISSA_SFMR_INDICES:
+                if si < len(mparts):
+                    v = _safe_float(mparts[si])
+                    if v is not None and v >= 0:
+                        if best_sfmr is None or v > best_sfmr:
+                            best_sfmr = v
+            if best_sfmr is not None:
+                obs["sfmr_wspd_ms"] = round(best_sfmr, 2)
 
-                if _MELISSA_FIELDS["extrapolated_sfc_wspd"] < len(mparts):
-                    obs["extrapolated_sfc_wspd_ms"] = _safe_float(mparts[_MELISSA_FIELDS["extrapolated_sfc_wspd"]])
-                    if obs["extrapolated_sfc_wspd_ms"] is not None:
-                        obs["extrapolated_sfc_wspd_ms"] = round(obs["extrapolated_sfc_wspd_ms"], 2)
-
-                if _MELISSA_FIELDS["sfmr_rain"] < len(mparts):
-                    obs["sfmr_rain_mmhr"] = _safe_float(mparts[_MELISSA_FIELDS["sfmr_rain"]])
-                    if obs["sfmr_rain_mmhr"] is not None:
-                        obs["sfmr_rain_mmhr"] = round(obs["sfmr_rain_mmhr"], 2)
-
-                if _MELISSA_FIELDS["fl_wspd"] < len(mparts):
-                    obs["fl_wspd_ms"] = _safe_float(mparts[_MELISSA_FIELDS["fl_wspd"]])
-                    if obs["fl_wspd_ms"] is not None:
-                        obs["fl_wspd_ms"] = round(obs["fl_wspd_ms"], 2)
-
-                if _MELISSA_FIELDS["fl_wdir"] < len(mparts):
-                    obs["fl_wdir_deg"] = _safe_float(mparts[_MELISSA_FIELDS["fl_wdir"]])
-                    if obs["fl_wdir_deg"] is not None:
-                        obs["fl_wdir_deg"] = round(obs["fl_wdir_deg"], 1)
-
-                if _MELISSA_FIELDS["slp"] < len(mparts):
-                    obs["slp_hpa"] = _safe_float(mparts[_MELISSA_FIELDS["slp"]])
-                    if obs["slp_hpa"] is not None:
-                        obs["slp_hpa"] = round(obs["slp_hpa"], 2)
-
-                i += 1
+            if _MELISSA_EXTRAP_SFC < len(mparts):
+                v = _safe_float(mparts[_MELISSA_EXTRAP_SFC])
+                if v is not None:
+                    obs["extrapolated_sfc_wspd_ms"] = round(v, 2)
 
         observations.append(obs)
 
     return observations
 
 
-def _thin_flight_track(observations: list[dict], interval_s: float = 10.0) -> list[dict]:
+def _average_fl_window(
+    observations: list[dict], interval_s: float = 10.0
+) -> list[dict]:
     """
-    Thin 1-Hz flight track to ~interval_s spacing for lighter payloads.
-    Always keeps first and last points.
+    Compute interval_s-second averages of flight-level observations.
+
+    Groups consecutive 1-Hz obs into non-overlapping windows and averages
+    all numeric fields.  Lat/lon/time use the window centre observation.
     """
-    if len(observations) <= 2:
+    if not observations or interval_s <= 1:
         return observations
 
-    thinned = [observations[0]]
-    last_offset = observations[0]["time_offset_s"]
+    # Numeric keys to average
+    _AVG_KEYS = [
+        "gps_alt_m", "press_alt_ft", "ground_spd_ms", "true_airspd_ms",
+        "vert_vel_ms", "static_pres_hpa", "temp_c", "dewpoint_c",
+        "fl_wspd_ms", "fl_wdir_deg", "sfmr_wspd_ms",
+        "extrapolated_sfc_wspd_ms",
+    ]
 
-    for obs in observations[1:-1]:
-        if abs(obs["time_offset_s"] - last_offset) >= interval_s:
-            thinned.append(obs)
-            last_offset = obs["time_offset_s"]
+    result = []
+    n = len(observations)
+    i = 0
+    while i < n:
+        t0 = observations[i]["time_offset_s"]
+        window = []
+        while i < n and observations[i]["time_offset_s"] - t0 < interval_s:
+            window.append(observations[i])
+            i += 1
 
-    thinned.append(observations[-1])
-    return thinned
+        # Use the centre observation for identity fields
+        mid_idx = len(window) // 2
+        mid = window[mid_idx]
+        averaged = {
+            "time": mid["time"],
+            "time_offset_s": mid["time_offset_s"],
+            "lat": mid["lat"],
+            "lon": mid["lon"],
+        }
+
+        # Average numeric fields (skip None values)
+        for key in _AVG_KEYS:
+            vals = [o[key] for o in window if o.get(key) is not None]
+            if vals:
+                # For wind direction, use circular mean
+                if key == "fl_wdir_deg":
+                    rad = [v * np.pi / 180.0 for v in vals]
+                    mean_sin = sum(np.sin(r) for r in rad) / len(rad)
+                    mean_cos = sum(np.cos(r) for r in rad) / len(rad)
+                    avg = (np.arctan2(mean_sin, mean_cos) * 180.0 / np.pi) % 360.0
+                else:
+                    avg = sum(vals) / len(vals)
+                averaged[key] = round(avg, 2)
+            else:
+                averaged[key] = None
+
+        # Carry forward heading/track from centre obs
+        averaged["heading"] = mid.get("heading")
+        averaged["track"] = mid.get("track")
+
+        result.append(averaged)
+
+    return result
 
 
 def _find_acdata_serial_file(mission_id: str, year: int) -> Optional[str]:
@@ -1915,7 +1940,6 @@ def _find_acdata_serial_file(mission_id: str, year: int) -> Optional[str]:
     except Exception:
         return None
 
-    # Look for the _serial.dat file
     for link in links:
         if link.endswith("_serial.dat"):
             return f"{base_url}{link}"
@@ -1925,18 +1949,19 @@ def _find_acdata_serial_file(mission_id: str, year: int) -> Optional[str]:
 @router.get("/flightlevel")
 def get_flight_level(
     file_url: str = Query(..., description="URL to the TDR xy.nc(.gz) file"),
-    thin_interval_s: float = Query(10.0, ge=1, le=60, description="Thinning interval in seconds"),
+    avg_interval_s: float = Query(10.0, ge=1, le=60,
+                                  description="Averaging interval in seconds"),
 ):
     """
     Return flight-level (in situ) observations from the IWG1/MELISSA serial
     data stream for the aircraft mission matching the given TDR analysis file.
 
-    Searches seb.omao.noaa.gov/pub/acdata/{year}/MET/{mission_id}/ for the
-    *_serial.dat file, parses IWG1 + MELISSA records, filters to +/-45 min
-    of the TDR analysis time, and returns structured JSON.
+    Parses 1-Hz IWG1 + MELISSA from seb.omao.noaa.gov/pub/acdata/, filters
+    to +/-45 min of the TDR analysis time, and returns 10-second averaged
+    observations with storm-relative coordinates.
     """
     now = time.time()
-    cache_key = f"{file_url}__thin{thin_interval_s}"
+    cache_key = f"{file_url}__avg{avg_interval_s}"
     if cache_key in _rt_fl_cache:
         cached, ts = _rt_fl_cache[cache_key]
         if now - ts < _RT_FL_CACHE_TTL:
@@ -1968,7 +1993,6 @@ def get_flight_level(
     if not mission_id:
         raise HTTPException(status_code=400, detail="Could not determine mission ID")
 
-    # Determine year from analysis time
     year = analysis_dt.year
 
     # Find the serial data file
@@ -1996,50 +2020,52 @@ def get_flight_level(
             detail=f"Could not fetch serial data from {serial_url}: {e}",
         )
 
-    observations = _parse_acdata_serial(serial_text, analysis_dt, FL_TIME_WINDOW_MIN)
+    raw_obs = _parse_acdata_serial(serial_text, analysis_dt, FL_TIME_WINDOW_MIN)
+
+    # Compute 10-second (or user-specified) averages
+    averaged_obs = _average_fl_window(raw_obs, interval_s=avg_interval_s)
 
     # Add storm-relative coordinates
-    for obs in observations:
+    for obs in averaged_obs:
         x_km, y_km = _latlon_to_storm_km(
             obs["lat"], obs["lon"], center_lat, center_lon
         )
         obs["x_km"] = round(x_km, 3)
         obs["y_km"] = round(y_km, 3)
 
-    # Thin track for performance
-    thinned = _thin_flight_track(observations, interval_s=thin_interval_s)
-
-    # Compute summary statistics
-    fl_wspds = [o["fl_wspd_ms"] for o in observations if o["fl_wspd_ms"] is not None]
-    sfmr_wspds = [o["sfmr_wspd_ms"] for o in observations if o["sfmr_wspd_ms"] is not None]
-    slps = [o["slp_hpa"] for o in observations if o["slp_hpa"] is not None and 800 < o["slp_hpa"] < 1100]
-    temps = [o["temp_c"] for o in observations if o["temp_c"] is not None]
+    # Compute summary statistics from the RAW 1-Hz data for accuracy
+    fl_wspds = [o["fl_wspd_ms"] for o in raw_obs if o["fl_wspd_ms"] is not None]
+    sfmr_wspds = [o["sfmr_wspd_ms"] for o in raw_obs if o["sfmr_wspd_ms"] is not None]
+    static_pres = [o["static_pres_hpa"] for o in raw_obs
+                   if o["static_pres_hpa"] is not None and 200 < o["static_pres_hpa"] < 1100]
+    temps = [o["temp_c"] for o in raw_obs if o["temp_c"] is not None]
 
     summary = {
         "max_fl_wspd_ms": round(max(fl_wspds), 2) if fl_wspds else None,
         "max_sfmr_wspd_ms": round(max(sfmr_wspds), 2) if sfmr_wspds else None,
-        "min_slp_hpa": round(min(slps), 2) if slps else None,
+        "min_slp_hpa": None,  # SLP not yet reliably parsed from MELISSA
         "max_temp_c": round(max(temps), 2) if temps else None,
         "min_temp_c": round(min(temps), 2) if temps else None,
-        "total_obs_1hz": len(observations),
-        "thinned_obs": len(thinned),
+        "min_static_pres_hpa": round(min(static_pres), 2) if static_pres else None,
+        "total_obs_1hz": len(raw_obs),
+        "avg_interval_s": avg_interval_s,
         "mean_alt_m": round(
-            sum(o["gps_alt_m"] for o in observations if o["gps_alt_m"] is not None)
-            / max(1, sum(1 for o in observations if o["gps_alt_m"] is not None)),
+            sum(o["gps_alt_m"] for o in raw_obs if o["gps_alt_m"] is not None)
+            / max(1, sum(1 for o in raw_obs if o["gps_alt_m"] is not None)),
             0,
-        ) if any(o["gps_alt_m"] is not None for o in observations) else None,
+        ) if any(o["gps_alt_m"] is not None for o in raw_obs) else None,
     }
 
     result = {
-        "observations": thinned,
+        "observations": averaged_obs,
         "analysis_time": analysis_dt.strftime("%Y-%m-%d %H:%M:%SZ"),
         "center_lat": center_lat,
         "center_lon": center_lon,
         "mission_id": mission_id,
         "serial_url": serial_url,
         "time_window_min": FL_TIME_WINDOW_MIN,
-        "n_obs": len(thinned),
-        "n_obs_total": len(observations),
+        "n_obs": len(averaged_obs),
+        "n_obs_total": len(raw_obs),
         "summary": summary,
     }
 
