@@ -198,15 +198,41 @@ router = APIRouter(tags=["realtime"])
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _fetch_bytes(url: str, timeout: int = 60) -> bytes:
-    """Fetch raw bytes from a URL."""
+_MAX_DOWNLOAD_MB = 150  # refuse to download files larger than this
+
+def _fetch_bytes(url: str, timeout: int = 60, max_mb: float = _MAX_DOWNLOAD_MB) -> bytes:
+    """Fetch raw bytes from a URL with an optional size guard."""
     if _requests:
-        resp = _requests.get(url, timeout=timeout)
+        # Stream the response so we can check Content-Length before committing
+        resp = _requests.get(url, timeout=timeout, stream=True)
         resp.raise_for_status()
-        return resp.content
+        cl = resp.headers.get("Content-Length")
+        if cl and int(cl) > max_mb * 1024 * 1024:
+            resp.close()
+            raise ValueError(
+                f"File too large ({int(cl) / 1024 / 1024:.0f} MB, limit {max_mb:.0f} MB): {url}"
+            )
+        # Read in chunks to enforce size limit even without Content-Length
+        chunks = []
+        total = 0
+        limit = int(max_mb * 1024 * 1024)
+        for chunk in resp.iter_content(chunk_size=1024 * 1024):
+            total += len(chunk)
+            if total > limit:
+                resp.close()
+                raise ValueError(
+                    f"File exceeds {max_mb:.0f} MB download limit: {url}"
+                )
+            chunks.append(chunk)
+        return b"".join(chunks)
     else:
         req = _urllib.Request(url)
         with _urllib.urlopen(req, timeout=timeout) as resp:
+            cl = resp.headers.get("Content-Length")
+            if cl and int(cl) > max_mb * 1024 * 1024:
+                raise ValueError(
+                    f"File too large ({int(cl) / 1024 / 1024:.0f} MB, limit {max_mb:.0f} MB): {url}"
+                )
             return resp.read()
 
 
@@ -1303,7 +1329,10 @@ def get_rt_azimuthal_mean(
     if overlay and overlay not in RT_VARIABLES and overlay not in RT_DERIVED:
         raise HTTPException(status_code=400, detail=f"Unknown overlay variable '{overlay}'.")
 
-    ds = _open_rt_dataset(file_url)
+    try:
+        ds = _open_rt_dataset(file_url)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not open TDR file: {e}")
     x_coords, y_coords = _get_xy_coords(ds)
     vol, heights = _extract_3d(ds, variable)
 
