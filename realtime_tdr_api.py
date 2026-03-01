@@ -1277,3 +1277,405 @@ def get_rt_azimuthal_mean(
             pass
 
     return JSONResponse(result)
+
+
+# ---------------------------------------------------------------------------
+# Dropsonde Observations
+# ---------------------------------------------------------------------------
+
+SEB_SONDE_BASE = "https://seb.omao.noaa.gov/pub/flight/ASPEN_Data"
+SONDE_TIME_WINDOW_MIN = 45  # ±45 minutes from TDR analysis center time
+
+# Cache: file_url → (response_dict, timestamp)
+_rt_sonde_cache = OrderedDict()
+_RT_SONDE_CACHE_MAX = 3
+_RT_SONDE_CACHE_TTL = 300  # 5 minutes
+
+
+def _extract_mission_id(file_url: str) -> Optional[str]:
+    """
+    Extract mission ID from a TDR file URL.
+
+    URLs look like: .../radar/20251028H1/251028H1_1349_xy.nc.gz
+    The mission folder name follows the /radar/ segment.
+    """
+    m = re.search(r"/radar/(\d{6,8}[A-Za-z]\d[^/]*)/", file_url)
+    if m:
+        return m.group(1)
+    # Fallback: try to parse from filename prefix (e.g. 251028H1_1349_xy.nc)
+    fname = file_url.rstrip("/").split("/")[-1]
+    m2 = re.match(r"(\d{6,8}[A-Za-z]\d)", fname)
+    if m2:
+        short_id = m2.group(1)
+        if len(short_id) >= 7 and short_id[0:2].isdigit():
+            yr2 = short_id[:2]
+            century = "20" if int(yr2) < 70 else "19"
+            return century + short_id
+    return None
+
+
+def _parse_sonde_launch_time(filename: str) -> Optional[_dt]:
+    """
+    Parse launch datetime from a dropsonde CSV filename.
+
+    Filename format: D20251028_135043_PQC.csv
+    """
+    m = re.match(r"D(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})", filename)
+    if not m:
+        return None
+    try:
+        hr = int(m.group(4))
+        mi = int(m.group(5))
+        sc = int(m.group(6))
+        if hr >= 24:
+            base = _dt(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                        tzinfo=timezone.utc)
+            return base + timedelta(hours=hr, minutes=mi, seconds=sc)
+        return _dt(
+            int(m.group(1)), int(m.group(2)), int(m.group(3)),
+            hr, mi, sc, tzinfo=timezone.utc,
+        )
+    except ValueError:
+        return None
+
+
+def _parse_dropsonde_csv(csv_text: str) -> Optional[dict]:
+    """
+    Parse an ASPEN PQC dropsonde CSV file.
+
+    Returns a dict with:
+        meta: dict of header metadata
+        profile: dict of arrays (time_s, pres, temp, rh, wspd, wdir,
+                                 lat, lon, alt, gps_alt, uwnd, vwnd)
+    or None if parsing fails.
+    """
+    lines = csv_text.splitlines()
+    meta = {}
+    fields_line = None
+    data_start = None
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("Fields,"):
+            fields_line = i
+            data_start = i + 2  # skip Units line
+            break
+        parts = stripped.split(",", 1)
+        if len(parts) == 2:
+            key = parts[0].strip()
+            val = parts[1].strip().strip('"')
+            meta[key] = val
+
+    if fields_line is None or data_start is None:
+        return None
+
+    # Parse column names from Fields line
+    field_names = lines[fields_line].split(",")
+    if field_names and field_names[0].strip().lower() == "fields":
+        field_names = field_names[1:]
+    field_names = [f.strip() for f in field_names]
+
+    col_map = {}
+    for idx, name in enumerate(field_names):
+        col_map[name.lower()] = idx
+
+    profile = {
+        "time_s": [], "pres": [], "temp": [], "rh": [],
+        "wspd": [], "wdir": [], "lat": [], "lon": [],
+        "alt": [], "gps_alt": [], "uwnd": [], "vwnd": [],
+        "ascent": [],
+    }
+
+    aliases = {
+        "time_s": ["time"],
+        "pres": ["pressure"],
+        "temp": ["temperature"],
+        "rh": ["rh"],
+        "wspd": ["speed"],
+        "wdir": ["direction"],
+        "lat": ["latitude"],
+        "lon": ["longitude"],
+        "alt": ["altitude"],
+        "gps_alt": ["gps altitude", "gpsaltitude"],
+        "uwnd": ["uwnd"],
+        "vwnd": ["vwnd"],
+        "ascent": ["ascent"],
+    }
+
+    var_cols = {}
+    for var_key, names in aliases.items():
+        for name in names:
+            if name in col_map:
+                var_cols[var_key] = col_map[name]
+                break
+
+    for i in range(data_start, len(lines)):
+        stripped = lines[i].strip()
+        if not stripped or not stripped.startswith("Data,"):
+            continue
+        parts = stripped.split(",")
+        values = parts[1:]
+
+        for var_key in profile:
+            if var_key not in var_cols:
+                profile[var_key].append(None)
+                continue
+            ci = var_cols[var_key]
+            if ci < len(values) and values[ci].strip():
+                try:
+                    profile[var_key].append(float(values[ci].strip()))
+                except (ValueError, TypeError):
+                    profile[var_key].append(None)
+            else:
+                profile[var_key].append(None)
+
+    if not profile["time_s"]:
+        return None
+
+    return {"meta": meta, "profile": profile}
+
+
+def _latlon_to_storm_km(
+    lat: float, lon: float, center_lat: float, center_lon: float
+) -> tuple[float, float]:
+    """Convert geographic lat/lon to storm-relative (x_km, y_km)."""
+    x_km = (lon - center_lon) * 111.0 * np.cos(np.radians(center_lat))
+    y_km = (lat - center_lat) * 111.0
+    return float(x_km), float(y_km)
+
+
+def _filter_valid_profile(profile: dict) -> dict:
+    """Filter profile to rows with valid lat, lon, and alt (or gps_alt)."""
+    n = len(profile["time_s"])
+    mask = []
+    for i in range(n):
+        lat_ok = profile["lat"][i] is not None
+        lon_ok = profile["lon"][i] is not None
+        alt_ok = (profile["alt"][i] is not None) or (profile["gps_alt"][i] is not None)
+        mask.append(lat_ok and lon_ok and alt_ok)
+
+    filtered = {}
+    for key in profile:
+        filtered[key] = [profile[key][i] for i in range(n) if mask[i]]
+    return filtered
+
+
+def _build_sonde_response(
+    parsed: dict,
+    center_lat: float,
+    center_lon: float,
+    analysis_dt: _dt,
+) -> Optional[dict]:
+    """Build a single dropsonde entry for the API response."""
+    meta = parsed["meta"]
+    profile = _filter_valid_profile(parsed["profile"])
+
+    if not profile["lat"]:
+        return None
+
+    x_km_arr = []
+    y_km_arr = []
+    alt_km_arr = []
+    for i in range(len(profile["lat"])):
+        x, y = _latlon_to_storm_km(
+            profile["lat"][i], profile["lon"][i], center_lat, center_lon
+        )
+        x_km_arr.append(round(x, 3))
+        y_km_arr.append(round(y, 3))
+        alt_m = profile["gps_alt"][i] if profile["gps_alt"][i] is not None else profile["alt"][i]
+        alt_km_arr.append(round(alt_m / 1000.0, 4) if alt_m is not None else None)
+
+    launch = {
+        "lat": profile["lat"][0],
+        "lon": profile["lon"][0],
+        "alt_m": (profile["gps_alt"][0] or profile["alt"][0]),
+        "x_km": x_km_arr[0],
+        "y_km": y_km_arr[0],
+    }
+
+    surface = {
+        "lat": profile["lat"][-1],
+        "lon": profile["lon"][-1],
+        "alt_m": (profile["gps_alt"][-1] or profile["alt"][-1]),
+        "x_km": x_km_arr[-1],
+        "y_km": y_km_arr[-1],
+    }
+
+    # Launch time for time offset computation (handle hour >= 24)
+    launch_dt = None
+    try:
+        yr = int(meta.get("Year", 0))
+        mo = int(meta.get("Month", 0))
+        dy = int(meta.get("Day", 0))
+        hr = int(meta.get("Hour", 0))
+        mi = int(meta.get("Minute", 0))
+        sc = int(meta.get("Second", 0))
+        if yr > 0:
+            if hr >= 24:
+                base = _dt(yr, mo, dy, tzinfo=timezone.utc)
+                launch_dt = base + timedelta(hours=hr, minutes=mi, seconds=sc)
+            else:
+                launch_dt = _dt(yr, mo, dy, hr, mi, sc, tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        pass
+
+    time_offset_min = None
+    launch_time_str = ""
+    if launch_dt:
+        launch_time_str = launch_dt.strftime("%Y-%m-%d %H:%M:%SZ")
+        delta = (launch_dt - analysis_dt).total_seconds() / 60.0
+        time_offset_min = round(delta, 1)
+
+    def _round_list(arr, decimals=3):
+        return [round(v, decimals) if v is not None else None for v in arr]
+
+    hit_sfc = meta.get("DropsondeHitSfc", meta.get("DropSondeHitSfc", "0"))
+
+    return {
+        "sonde_id": meta.get("SondeId", ""),
+        "launch_time": launch_time_str,
+        "time_offset_min": time_offset_min,
+        "comments": meta.get("Comments", meta.get("Comment", "")),
+        "flight": meta.get("Flight", ""),
+        "platform": meta.get("PlatformId", ""),
+        "project": meta.get("Project", ""),
+        "hit_surface": str(hit_sfc).strip() == "1",
+        "launch": launch,
+        "surface": surface,
+        "profile": {
+            "time_s": _round_list(profile["time_s"], 1),
+            "lat": _round_list(profile["lat"], 5),
+            "lon": _round_list(profile["lon"], 5),
+            "x_km": x_km_arr,
+            "y_km": y_km_arr,
+            "alt_km": alt_km_arr,
+            "wspd": _round_list(profile["wspd"], 2),
+            "wdir": _round_list(profile["wdir"], 1),
+            "temp": _round_list(profile["temp"], 2),
+            "pres": _round_list(profile["pres"], 2),
+        },
+    }
+
+
+@router.get("/dropsondes")
+def get_dropsondes(
+    file_url: str = Query(..., description="URL to the TDR xy.nc(.gz) file"),
+):
+    """
+    Return dropsonde profiles within ±45 min of the TDR analysis time.
+
+    Searches the matching ASPEN_Data mission folder on the SEB server,
+    parses PQC CSV files, converts to storm-relative coordinates, and
+    returns full-resolution profiles for visualization.
+    """
+    now = time.time()
+    if file_url in _rt_sonde_cache:
+        cached, ts = _rt_sonde_cache[file_url]
+        if now - ts < _RT_SONDE_CACHE_TTL:
+            _rt_sonde_cache.move_to_end(file_url)
+            return JSONResponse(cached)
+
+    try:
+        ds = _open_rt_dataset(file_url)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not open TDR file: {e}")
+
+    case_meta = _build_case_meta(ds)
+    center_lat = case_meta["latitude"]
+    center_lon = case_meta["longitude"]
+
+    try:
+        analysis_dt = _parse_tdr_datetime(case_meta)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Extract mission ID from file URL
+    mission_id = _extract_mission_id(file_url)
+    if not mission_id:
+        flt = case_meta.get("mission_id", "")
+        m = re.match(r"(\d{6,8}[A-Za-z]\d)", flt)
+        if m:
+            mission_id = m.group(1)
+
+    if not mission_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not determine mission ID from file URL",
+        )
+
+    # List dropsonde CSVs for this mission
+    sonde_dir_url = f"{SEB_SONDE_BASE}/{mission_id}/"
+    try:
+        links = _parse_directory(sonde_dir_url)
+    except Exception:
+        result = {
+            "dropsondes": [],
+            "analysis_time": analysis_dt.strftime("%Y-%m-%d %H:%M:%SZ"),
+            "center_lat": center_lat,
+            "center_lon": center_lon,
+            "time_window_min": SONDE_TIME_WINDOW_MIN,
+            "n_sondes": 0,
+            "message": f"No dropsonde directory found for mission {mission_id}",
+        }
+        _rt_sonde_cache[file_url] = (result, now)
+        return JSONResponse(result)
+
+    # Filter to PQC CSV files within time window
+    csv_candidates = []
+    for link in links:
+        if not link.endswith("_PQC.csv"):
+            continue
+        launch_dt = _parse_sonde_launch_time(link)
+        if launch_dt is None:
+            continue
+        delta_min = abs((launch_dt - analysis_dt).total_seconds()) / 60.0
+        if delta_min <= SONDE_TIME_WINDOW_MIN:
+            csv_candidates.append((link, launch_dt, delta_min))
+
+    csv_candidates.sort(key=lambda x: x[2])
+
+    # Fetch and parse each CSV in parallel
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _fetch_and_parse(item):
+        filename, _ldt, _dmin = item
+        csv_url = f"{SEB_SONDE_BASE}/{mission_id}/{filename}"
+        try:
+            csv_text = _fetch_text(csv_url, timeout=30)
+            parsed = _parse_dropsonde_csv(csv_text)
+            if parsed is None:
+                return None
+            return _build_sonde_response(parsed, center_lat, center_lon, analysis_dt)
+        except Exception:
+            return None
+
+    dropsondes = []
+    if csv_candidates:
+        max_workers = min(len(csv_candidates), 6)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_fetch_and_parse, item): item for item in csv_candidates}
+            for future in as_completed(futures):
+                sonde_entry = future.result()
+                if sonde_entry is not None:
+                    dropsondes.append(sonde_entry)
+
+    dropsondes.sort(
+        key=lambda s: abs(s["time_offset_min"]) if s["time_offset_min"] is not None else 999
+    )
+
+    result = {
+        "dropsondes": dropsondes,
+        "analysis_time": analysis_dt.strftime("%Y-%m-%d %H:%M:%SZ"),
+        "center_lat": center_lat,
+        "center_lon": center_lon,
+        "time_window_min": SONDE_TIME_WINDOW_MIN,
+        "n_sondes": len(dropsondes),
+    }
+
+    _rt_sonde_cache[file_url] = (result, now)
+    if len(_rt_sonde_cache) > _RT_SONDE_CACHE_MAX:
+        _rt_sonde_cache.popitem(last=False)
+
+    return JSONResponse(result)
