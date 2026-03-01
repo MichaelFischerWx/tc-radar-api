@@ -286,7 +286,7 @@ app.add_middleware(CompositeGCMiddleware)
 # Dataset loading
 # ---------------------------------------------------------------------------
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=2)
 def get_dataset(data_type: str, era: str) -> xr.Dataset:
     """
     Open a TC-RADAR dataset.
@@ -447,10 +447,10 @@ MERGE_METADATA_PATH = Path(os.environ.get("MERGE_METADATA_PATH", "./tc_radar_met
 _metadata_cache: dict[int, dict] = {}
 _merge_metadata_cache: dict[int, dict] = {}
 _plot_cache: OrderedDict = OrderedDict()
-_PLOT_CACHE_MAX = 150  # ~150 plots × ~150 KB ≈ 22 MB max
+_PLOT_CACHE_MAX = 40   # ~40 plots × ~150 KB ≈ 6 MB max (was 150)
 
 _data_cache: OrderedDict = OrderedDict()
-_DATA_CACHE_MAX = 100  # ~100 entries × ~100 KB ≈ 10 MB max
+_DATA_CACHE_MAX = 20   # ~20 entries — JSON dicts can be large (was 100)
 
 
 @app.on_event("startup")
@@ -748,6 +748,7 @@ def get_data(
     _data_cache[cache_key] = result
     if len(_data_cache) > _DATA_CACHE_MAX:
         _data_cache.popitem(last=False)  # evict oldest entry
+        gc.collect()
 
     return JSONResponse(result, headers={"X-Cache": "MISS"})
 
@@ -3246,6 +3247,7 @@ def plot(
     _plot_cache[cache_key] = png
     if len(_plot_cache) > _PLOT_CACHE_MAX:
         _plot_cache.popitem(last=False)  # evict oldest entry
+        gc.collect()
     return Response(content=png, media_type="image/png", headers={"X-Cache": "MISS"})
 
 from realtime_tdr_api import router as realtime_router

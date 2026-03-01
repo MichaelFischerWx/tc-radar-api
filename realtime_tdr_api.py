@@ -181,13 +181,13 @@ _IR_LUT = _build_ir_lut()
 # ---------------------------------------------------------------------------
 _rt_ds_cache = OrderedDict()       # file_url → (xr.Dataset, timestamp)
 _rt_dir_cache = OrderedDict()      # dir_url  → (link_list, timestamp)
-_RT_DS_CACHE_MAX = 3               # was 8 — keep fewer datasets in RAM
+_RT_DS_CACHE_MAX = 1               # ONE dataset at a time — each can be 100-300 MB
 _RT_DIR_CACHE_TTL = 300            # 5 minutes for directory listings
 
 # GOES IR frame cache: (file_url, frame_index) → rendered result dict
 # Kept small because browsers cache via Cache-Control headers.
 _rt_ir_cache = OrderedDict()
-_RT_IR_CACHE_MAX = 5               # minimal — browser handles long-term caching
+_RT_IR_CACHE_MAX = 3               # minimal — browser handles long-term caching
 
 # Shared S3 filesystem (lazy-initialised)
 _goes_fs = None
@@ -255,11 +255,25 @@ def _parse_directory(url: str) -> list[str]:
 
 
 def _open_rt_dataset(file_url: str) -> xr.Dataset:
-    """Download, decompress (if .gz), and open a real-time TDR NetCDF file."""
+    """Download, decompress (if .gz), and open a real-time TDR NetCDF file.
+
+    Memory-conscious: explicitly frees intermediate byte buffers and forces
+    garbage collection when evicting cached datasets.
+    """
     if file_url in _rt_ds_cache:
         ds, _ = _rt_ds_cache[file_url]
         _rt_ds_cache.move_to_end(file_url)
         return ds
+
+    # Evict oldest cached dataset BEFORE downloading new one to minimise peak RAM
+    if len(_rt_ds_cache) >= _RT_DS_CACHE_MAX:
+        _evicted_url, (evicted_ds, _) = _rt_ds_cache.popitem(last=False)
+        try:
+            evicted_ds.close()
+        except Exception:
+            pass
+        del evicted_ds
+        gc.collect()
 
     raw = _fetch_bytes(file_url, timeout=120)
 
@@ -267,7 +281,10 @@ def _open_rt_dataset(file_url: str) -> xr.Dataset:
     # because the HTTP server may transparently decompress via Content-Encoding.
     # Gzip magic number is b'\x1f\x8b'; HDF5/NetCDF4 starts with b'\x89HDF' or b'CDF'.
     if raw[:2] == b'\x1f\x8b':
-        raw = gzip.decompress(raw)
+        decompressed = gzip.decompress(raw)
+        del raw          # free compressed copy immediately
+        raw = decompressed
+        del decompressed
 
     # Detect file format from magic bytes and choose the right xarray engine.
     # netCDF3 classic starts with b'CDF'; HDF5/netCDF4 starts with b'\x89HDF'.
@@ -276,10 +293,12 @@ def _open_rt_dataset(file_url: str) -> xr.Dataset:
     else:
         engine = "h5netcdf"
 
-    ds = xr.open_dataset(io.BytesIO(raw), engine=engine)
+    buf = io.BytesIO(raw)
+    del raw  # free raw bytes — xarray reads from the BytesIO buffer
+    gc.collect()
+
+    ds = xr.open_dataset(buf, engine=engine)
     _rt_ds_cache[file_url] = (ds, time.time())
-    if len(_rt_ds_cache) > _RT_DS_CACHE_MAX:
-        _rt_ds_cache.popitem(last=False)
     return ds
 
 
@@ -1338,7 +1357,7 @@ SONDE_TIME_WINDOW_MIN = 45  # ±45 minutes from TDR analysis center time
 
 # Cache: file_url → (response_dict, timestamp)
 _rt_sonde_cache = OrderedDict()
-_RT_SONDE_CACHE_MAX = 3
+_RT_SONDE_CACHE_MAX = 2
 _RT_SONDE_CACHE_TTL = 300  # 5 minutes
 
 
@@ -1732,6 +1751,7 @@ def get_dropsondes(
     _rt_sonde_cache[file_url] = (result, now)
     if len(_rt_sonde_cache) > _RT_SONDE_CACHE_MAX:
         _rt_sonde_cache.popitem(last=False)
+        gc.collect()
 
     return JSONResponse(result)
 
@@ -1788,7 +1808,7 @@ _MELISSA_SLP = 72                     # sea-level pressure (hPa)
 
 # Cache
 _rt_fl_cache = OrderedDict()
-_RT_FL_CACHE_MAX = 3
+_RT_FL_CACHE_MAX = 2
 _RT_FL_CACHE_TTL = 300  # 5 minutes
 
 
@@ -2148,5 +2168,61 @@ def get_flight_level(
     _rt_fl_cache[cache_key] = (result, now)
     if len(_rt_fl_cache) > _RT_FL_CACHE_MAX:
         _rt_fl_cache.popitem(last=False)
+        gc.collect()
 
     return JSONResponse(result)
+
+
+# ---------------------------------------------------------------------------
+# Memory monitoring & cache management
+# ---------------------------------------------------------------------------
+
+def _get_rss_mb() -> float:
+    """Get current process RSS in MB (Linux)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    try:
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+    except Exception:
+        return -1
+
+
+def _cache_summary() -> dict:
+    """Return a summary of all cache sizes."""
+    return {
+        "rss_mb": round(_get_rss_mb(), 1),
+        "rt_ds_cache": {"count": len(_rt_ds_cache), "max": _RT_DS_CACHE_MAX,
+                        "urls": list(_rt_ds_cache.keys())},
+        "rt_dir_cache": {"count": len(_rt_dir_cache)},
+        "rt_ir_cache": {"count": len(_rt_ir_cache), "max": _RT_IR_CACHE_MAX},
+        "rt_sonde_cache": {"count": len(_rt_sonde_cache), "max": _RT_SONDE_CACHE_MAX},
+        "rt_fl_cache": {"count": len(_rt_fl_cache), "max": _RT_FL_CACHE_MAX},
+    }
+
+
+@router.get("/memory")
+def memory_status():
+    """Show current memory usage and cache occupancy."""
+    return JSONResponse(_cache_summary())
+
+
+@router.post("/clear_cache")
+def clear_all_rt_caches():
+    """Emergency cache flush — frees all cached datasets and results."""
+    for url, (ds, _) in list(_rt_ds_cache.items()):
+        try:
+            ds.close()
+        except Exception:
+            pass
+    _rt_ds_cache.clear()
+    _rt_ir_cache.clear()
+    _rt_sonde_cache.clear()
+    _rt_fl_cache.clear()
+    gc.collect()
+    return JSONResponse({"status": "ok", **_cache_summary()})
