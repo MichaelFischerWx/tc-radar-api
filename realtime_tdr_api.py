@@ -438,7 +438,7 @@ def _select_goes_sat(longitude: float, analysis_dt: _dt) -> tuple[str, str]:
     return bucket, sat_key
 
 
-def _find_goes_file(bucket: str, target_dt: _dt, tolerance_min: int = 10) -> Optional[str]:
+def _find_goes_file(bucket: str, target_dt: _dt, tolerance_min: int = 15) -> Optional[str]:
     """
     Find the GOES ABI Band 13 full-disk file closest to target_dt.
 
@@ -464,10 +464,11 @@ def _find_goes_file(bucket: str, target_dt: _dt, tolerance_min: int = 10) -> Opt
         return None
 
     # Parse start timestamp from filename:
-    #   OR_ABI-L2-CMIPF-M6C13-G16-s20231501200432_e…_c….nc
+    #   GOES-16: OR_ABI-L2-CMIPF-M6C13-G16-s20231501200432_e…_c….nc
+    #   GOES-19: OR_ABI-L2-CMIPF-M6C13_G19_s20253011300205_e…_c….nc
     best_file = None
     best_delta = timedelta(minutes=tolerance_min + 1)
-    ts_re = re.compile(r"-s(\d{4})(\d{3})(\d{2})(\d{2})(\d{2})")
+    ts_re = re.compile(r"[-_]s(\d{4})(\d{3})(\d{2})(\d{2})(\d{2})")
 
     for fpath in candidates:
         fname = fpath.split("/")[-1]
