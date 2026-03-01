@@ -1402,7 +1402,7 @@ def _parse_dropsonde_csv(csv_text: str) -> Optional[dict]:
         "uwnd": ["uwnd"],
         "vwnd": ["vwnd"],
         "ascent": ["ascent"],
-        "dewpoint": ["dewpoint"],
+        "dewpoint": ["dewpoint", "dp", "dew point", "dew pt", "td"],
     }
 
     var_cols = {}
