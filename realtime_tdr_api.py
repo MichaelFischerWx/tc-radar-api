@@ -576,8 +576,10 @@ def _render_ir_png(frame_2d: np.ndarray) -> Optional[str]:
     mask = ~np.isfinite(arr) | (arr <= 0)
     rgba[mask] = [0, 0, 0, 0]
 
-    # Flip vertically (y ascending → image top-to-bottom)
-    rgba = rgba[::-1]
+    # NOTE: No vertical flip here.  GOES y-axis is descending (north at
+    # row 0), which matches standard image orientation (top = north) and
+    # Leaflet's L.imageOverlay expectation.  For Plotly underlays the
+    # client swaps the y-axis bounds instead.
 
     img = Image.fromarray(rgba, "RGBA")
     buf = io.BytesIO()
