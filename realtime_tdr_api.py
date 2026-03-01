@@ -2132,15 +2132,40 @@ def get_flight_level(
     # Compute 10-second (or user-specified) averages
     averaged_obs = _average_fl_window(raw_obs, interval_s=avg_interval_s)
 
-    # Add storm-relative coordinates
+    # ── Storm-motion correction for flight-level positions ──────────
+    # The TDR analysis grid is storm-centered at the analysis time.  FL
+    # observations span ±45 min, so uncorrected positions use the
+    # *analysis-time* storm center for all obs regardless of when they
+    # were collected.  We adjust each obs position by back-propagating
+    # the storm motion so that positions reflect where the aircraft was
+    # relative to the *moving* storm at the time of each observation.
+    #
+    #   x_adj = x_static + u_storm * (-dt) / 1000   (dt in s, u in m/s → km)
+    #   y_adj = y_static + v_storm * (-dt) / 1000
+    #
+    # dt = time_offset_s (negative before analysis → -dt is positive →
+    #       shifts position in the direction of storm motion, i.e. the
+    #       aircraft was "ahead" of the storm center in a relative sense).
+
+    storm_u = case_meta.get("storm_motion_east_ms", -999)
+    storm_v = case_meta.get("storm_motion_north_ms", -999)
+    has_motion = (storm_u != -999 and storm_v != -999
+                  and storm_u is not None and storm_v is not None)
+
     for obs in averaged_obs:
         x_km, y_km = _latlon_to_storm_km(
             obs["lat"], obs["lon"], center_lat, center_lon
         )
+        # Apply storm-motion correction if available
+        if has_motion and obs.get("time_offset_s") is not None:
+            dt_s = obs["time_offset_s"]        # seconds from analysis (neg = before)
+            x_km += storm_u * (-dt_s) / 1000.0  # km
+            y_km += storm_v * (-dt_s) / 1000.0
         obs["x_km"] = round(x_km, 3)
         obs["y_km"] = round(y_km, 3)
 
     # ── Interpolate TDR wind speed to flight-track positions ──────
+    # (now using storm-motion-adjusted positions)
     try:
         x_arr = np.array([o["x_km"] for o in averaged_obs], dtype=float)
         y_arr = np.array([o["y_km"] for o in averaged_obs], dtype=float)
@@ -2191,6 +2216,9 @@ def get_flight_level(
         "time_window_min": FL_TIME_WINDOW_MIN,
         "n_obs": len(averaged_obs),
         "n_obs_total": len(raw_obs),
+        "storm_motion_corrected": has_motion,
+        "storm_motion_east_ms": round(storm_u, 2) if has_motion else None,
+        "storm_motion_north_ms": round(storm_v, 2) if has_motion else None,
         "summary": summary,
     }
 
