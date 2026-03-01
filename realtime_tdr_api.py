@@ -1385,7 +1385,7 @@ def _parse_dropsonde_csv(csv_text: str) -> Optional[dict]:
         "time_s": [], "pres": [], "temp": [], "rh": [],
         "wspd": [], "wdir": [], "lat": [], "lon": [],
         "alt": [], "gps_alt": [], "uwnd": [], "vwnd": [],
-        "ascent": [],
+        "ascent": [], "dewpoint": [],
     }
 
     aliases = {
@@ -1402,6 +1402,7 @@ def _parse_dropsonde_csv(csv_text: str) -> Optional[dict]:
         "uwnd": ["uwnd"],
         "vwnd": ["vwnd"],
         "ascent": ["ascent"],
+        "dewpoint": ["dewpoint"],
     }
 
     var_cols = {}
@@ -1555,6 +1556,10 @@ def _build_sonde_response(
             "wdir": _round_list(profile["wdir"], 1),
             "temp": _round_list(profile["temp"], 2),
             "pres": _round_list(profile["pres"], 2),
+            "rh": _round_list(profile["rh"], 1),
+            "dewpoint": _round_list(profile.get("dewpoint", []), 2),
+            "uwnd": _round_list(profile["uwnd"], 2),
+            "vwnd": _round_list(profile["vwnd"], 2),
         },
     }
 
