@@ -3480,6 +3480,7 @@ def _hrd_average_window(
             else:
                 averaged[key] = None
 
+        averaged["time_offset_s"] = mid.get("time_offset_s")
         averaged["heading"] = mid.get("heading")
         averaged["track"] = mid.get("track")
         averaged["sfmr_wspd_ms"] = None
