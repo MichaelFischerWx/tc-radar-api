@@ -2020,7 +2020,7 @@ def quadrant_mean(
 # ---------------------------------------------------------------------------
 # Composite endpoints
 # ---------------------------------------------------------------------------
-_COMPOSITE_MAX_CASES = 500  # safety cap — raised from 150 for 2 GB Render instance
+_COMPOSITE_MAX_CASES = 1000  # safety cap — batched processing keeps peak RAM bounded regardless of N
 
 # Common query parameters for composite filters
 def _composite_filter_params(
