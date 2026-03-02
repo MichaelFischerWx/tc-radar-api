@@ -3994,8 +3994,10 @@ def get_archive_flight_level(
             y_arr = np.array([o["y_km"] for o in obs_list], dtype=float)
 
             # Fixed-height interpolation (0.5 km and 2.0 km)
-            tdr_05 = _interp_tdr_archive(ds, local_idx, "recentered_wind_speed", 0.5, x_arr, y_arr)
-            tdr_20 = _interp_tdr_archive(ds, local_idx, "recentered_wind_speed", 2.0, x_arr, y_arr)
+            # Use earth-relative wind speed for fair comparison with FL winds
+            _tdr_fl_var = "recentered_earth_relative_wind_speed"
+            tdr_05 = _interp_tdr_archive(ds, local_idx, _tdr_fl_var, 0.5, x_arr, y_arr)
+            tdr_20 = _interp_tdr_archive(ds, local_idx, _tdr_fl_var, 2.0, x_arr, y_arr)
 
             # 3D interpolation at aircraft altitude
             z_arr = np.array([
@@ -4004,7 +4006,7 @@ def get_archive_flight_level(
             has_alt = np.any(z_arr > 0)
             if has_alt:
                 tdr_fl = _interp_tdr_archive_3d(
-                    ds, local_idx, "recentered_wind_speed", x_arr, y_arr, z_arr
+                    ds, local_idx, _tdr_fl_var, x_arr, y_arr, z_arr
                 )
             else:
                 tdr_fl = np.full(len(obs_list), np.nan)
