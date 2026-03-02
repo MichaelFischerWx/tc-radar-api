@@ -3577,6 +3577,99 @@ def _interp_tdr_archive(
     return result
 
 
+def _interp_tdr_archive_3d(
+    ds, local_idx: int, variable_key: str,
+    x_pts: np.ndarray, y_pts: np.ndarray, z_pts_km: np.ndarray
+) -> np.ndarray:
+    """
+    Trilinear-interpolate a TDR 3D field from the archive Zarr dataset
+    to arbitrary (x_km, y_km, height_km) points — i.e. at the aircraft altitude.
+
+    Uses scipy RegularGridInterpolator for efficient 3D interpolation.
+    Returns array of interpolated values (NaN where outside domain).
+    """
+    height_vals = ds["height"].values  # 1D, in km
+
+    # Load full 3D volume
+    if variable_key in DERIVED_VARIABLES:
+        u_name, v_name = DERIVED_VARIABLES[variable_key]
+        u_3d = ds[u_name].isel(num_cases=local_idx).values  # (height, y, x) or permuted
+        v_3d = ds[v_name].isel(num_cases=local_idx).values
+        vol = np.sqrt(u_3d**2 + v_3d**2)
+        ref_varname = u_name
+    else:
+        _, varname, _, _, _, _ = VARIABLES[variable_key]
+        vol = ds[varname].isel(num_cases=local_idx).values
+        ref_varname = varname
+
+    # Determine grid coordinates
+    dims = ds[ref_varname].dims
+    # Remove 'num_cases' to get spatial dims in order
+    spatial_dims = [d for d in dims if d != "num_cases"]
+
+    if "eastward_distance" in dims:
+        x_coord = ds["eastward_distance"].values
+        y_coord = ds["northward_distance"].values
+    elif "longitude" in dims:
+        x_coord = ds["longitude"].values
+        y_coord = ds["latitude"].values
+    else:
+        x_coord = ds["x"].values if "x" in ds else np.arange(vol.shape[-1])
+        y_coord = ds["y"].values if "y" in ds else np.arange(vol.shape[-2])
+
+    # Determine axis ordering: need (height, y, x)
+    # Common orderings after isel(num_cases=...):
+    #   (height, northward_distance, eastward_distance) → already correct
+    #   (height, y, x) → already correct
+    # If the first spatial dim is height, assume (height, y, x)
+    h_dim_name = "height"
+    if spatial_dims[0] == h_dim_name:
+        # vol is (height, y, x) — correct order
+        pass
+    elif spatial_dims[-1] == h_dim_name:
+        # vol is (y, x, height) — transpose
+        vol = np.transpose(vol, (2, 0, 1))
+    elif len(spatial_dims) >= 2 and spatial_dims[1] == h_dim_name:
+        # vol is (y, height, x) — transpose
+        vol = np.transpose(vol, (1, 0, 2))
+
+    # Handle potential (x, y) vs (y, x) ambiguity in the last two dims
+    nz, ny_vol, nx_vol = vol.shape
+    if ny_vol == len(x_coord) and nx_vol == len(y_coord) and len(x_coord) != len(y_coord):
+        # Axes are swapped: (height, x, y) → (height, y, x)
+        vol = np.transpose(vol, (0, 2, 1))
+        nz, ny_vol, nx_vol = vol.shape
+
+    # Replace NaN with fill to avoid interpolation artifacts at boundaries
+    # RegularGridInterpolator handles fill_value for out-of-bounds
+    interp = RegularGridInterpolator(
+        (height_vals.astype(float), y_coord.astype(float), x_coord.astype(float)),
+        vol.astype(float),
+        method="linear",
+        bounds_error=False,
+        fill_value=np.nan,
+    )
+
+    # Build query points: (z, y, x) ordering to match grid
+    pts = np.column_stack([z_pts_km, y_pts, x_pts])
+    result = interp(pts)
+
+    # For NaN results, try nearest-neighbor fallback
+    nan_mask = np.isnan(result)
+    if np.any(nan_mask):
+        interp_nn = RegularGridInterpolator(
+            (height_vals.astype(float), y_coord.astype(float), x_coord.astype(float)),
+            vol.astype(float),
+            method="nearest",
+            bounds_error=False,
+            fill_value=np.nan,
+        )
+        nn_vals = interp_nn(pts[nan_mask])
+        result[nan_mask] = nn_vals
+
+    return result
+
+
 def _resolve_hrd_storm_name(storm_name: str, year: int) -> Optional[str]:
     """
     Resolve a TC-RADAR storm name to an HRD directory name.
@@ -3851,58 +3944,85 @@ def get_archive_flight_level(
             _hrd_fl_cache.popitem(last=False)
         return JSONResponse(result)
 
-    # Average to N-second windows
-    averaged = _hrd_average_window(filtered, interval_s=avg_interval_s)
+    # ── Multi-resolution averaging ──────────────────────────────
+    # Produce 1s (raw), 10s, and 30s averaged windows in a single pass
+    avg_intervals = [1, 10, 30]
+    avg_results = {}  # key → list of obs dicts
+    for intv in avg_intervals:
+        if intv <= 1:
+            avg_results[intv] = list(filtered)  # shallow copy of 1-sec obs
+        else:
+            avg_results[intv] = _hrd_average_window(filtered, interval_s=float(intv))
 
     # Get storm center coordinates for storm-relative transform
-    # Try to get from metadata; fallback to Zarr dataset attributes
     if center_lat is None or center_lon is None or (center_lat == 0 and center_lon == 0):
-        # Use mean of FL observations as fallback center
-        lats = [o["lat"] for o in averaged if o["lat"]]
-        lons = [o["lon"] for o in averaged if o["lon"]]
+        lats = [o["lat"] for o in filtered if o["lat"]]
+        lons = [o["lon"] for o in filtered if o["lon"]]
         center_lat = sum(lats) / len(lats) if lats else 0
         center_lon = sum(lons) / len(lons) if lons else 0
 
-    # Storm-motion correction (if available in metadata)
+    # Storm-motion correction
     storm_u = case_meta.get("storm_motion_east_ms", -999)
     storm_v = case_meta.get("storm_motion_north_ms", -999)
     has_motion = (storm_u is not None and storm_v is not None
                   and storm_u != -999 and storm_v != -999)
 
-    # Convert to storm-relative coordinates
-    for obs in averaged:
-        x_km, y_km = _latlon_to_storm_km_archive(
-            obs["lat"], obs["lon"], center_lat, center_lon
-        )
-        if has_motion and obs.get("time_offset_s") is not None:
-            dt_s = obs["time_offset_s"]
-            x_km += storm_u * (-dt_s) / 1000.0
-            y_km += storm_v * (-dt_s) / 1000.0
-            x_km = round(x_km, 3)
-            y_km = round(y_km, 3)
-        obs["x_km"] = x_km
-        obs["y_km"] = y_km
-        obs["r_km"] = round(math.sqrt(x_km**2 + y_km**2), 3)
+    # Convert all resolutions to storm-relative coordinates
+    for intv, obs_list in avg_results.items():
+        for obs in obs_list:
+            x_km, y_km = _latlon_to_storm_km_archive(
+                obs["lat"], obs["lon"], center_lat, center_lon
+            )
+            if has_motion and obs.get("time_offset_s") is not None:
+                dt_s = obs["time_offset_s"]
+                x_km += storm_u * (-dt_s) / 1000.0
+                y_km += storm_v * (-dt_s) / 1000.0
+                x_km = round(x_km, 3)
+                y_km = round(y_km, 3)
+            obs["x_km"] = x_km
+            obs["y_km"] = y_km
+            obs["r_km"] = round(math.sqrt(x_km**2 + y_km**2), 3)
 
-    # Interpolate TDR wind speed at flight-track positions
+    # ── TDR interpolation (2D fixed heights + 3D at flight altitude) ──
     try:
         ds, local_idx = resolve_case(case_index, data_type)
-        x_arr = np.array([o["x_km"] for o in averaged], dtype=float)
-        y_arr = np.array([o["y_km"] for o in averaged], dtype=float)
 
-        tdr_05 = _interp_tdr_archive(ds, local_idx, "recentered_wind_speed", 0.5, x_arr, y_arr)
-        tdr_20 = _interp_tdr_archive(ds, local_idx, "recentered_wind_speed", 2.0, x_arr, y_arr)
+        for intv, obs_list in avg_results.items():
+            if not obs_list:
+                continue
+            x_arr = np.array([o["x_km"] for o in obs_list], dtype=float)
+            y_arr = np.array([o["y_km"] for o in obs_list], dtype=float)
 
-        for i, obs in enumerate(averaged):
-            obs["tdr_wspd_0p5km"] = round(float(tdr_05[i]), 2) if not np.isnan(tdr_05[i]) else None
-            obs["tdr_wspd_2km"] = round(float(tdr_20[i]), 2) if not np.isnan(tdr_20[i]) else None
+            # Fixed-height interpolation (0.5 km and 2.0 km)
+            tdr_05 = _interp_tdr_archive(ds, local_idx, "recentered_wind_speed", 0.5, x_arr, y_arr)
+            tdr_20 = _interp_tdr_archive(ds, local_idx, "recentered_wind_speed", 2.0, x_arr, y_arr)
+
+            # 3D interpolation at aircraft altitude
+            z_arr = np.array([
+                (o.get("gps_alt_m") or 0) / 1000.0 for o in obs_list
+            ], dtype=float)
+            has_alt = np.any(z_arr > 0)
+            if has_alt:
+                tdr_fl = _interp_tdr_archive_3d(
+                    ds, local_idx, "recentered_wind_speed", x_arr, y_arr, z_arr
+                )
+            else:
+                tdr_fl = np.full(len(obs_list), np.nan)
+
+            for i, obs in enumerate(obs_list):
+                obs["tdr_wspd_0p5km"] = round(float(tdr_05[i]), 2) if not np.isnan(tdr_05[i]) else None
+                obs["tdr_wspd_2km"] = round(float(tdr_20[i]), 2) if not np.isnan(tdr_20[i]) else None
+                obs["tdr_wspd_fl_alt"] = round(float(tdr_fl[i]), 2) if not np.isnan(tdr_fl[i]) else None
+
     except Exception as e:
         print(f"FL archive TDR interpolation warning: {e}")
-        for obs in averaged:
-            obs.setdefault("tdr_wspd_0p5km", None)
-            obs.setdefault("tdr_wspd_2km", None)
+        for intv, obs_list in avg_results.items():
+            for obs in obs_list:
+                obs.setdefault("tdr_wspd_0p5km", None)
+                obs.setdefault("tdr_wspd_2km", None)
+                obs.setdefault("tdr_wspd_fl_alt", None)
 
-    # Summary statistics from raw filtered data
+    # Summary statistics from raw 1-sec filtered data
     fl_wspds = [o["fl_wspd_ms"] for o in filtered if o.get("fl_wspd_ms") is not None]
     static_pres = [o["static_pres_hpa"] for o in filtered
                    if o.get("static_pres_hpa") is not None and 200 < o["static_pres_hpa"] < 1100]
@@ -3911,7 +4031,6 @@ def get_archive_flight_level(
         "max_fl_wspd_ms": round(max(fl_wspds), 2) if fl_wspds else None,
         "min_static_pres_hpa": round(min(static_pres), 2) if static_pres else None,
         "total_obs_1hz": len(filtered),
-        "avg_interval_s": avg_interval_s,
         "mean_alt_m": round(
             sum(o["gps_alt_m"] for o in filtered if o.get("gps_alt_m") is not None)
             / max(1, sum(1 for o in filtered if o.get("gps_alt_m") is not None)),
@@ -3919,16 +4038,22 @@ def get_archive_flight_level(
         ) if any(o.get("gps_alt_m") is not None for o in filtered) else None,
     }
 
+    # Use 10s as the "primary" observation set for backward compatibility
+    averaged_10s = avg_results.get(10, [])
+
     result = {
         "success": True,
-        "observations": averaged,
+        "observations": averaged_10s,
+        "obs_1s": avg_results.get(1, []),
+        "obs_10s": averaged_10s,
+        "obs_30s": avg_results.get(30, []),
         "analysis_time": scan_dt.strftime("%Y-%m-%d %H:%M:%SZ"),
         "center_lat": center_lat,
         "center_lon": center_lon,
         "mission_id": mission_id,
         "storm_name": storm_name,
         "time_window_min": _FL_TIME_WINDOW_MIN,
-        "n_obs": len(averaged),
+        "n_obs": len(averaged_10s),
         "n_obs_raw": len(filtered),
         "source_file": matched_files[0],
         "source_url": fl_url,
