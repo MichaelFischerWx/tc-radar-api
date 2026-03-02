@@ -2020,7 +2020,7 @@ def quadrant_mean(
 # ---------------------------------------------------------------------------
 # Composite endpoints
 # ---------------------------------------------------------------------------
-_COMPOSITE_MAX_CASES = 150  # safety cap — keep low for 512 MB free-tier servers
+_COMPOSITE_MAX_CASES = 500  # safety cap — raised from 150 for 2 GB Render instance
 
 # Common query parameters for composite filters
 def _composite_filter_params(
