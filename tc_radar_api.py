@@ -3606,23 +3606,38 @@ def _resolve_hrd_storm_name(storm_name: str, year: int) -> Optional[str]:
     return None
 
 
-def _match_hrd_files(mission_id: str, hrd_files: list[str]) -> list[str]:
+def _match_hrd_files(mission_id: str, hrd_files: list[str], year: int = None) -> list[str]:
     """
     Match a TC-RADAR mission_id to HRD .sec.txt files.
 
-    mission_id format: e.g., "20241007I1", "20241007H1"
+    mission_id format: "20241007I1" (YYYYMMDD) or "190901H1" (YYMMDD)
     HRD filename format: e.g., "20241007I1.sec.txt", "20241007H1.1sec.txt"
 
+    The `year` parameter is used as a hint to expand 6-digit dates to 8-digit.
     Returns list of matching filenames sorted by relevance.
     """
     matches = []
-    # Extract the core mission pattern (date + aircraft + number)
-    # e.g., "20241007I1" → date=20241007, aircraft=I, num=1
+    # Try 8-digit date first: YYYYMMDD + aircraft + sortie
     m = re.match(r"(\d{8})([A-Za-z])(\d+)", mission_id)
     if not m:
-        return matches
+        # Try 6-digit date: YYMMDD + aircraft + sortie (common in older TC-RADAR metadata)
+        m = re.match(r"(\d{6})([A-Za-z])(\d+)", mission_id)
+        if not m:
+            return matches
+        # Expand 6-digit YYMMDD to 8-digit YYYYMMDD
+        short_date = m.group(1)
+        if year is not None:
+            # Use the known year from scan datetime
+            century = str(year)[:2]
+        else:
+            # Guess century: YY >= 97 → 1900s, else 2000s
+            yy = int(short_date[:2])
+            century = "19" if yy >= 97 else "20"
+        date_str = century + short_date
+        aircraft, num = m.group(2).upper(), m.group(3)
+    else:
+        date_str, aircraft, num = m.group(1), m.group(2).upper(), m.group(3)
 
-    date_str, aircraft, num = m.group(1), m.group(2).upper(), m.group(3)
     mission_prefix = f"{date_str}{aircraft}{num}"
 
     for fname in hrd_files:
@@ -3775,7 +3790,7 @@ def get_archive_flight_level(
         return JSONResponse(result)
 
     # Match mission_id to HRD files
-    matched_files = _match_hrd_files(mission_id, hrd_files)
+    matched_files = _match_hrd_files(mission_id, hrd_files, year=year)
     if not matched_files:
         result = {
             "success": False,
