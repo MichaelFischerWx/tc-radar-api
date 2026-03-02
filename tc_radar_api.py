@@ -3657,9 +3657,21 @@ def _match_hrd_files(mission_id: str, hrd_files: list[str]) -> list[str]:
 
 def _parse_tdr_scan_time(dt_str: str) -> Optional[datetime]:
     """Parse a TC-RADAR datetime string to a datetime object."""
-    for fmt in ("%Y-%m-%d %H:%M:%SZ", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"):
+    # Strip trailing " UTC" suffix and normalize to plain string
+    cleaned = dt_str.strip()
+    if cleaned.upper().endswith(" UTC"):
+        cleaned = cleaned[:-4].strip()
+
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",   # 2024-10-08 22:05:30
+        "%Y-%m-%d %H:%M",      # 2024-10-08 22:05
+        "%Y-%m-%d %H:%M:%SZ",  # 2024-10-08 22:05:30Z
+        "%Y-%m-%dT%H:%M:%SZ",  # 2024-10-08T22:05:30Z
+        "%Y-%m-%dT%H:%M:%S",   # 2024-10-08T22:05:30
+        "%Y-%m-%dT%H:%M",      # 2024-10-08T22:05
+    ):
         try:
-            return datetime.strptime(dt_str, fmt).replace(tzinfo=timezone.utc)
+            return datetime.strptime(cleaned, fmt).replace(tzinfo=timezone.utc)
         except (ValueError, TypeError):
             continue
     return None
