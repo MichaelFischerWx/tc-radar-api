@@ -32,13 +32,18 @@ import base64
 import gc
 import io
 import json
+import math
 import os
+import re
 import threading
+import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from html.parser import HTMLParser
 from pathlib import Path
+from typing import Optional
 
 import matplotlib
 matplotlib.use("Agg")
@@ -3249,6 +3254,665 @@ def plot(
         _plot_cache.popitem(last=False)  # evict oldest entry
         gc.collect()
     return Response(content=png, media_type="image/png", headers={"X-Cache": "MISS"})
+
+# ---------------------------------------------------------------------------
+# Flight-Level Archive  (HRD historical data)
+# ---------------------------------------------------------------------------
+HRD_FL_BASE = "https://www.aoml.noaa.gov/ftp/pub/hrd/data/flightlevel"
+_FL_TIME_WINDOW_MIN = 45   # ±45 minutes around TDR scan time
+_FL_AVG_INTERVAL_S = 10    # 10-second averaging window
+
+# Caches for HRD directory listings and flight-level results
+_hrd_dir_cache: OrderedDict = OrderedDict()    # url → (links, timestamp)
+_HRD_DIR_CACHE_TTL = 3600  # 1 hour for archive data
+_hrd_fl_cache: OrderedDict = OrderedDict()     # case_index → (result, timestamp)
+_HRD_FL_CACHE_TTL = 86400  # 24 hours — archive data is static
+_HRD_FL_CACHE_MAX = 50
+
+
+class _HRDLinkParser(HTMLParser):
+    """Extract href links from an Apache directory listing."""
+    def __init__(self):
+        super().__init__()
+        self.links: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            for name, value in attrs:
+                if name == "href" and value and not value.startswith("?") and not value.startswith("/"):
+                    self.links.append(value)
+
+
+def _hrd_fetch_text(url: str, timeout: int = 30) -> str:
+    """Fetch text content from a URL (for HRD archive access)."""
+    try:
+        import requests as _req
+        resp = _req.get(url, timeout=timeout)
+        resp.raise_for_status()
+        return resp.text
+    except ImportError:
+        import urllib.request as _urllib
+        req = _urllib.Request(url)
+        with _urllib.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8")
+
+
+def _hrd_parse_directory(url: str) -> list[str]:
+    """Fetch an HRD Apache directory listing and return link names (cached)."""
+    now = time.time()
+    if url in _hrd_dir_cache:
+        links, ts = _hrd_dir_cache[url]
+        if now - ts < _HRD_DIR_CACHE_TTL:
+            _hrd_dir_cache.move_to_end(url)
+            return links
+
+    html = _hrd_fetch_text(url)
+    parser = _HRDLinkParser()
+    parser.feed(html)
+    links = parser.links
+    _hrd_dir_cache[url] = (links, now)
+    if len(_hrd_dir_cache) > 100:
+        _hrd_dir_cache.popitem(last=False)
+    return links
+
+
+def _parse_hrd_1sec(text: str) -> list[dict]:
+    """
+    Parse an HRD archive 1-second flight-level .sec.txt file.
+
+    Format:
+      Line 1: storm_name  mission_id  (header)
+      Line 2: blank or column names
+      Line 3: column names (TIME, Lat, Lon, ...)
+      Line 4: units (HHMMSS, Deg N, Deg W, ...)
+      Line 5+: data rows (whitespace-delimited)
+
+    Returns list of observation dicts with consistent field names.
+    """
+    lines = text.strip().splitlines()
+    if len(lines) < 5:
+        return []
+
+    # Find the header line with column names — look for "TIME" in the line
+    col_line_idx = None
+    for i, line in enumerate(lines[:6]):
+        if "TIME" in line and "Lat" in line:
+            col_line_idx = i
+            break
+    if col_line_idx is None:
+        # Fallback: assume line index 2 has column names
+        col_line_idx = 2
+
+    col_names = lines[col_line_idx].split()
+    # Data starts 2 lines after column header (units line, then data)
+    data_start = col_line_idx + 2
+
+    # Build column index map
+    col_idx = {}
+    for j, name in enumerate(col_names):
+        col_idx[name.upper()] = j
+
+    observations = []
+    for line in lines[data_start:]:
+        parts = line.split()
+        if len(parts) < len(col_names) - 2:  # allow a couple missing at end
+            continue
+
+        def _get(name):
+            idx = col_idx.get(name.upper())
+            if idx is not None and idx < len(parts):
+                try:
+                    return float(parts[idx])
+                except (ValueError, TypeError):
+                    return None
+            return None
+
+        # Parse TIME (HHMMSS format)
+        time_str = parts[col_idx.get("TIME", 0)] if "TIME" in col_idx else None
+        if not time_str or len(time_str) < 6:
+            continue
+        try:
+            hh = int(time_str[0:2])
+            mm = int(time_str[2:4])
+            ss = int(time_str[4:6])
+            time_sec = hh * 3600 + mm * 60 + ss
+        except (ValueError, IndexError):
+            continue
+
+        lat = _get("LAT")
+        # Longitude: HRD uses "Deg W" (positive = west), negate for standard
+        lon_w = _get("LON")
+        if lat is None or lon_w is None:
+            continue
+        lon = -abs(lon_w)  # Convert west-positive to standard negative-west
+
+        wspd = _get("WNDSP")   # m/s
+        wdir = _get("WNDDR")   # degrees
+        temp = _get("TEMPR")   # °C
+        dewpt = _get("DEWPT")  # °C, -25.00 is sentinel
+        if dewpt is not None and dewpt <= -24.99:
+            dewpt = None
+        press = _get("PRESS")  # mb
+        geo_alt = _get("GEOAL")  # m
+        sfcpr = _get("SFCPR")  # mb
+        rd_alt = _get("RDALT")  # m
+        gn_spd = _get("GNSPD")  # m/s
+        tas = _get("TAS")      # m/s
+        head = _get("HEAD")    # deg
+        track = _get("TRACK")  # deg
+        vt_wnd = _get("VTWND")  # m/s
+        theta_e = _get("THETAE")  # deg
+
+        obs = {
+            "time": f"{hh:02d}:{mm:02d}:{ss:02d}",
+            "time_sec": time_sec,
+            "lat": round(lat, 5),
+            "lon": round(lon, 5),
+            "fl_wspd_ms": round(wspd, 2) if wspd is not None else None,
+            "fl_wdir_deg": round(wdir, 1) if wdir is not None else None,
+            "gps_alt_m": round(geo_alt, 1) if geo_alt is not None else None,
+            "static_pres_hpa": round(press, 1) if press is not None else None,
+            "temp_c": round(temp, 2) if temp is not None else None,
+            "dewpoint_c": round(dewpt, 2) if dewpt is not None else None,
+            "sfcpr_hpa": round(sfcpr, 1) if sfcpr is not None else None,
+            "ground_spd_ms": round(gn_spd, 1) if gn_spd is not None else None,
+            "true_airspd_ms": round(tas, 1) if tas is not None else None,
+            "heading": round(head, 1) if head is not None else None,
+            "track": round(track, 1) if track is not None else None,
+            "vert_vel_ms": round(vt_wnd, 2) if vt_wnd is not None else None,
+            "theta_e": round(theta_e, 2) if theta_e is not None else None,
+            # Placeholders for compatibility with real-time structure
+            "sfmr_wspd_ms": None,
+            "slp_hpa": None,
+            "extrapolated_sfc_wspd_ms": None,
+        }
+        observations.append(obs)
+
+    return observations
+
+
+def _hrd_average_window(
+    observations: list[dict], interval_s: float = 10.0
+) -> list[dict]:
+    """
+    Compute interval_s-second averages of HRD flight-level observations.
+    Similar to the real-time _average_fl_window but works with time_sec field.
+    """
+    if not observations or interval_s <= 1:
+        return observations
+
+    _AVG_KEYS = [
+        "gps_alt_m", "static_pres_hpa", "temp_c", "dewpoint_c",
+        "fl_wspd_ms", "fl_wdir_deg", "sfcpr_hpa", "ground_spd_ms",
+        "true_airspd_ms", "vert_vel_ms", "theta_e",
+    ]
+
+    result = []
+    n = len(observations)
+    i = 0
+    while i < n:
+        t0 = observations[i]["time_sec"]
+        window = []
+        while i < n and observations[i]["time_sec"] - t0 < interval_s:
+            window.append(observations[i])
+            i += 1
+
+        mid_idx = len(window) // 2
+        mid = window[mid_idx]
+        averaged = {
+            "time": mid["time"],
+            "time_sec": mid["time_sec"],
+            "lat": mid["lat"],
+            "lon": mid["lon"],
+        }
+
+        for key in _AVG_KEYS:
+            vals = [o[key] for o in window if o.get(key) is not None]
+            if vals:
+                if key == "fl_wdir_deg":
+                    rad = [v * math.pi / 180.0 for v in vals]
+                    mean_sin = sum(math.sin(r) for r in rad) / len(rad)
+                    mean_cos = sum(math.cos(r) for r in rad) / len(rad)
+                    avg = (math.atan2(mean_sin, mean_cos) * 180.0 / math.pi) % 360.0
+                else:
+                    avg = sum(vals) / len(vals)
+                averaged[key] = round(avg, 2)
+            else:
+                averaged[key] = None
+
+        averaged["heading"] = mid.get("heading")
+        averaged["track"] = mid.get("track")
+        averaged["sfmr_wspd_ms"] = None
+        averaged["slp_hpa"] = None
+        averaged["extrapolated_sfc_wspd_ms"] = None
+
+        result.append(averaged)
+
+    return result
+
+
+def _latlon_to_storm_km_archive(
+    lat: float, lon: float, center_lat: float, center_lon: float
+) -> tuple[float, float]:
+    """Convert geographic lat/lon to storm-relative (x_km, y_km)."""
+    x_km = (lon - center_lon) * 111.0 * math.cos(math.radians(center_lat))
+    y_km = (lat - center_lat) * 111.0
+    return round(x_km, 3), round(y_km, 3)
+
+
+def _interp_tdr_archive(
+    ds, local_idx: int, variable_key: str, level_km: float,
+    x_pts: np.ndarray, y_pts: np.ndarray
+) -> np.ndarray:
+    """
+    Bilinear-interpolate a TDR 2D field from the archive Zarr dataset
+    to arbitrary (x_km, y_km) points.
+
+    Adapted from realtime_tdr_api._interp_tdr_along_track for Zarr archive format.
+    Returns array of interpolated values (NaN where outside domain).
+    """
+    # Get the 2D data slice
+    height_vals = ds["height"].values
+    z_idx = int(np.argmin(np.abs(height_vals - level_km)))
+
+    # Handle derived variables (wind speed)
+    if variable_key in DERIVED_VARIABLES:
+        u_name, v_name = DERIVED_VARIABLES[variable_key]
+        u = ds[u_name].isel(num_cases=local_idx, height=z_idx).values
+        v = ds[v_name].isel(num_cases=local_idx, height=z_idx).values
+        data = np.sqrt(u**2 + v**2)
+        ref_varname = u_name
+    else:
+        _, varname, _, _, _, _ = VARIABLES[variable_key]
+        data = ds[varname].isel(num_cases=local_idx, height=z_idx).values
+        ref_varname = varname
+
+    # Determine grid coordinates
+    dims = ds[ref_varname].dims
+    if "eastward_distance" in dims:
+        x_km = ds["eastward_distance"].values
+        y_km = ds["northward_distance"].values
+    elif "longitude" in dims:
+        x_km = ds["longitude"].values
+        y_km = ds["latitude"].values
+    else:
+        x_km = ds["x"].values if "x" in ds else np.arange(data.shape[-1])
+        y_km = ds["y"].values if "y" in ds else np.arange(data.shape[-2])
+
+    # data may be (x, y) — transpose to (y, x) if needed
+    if data.shape[0] == len(x_km) and data.shape[1] == len(y_km) and len(x_km) != len(y_km):
+        data = data.T
+    ny, nx = data.shape
+
+    dx = float(x_km[1] - x_km[0]) if nx > 1 else 1.0
+    dy = float(y_km[1] - y_km[0]) if ny > 1 else 1.0
+
+    fi = (x_pts - float(x_km[0])) / dx
+    fj = (y_pts - float(y_km[0])) / dy
+
+    result = np.full(len(x_pts), np.nan)
+    for k in range(len(x_pts)):
+        xi, yj = fi[k], fj[k]
+        i0 = int(np.floor(xi))
+        j0 = int(np.floor(yj))
+        i1, j1 = i0 + 1, j0 + 1
+        if i0 < 0 or i1 >= nx or j0 < 0 or j1 >= ny:
+            continue
+        wx = xi - i0
+        wy = yj - j0
+        v00 = data[j0, i0]
+        v10 = data[j0, i1]
+        v01 = data[j1, i0]
+        v11 = data[j1, i1]
+        if any(np.isnan(v) for v in [v00, v10, v01, v11]):
+            ni = int(round(xi))
+            nj = int(round(yj))
+            if 0 <= ni < nx and 0 <= nj < ny and not np.isnan(data[nj, ni]):
+                result[k] = float(data[nj, ni])
+            continue
+        val = (v00 * (1 - wx) * (1 - wy) + v10 * wx * (1 - wy) +
+               v01 * (1 - wx) * wy + v11 * wx * wy)
+        result[k] = float(val)
+    return result
+
+
+def _resolve_hrd_storm_name(storm_name: str, year: int) -> Optional[str]:
+    """
+    Resolve a TC-RADAR storm name to an HRD directory name.
+
+    HRD uses lowercase storm names as directory names. We check the year
+    directory listing and do case-insensitive + fuzzy matching.
+    """
+    year_url = f"{HRD_FL_BASE}/{year}/"
+    try:
+        entries = _hrd_parse_directory(year_url)
+    except Exception:
+        return None
+
+    # Clean entries (strip trailing slashes)
+    storm_dirs = [e.rstrip("/") for e in entries if not e.startswith("?")]
+
+    # Exact match (case-insensitive)
+    target = storm_name.lower().strip()
+    for d in storm_dirs:
+        if d.lower() == target:
+            return d
+
+    # Fuzzy: try removing numbers/suffixes (e.g., "milton" vs "milton1")
+    for d in storm_dirs:
+        if target.startswith(d.lower()) or d.lower().startswith(target):
+            return d
+
+    return None
+
+
+def _match_hrd_files(mission_id: str, hrd_files: list[str]) -> list[str]:
+    """
+    Match a TC-RADAR mission_id to HRD .sec.txt files.
+
+    mission_id format: e.g., "20241007I1", "20241007H1"
+    HRD filename format: e.g., "20241007I1.sec.txt", "20241007H1.1sec.txt"
+
+    Returns list of matching filenames sorted by relevance.
+    """
+    matches = []
+    # Extract the core mission pattern (date + aircraft + number)
+    # e.g., "20241007I1" → date=20241007, aircraft=I, num=1
+    m = re.match(r"(\d{8})([A-Za-z])(\d+)", mission_id)
+    if not m:
+        return matches
+
+    date_str, aircraft, num = m.group(1), m.group(2).upper(), m.group(3)
+    mission_prefix = f"{date_str}{aircraft}{num}"
+
+    for fname in hrd_files:
+        if not fname.lower().endswith(".txt"):
+            continue
+        # Check if the filename starts with the mission prefix
+        fname_upper = fname.upper()
+        if fname_upper.startswith(mission_prefix.upper()):
+            matches.append(fname)
+        # Also check with just date + aircraft (e.g., 20241007I)
+        elif fname_upper.startswith(f"{date_str}{aircraft}"):
+            matches.append(fname)
+
+    # Prefer exact mission_id match, then .1sec.txt, then .sec.txt
+    def sort_key(f):
+        fu = f.upper()
+        if fu.startswith(mission_prefix.upper()):
+            priority = 0
+        else:
+            priority = 1
+        if "1sec" in f.lower():
+            fmt_priority = 0  # 1-second data preferred
+        elif "sec" in f.lower():
+            fmt_priority = 1
+        else:
+            fmt_priority = 2
+        return (priority, fmt_priority, f)
+
+    matches.sort(key=sort_key)
+    return matches
+
+
+def _parse_tdr_scan_time(dt_str: str) -> Optional[datetime]:
+    """Parse a TC-RADAR datetime string to a datetime object."""
+    for fmt in ("%Y-%m-%d %H:%M:%SZ", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            return datetime.strptime(dt_str, fmt).replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+@app.get("/flightlevel/archive")
+def get_archive_flight_level(
+    case_index: int = Query(..., ge=0, description="0-based case index"),
+    data_type: str = Query("swath", description="'swath' or 'merge'"),
+    avg_interval_s: float = Query(10.0, ge=1, le=60,
+                                   description="Averaging interval in seconds"),
+):
+    """
+    Return flight-level (in situ) observations from the HRD historical archive
+    for the TC-RADAR case matching the given case_index.
+
+    Parses 1-Hz HRD .sec.txt data, filters to ±45 min of the TDR analysis time,
+    returns 10-second averaged observations with storm-relative coordinates and
+    TDR-interpolated wind speeds at 0.5 km and 2.0 km.
+    """
+    now = time.time()
+    cache_key = f"{data_type}_{case_index}_avg{avg_interval_s}"
+    if cache_key in _hrd_fl_cache:
+        cached, ts = _hrd_fl_cache[cache_key]
+        if now - ts < _HRD_FL_CACHE_TTL:
+            _hrd_fl_cache.move_to_end(cache_key)
+            return JSONResponse(cached)
+
+    # Look up case metadata
+    cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
+    case_meta = cache.get(case_index)
+    if not case_meta:
+        raise HTTPException(status_code=404, detail=f"case_index {case_index} not found")
+
+    storm_name = case_meta.get("storm_name", "").strip()
+    mission_id = case_meta.get("mission_id", "").strip()
+    dt_str = case_meta.get("datetime", "")
+    # Get storm center lat/lon from ERA5 or IR Zarr store
+    center_lat = None
+    center_lon = None
+    try:
+        era5 = get_era5_dataset()
+        if era5 is not None and 'center_lat' in era5:
+            center_lat = float(era5['center_lat'][case_index])
+            center_lon = float(era5['center_lon'][case_index])
+    except Exception:
+        pass
+    if center_lat is None:
+        try:
+            ir_store = get_ir_dataset()
+            if ir_store is not None and 'center_lat' in ir_store:
+                center_lat = float(ir_store['center_lat'][case_index])
+                center_lon = float(ir_store['center_lon'][case_index])
+        except Exception:
+            pass
+
+    if not mission_id:
+        result = {
+            "success": False,
+            "reason": "no_mission_id",
+            "message": "No mission ID in metadata for this case",
+        }
+        return JSONResponse(result)
+
+    # Parse TDR scan datetime
+    scan_dt = _parse_tdr_scan_time(dt_str)
+    if scan_dt is None:
+        result = {
+            "success": False,
+            "reason": "bad_datetime",
+            "message": f"Could not parse datetime: {dt_str}",
+        }
+        return JSONResponse(result)
+
+    year = scan_dt.year
+    scan_time_sec = scan_dt.hour * 3600 + scan_dt.minute * 60 + scan_dt.second
+
+    # Resolve HRD storm directory
+    hrd_storm = _resolve_hrd_storm_name(storm_name, year)
+    if not hrd_storm:
+        result = {
+            "success": False,
+            "reason": "no_hrd_storm",
+            "message": f"No HRD flight-level directory found for {storm_name} ({year})",
+        }
+        _hrd_fl_cache[cache_key] = (result, now)
+        if len(_hrd_fl_cache) > _HRD_FL_CACHE_MAX:
+            _hrd_fl_cache.popitem(last=False)
+        return JSONResponse(result)
+
+    # List files in the storm directory
+    storm_url = f"{HRD_FL_BASE}/{year}/{hrd_storm}/"
+    try:
+        hrd_files = _hrd_parse_directory(storm_url)
+    except Exception as e:
+        result = {
+            "success": False,
+            "reason": "dir_fetch_error",
+            "message": f"Could not list HRD directory: {e}",
+        }
+        return JSONResponse(result)
+
+    # Match mission_id to HRD files
+    matched_files = _match_hrd_files(mission_id, hrd_files)
+    if not matched_files:
+        result = {
+            "success": False,
+            "reason": "no_fl_data",
+            "message": f"No flight-level data found for mission {mission_id} in {hrd_storm}/",
+        }
+        _hrd_fl_cache[cache_key] = (result, now)
+        if len(_hrd_fl_cache) > _HRD_FL_CACHE_MAX:
+            _hrd_fl_cache.popitem(last=False)
+        return JSONResponse(result)
+
+    # Fetch and parse the best-match file
+    fl_url = f"{storm_url}{matched_files[0]}"
+    try:
+        fl_text = _hrd_fetch_text(fl_url, timeout=60)
+    except Exception as e:
+        result = {
+            "success": False,
+            "reason": "fetch_error",
+            "message": f"Could not fetch {matched_files[0]}: {e}",
+        }
+        return JSONResponse(result)
+
+    raw_obs = _parse_hrd_1sec(fl_text)
+    if not raw_obs:
+        result = {
+            "success": False,
+            "reason": "parse_error",
+            "message": f"No valid observations parsed from {matched_files[0]}",
+        }
+        return JSONResponse(result)
+
+    # Time-window filter: keep records within ±FL_TIME_WINDOW_MIN of scan
+    window_sec = _FL_TIME_WINDOW_MIN * 60
+    filtered = []
+    for obs in raw_obs:
+        delta = obs["time_sec"] - scan_time_sec
+        # Handle midnight crossing
+        if delta > 43200:
+            delta -= 86400
+        elif delta < -43200:
+            delta += 86400
+        if abs(delta) <= window_sec:
+            obs["time_offset_s"] = round(delta, 1)
+            filtered.append(obs)
+
+    if not filtered:
+        result = {
+            "success": False,
+            "reason": "no_obs_in_window",
+            "message": f"No observations within ±{_FL_TIME_WINDOW_MIN} min of TDR scan time ({scan_dt.strftime('%H:%M:%SZ')})",
+            "total_obs": len(raw_obs),
+            "file": matched_files[0],
+        }
+        _hrd_fl_cache[cache_key] = (result, now)
+        if len(_hrd_fl_cache) > _HRD_FL_CACHE_MAX:
+            _hrd_fl_cache.popitem(last=False)
+        return JSONResponse(result)
+
+    # Average to N-second windows
+    averaged = _hrd_average_window(filtered, interval_s=avg_interval_s)
+
+    # Get storm center coordinates for storm-relative transform
+    # Try to get from metadata; fallback to Zarr dataset attributes
+    if center_lat is None or center_lon is None or (center_lat == 0 and center_lon == 0):
+        # Use mean of FL observations as fallback center
+        lats = [o["lat"] for o in averaged if o["lat"]]
+        lons = [o["lon"] for o in averaged if o["lon"]]
+        center_lat = sum(lats) / len(lats) if lats else 0
+        center_lon = sum(lons) / len(lons) if lons else 0
+
+    # Storm-motion correction (if available in metadata)
+    storm_u = case_meta.get("storm_motion_east_ms", -999)
+    storm_v = case_meta.get("storm_motion_north_ms", -999)
+    has_motion = (storm_u is not None and storm_v is not None
+                  and storm_u != -999 and storm_v != -999)
+
+    # Convert to storm-relative coordinates
+    for obs in averaged:
+        x_km, y_km = _latlon_to_storm_km_archive(
+            obs["lat"], obs["lon"], center_lat, center_lon
+        )
+        if has_motion and obs.get("time_offset_s") is not None:
+            dt_s = obs["time_offset_s"]
+            x_km += storm_u * (-dt_s) / 1000.0
+            y_km += storm_v * (-dt_s) / 1000.0
+            x_km = round(x_km, 3)
+            y_km = round(y_km, 3)
+        obs["x_km"] = x_km
+        obs["y_km"] = y_km
+        obs["r_km"] = round(math.sqrt(x_km**2 + y_km**2), 3)
+
+    # Interpolate TDR wind speed at flight-track positions
+    try:
+        ds, local_idx = resolve_case(case_index, data_type)
+        x_arr = np.array([o["x_km"] for o in averaged], dtype=float)
+        y_arr = np.array([o["y_km"] for o in averaged], dtype=float)
+
+        tdr_05 = _interp_tdr_archive(ds, local_idx, "recentered_wind_speed", 0.5, x_arr, y_arr)
+        tdr_20 = _interp_tdr_archive(ds, local_idx, "recentered_wind_speed", 2.0, x_arr, y_arr)
+
+        for i, obs in enumerate(averaged):
+            obs["tdr_wspd_0p5km"] = round(float(tdr_05[i]), 2) if not np.isnan(tdr_05[i]) else None
+            obs["tdr_wspd_2km"] = round(float(tdr_20[i]), 2) if not np.isnan(tdr_20[i]) else None
+    except Exception as e:
+        print(f"FL archive TDR interpolation warning: {e}")
+        for obs in averaged:
+            obs.setdefault("tdr_wspd_0p5km", None)
+            obs.setdefault("tdr_wspd_2km", None)
+
+    # Summary statistics from raw filtered data
+    fl_wspds = [o["fl_wspd_ms"] for o in filtered if o.get("fl_wspd_ms") is not None]
+    static_pres = [o["static_pres_hpa"] for o in filtered
+                   if o.get("static_pres_hpa") is not None and 200 < o["static_pres_hpa"] < 1100]
+
+    summary = {
+        "max_fl_wspd_ms": round(max(fl_wspds), 2) if fl_wspds else None,
+        "min_static_pres_hpa": round(min(static_pres), 2) if static_pres else None,
+        "total_obs_1hz": len(filtered),
+        "avg_interval_s": avg_interval_s,
+        "mean_alt_m": round(
+            sum(o["gps_alt_m"] for o in filtered if o.get("gps_alt_m") is not None)
+            / max(1, sum(1 for o in filtered if o.get("gps_alt_m") is not None)),
+            0,
+        ) if any(o.get("gps_alt_m") is not None for o in filtered) else None,
+    }
+
+    result = {
+        "success": True,
+        "observations": averaged,
+        "analysis_time": scan_dt.strftime("%Y-%m-%d %H:%M:%SZ"),
+        "center_lat": center_lat,
+        "center_lon": center_lon,
+        "mission_id": mission_id,
+        "storm_name": storm_name,
+        "time_window_min": _FL_TIME_WINDOW_MIN,
+        "n_obs": len(averaged),
+        "n_obs_raw": len(filtered),
+        "source_file": matched_files[0],
+        "source_url": fl_url,
+        "summary": summary,
+    }
+
+    _hrd_fl_cache[cache_key] = (result, now)
+    if len(_hrd_fl_cache) > _HRD_FL_CACHE_MAX:
+        _hrd_fl_cache.popitem(last=False)
+
+    return JSONResponse(result)
+
 
 from realtime_tdr_api import router as realtime_router
 app.include_router(realtime_router, prefix="/realtime")
