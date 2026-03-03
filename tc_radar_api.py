@@ -174,8 +174,8 @@ ERA5_FIELD_CONFIG = {
 CASE_COUNTS = {
     ("swath", "early"):  710,
     ("swath", "recent"): 800,
-    ("merge", "early"):  310,
-    ("merge", "recent"): 126,
+    ("merge", "early"):  215,
+    ("merge", "recent"): 221,
 }
 
 # ---------------------------------------------------------------------------
@@ -458,11 +458,18 @@ _PLOT_CACHE_MAX = 40   # ~40 plots × ~150 KB ≈ 6 MB max (was 150)
 _data_cache: OrderedDict = OrderedDict()
 _DATA_CACHE_MAX = 20   # ~20 entries — JSON dicts can be large (was 100)
 
+# Merge case_index → swath case_index mapping for IR/ERA5 lookups.
+# The MergIR and ERA5 zarr stores are indexed by swath case (0–1509),
+# but merge mode passes merge case indices (0–435).  This dict maps
+# merge_case_index → nearest swath_case_index (matched by mission_id
+# and closest datetime).  Built at startup from both metadata files.
+_merge_to_swath_index: dict[int, int] = {}
+
 
 @app.on_event("startup")
 def startup():
     # Load metadata
-    global _metadata_cache, _merge_metadata_cache
+    global _metadata_cache, _merge_metadata_cache, _merge_to_swath_index
     if METADATA_PATH.exists():
         with open(METADATA_PATH) as f:
             data = json.load(f)
@@ -478,6 +485,40 @@ def startup():
         print(f"Loaded {len(_merge_metadata_cache)} merge cases from {MERGE_METADATA_PATH}")
     else:
         print(f"Warning: {MERGE_METADATA_PATH} not found — merge composites will not filter correctly")
+
+    # Build merge→swath index mapping for IR/ERA5 lookups.
+    # The MergIR and ERA5 zarr stores are indexed by swath case number,
+    # so when in merge mode we need to translate merge indices to swath indices.
+    if _metadata_cache and _merge_metadata_cache:
+        from datetime import datetime as _dt
+        # Build swath lookup: mission_id → [(swath_idx, datetime, storm_name)]
+        _sw_by_mission: dict[str, list] = {}
+        for sc in _metadata_cache.values():
+            mid = sc.get("mission_id", "")
+            sdt = _dt.strptime(sc["datetime"], "%Y-%m-%d %H:%M UTC")
+            _sw_by_mission.setdefault(mid, []).append((sc["case_index"], sdt, sc.get("storm_name", "")))
+
+        for mc in _merge_metadata_cache.values():
+            mg_idx = mc["case_index"]
+            mg_dt = _dt.strptime(mc["datetime"], "%Y-%m-%d %H:%M UTC")
+            mg_mission = mc.get("mission_id", "")
+            mg_storm = mc.get("storm_name", "")
+
+            # Strategy 1: match by mission_id, pick closest in time
+            candidates = _sw_by_mission.get(mg_mission, [])
+            if candidates:
+                best = min(candidates, key=lambda x: abs((x[1] - mg_dt).total_seconds()))
+                _merge_to_swath_index[mg_idx] = best[0]
+            else:
+                # Strategy 2: match by storm_name, closest time within 24 h
+                all_storm = [(si, sdt, sn) for cands in _sw_by_mission.values()
+                             for si, sdt, sn in cands if sn == mg_storm]
+                if all_storm:
+                    best = min(all_storm, key=lambda x: abs((x[1] - mg_dt).total_seconds()))
+                    if abs((best[1] - mg_dt).total_seconds()) < 86400:
+                        _merge_to_swath_index[mg_idx] = best[0]
+
+        print(f"Built merge→swath index mapping: {len(_merge_to_swath_index)}/{len(_merge_metadata_cache)} cases mapped")
 
     backend = f"S3 Zarr (s3://{S3_BUCKET}/{S3_PREFIX})" if USE_S3 else "AOML HTTP (fallback)"
     print(f"Data backend: {backend}")
@@ -1213,7 +1254,10 @@ def _render_ir_png(frame_2d, vmin=190.0, vmax=310.0):
 
 
 @app.get("/ir")
-def get_ir(case_index: int = Query(..., ge=0)):
+def get_ir(
+    case_index: int = Query(..., ge=0),
+    data_type:  str = Query("swath", description="'swath' or 'merge'"),
+):
     """
     Return IR metadata and the t=0 frame (most recent) for instant display.
     The client then calls /ir_frame for each additional lag index to progressively
@@ -1222,32 +1266,41 @@ def get_ir(case_index: int = Query(..., ge=0)):
     if ir_store is None:
         raise HTTPException(status_code=503, detail="IR data not available (S3 not configured)")
 
+    # The IR zarr is indexed by swath case (0–1509).  When the caller is
+    # in merge mode, translate the merge case_index to the corresponding
+    # swath index so we pull the correct storm's IR data.
+    ir_idx = case_index
+    if data_type == "merge":
+        ir_idx = _merge_to_swath_index.get(case_index)
+        if ir_idx is None:
+            raise HTTPException(status_code=404, detail=f"No swath mapping for merge case {case_index}")
+
     # Check status
     try:
-        status = int(ir_store['status'][case_index])
+        status = int(ir_store['status'][ir_idx])
     except (IndexError, KeyError):
-        raise HTTPException(status_code=404, detail=f"Case {case_index} not found in IR store")
+        raise HTTPException(status_code=404, detail=f"Case {ir_idx} not found in IR store")
 
     if status != 1:
-        raise HTTPException(status_code=404, detail=f"No IR data for case {case_index}")
+        raise HTTPException(status_code=404, detail=f"No IR data for case {ir_idx}")
 
     # Read metadata
     import numpy as np
-    center_lat = float(ir_store['center_lat'][case_index])
-    center_lon = float(ir_store['center_lon'][case_index])
+    center_lat = float(ir_store['center_lat'][ir_idx])
+    center_lon = float(ir_store['center_lon'][ir_idx])
     lat_offsets = ir_store['lat_offsets'][:].tolist()
     lon_offsets = ir_store['lon_offsets'][:].tolist()
     lag_hours = ir_store['lag_hours'][:].tolist()
 
     # Render ONLY the t=0 frame (index 0) for instant display
-    tb_frame0 = ir_store['Tb'][case_index, 0]  # shape: (n_lat, n_lon)
+    tb_frame0 = ir_store['Tb'][ir_idx, 0]  # shape: (n_lat, n_lon)
     if np.all(np.isnan(tb_frame0)):
         frame0_png = None
     else:
         frame0_png = _render_ir_png(tb_frame0, vmin=190.0, vmax=310.0)
 
     # Read IR datetimes
-    ir_dt_raw = ir_store['ir_datetime'][case_index]  # epoch minutes
+    ir_dt_raw = ir_store['ir_datetime'][ir_idx]  # epoch minutes
     ir_datetimes = []
     for val in ir_dt_raw:
         val = int(val)
@@ -1272,7 +1325,11 @@ def get_ir(case_index: int = Query(..., ge=0)):
 
 
 @app.get("/ir_frame")
-def get_ir_frame(case_index: int = Query(..., ge=0), lag_index: int = Query(..., ge=0)):
+def get_ir_frame(
+    case_index: int = Query(..., ge=0),
+    lag_index:  int = Query(..., ge=0),
+    data_type:  str = Query("swath", description="'swath' or 'merge'"),
+):
     """
     Return a single server-rendered IR PNG frame.
     Called progressively by the client to build up the animation.
@@ -1281,20 +1338,27 @@ def get_ir_frame(case_index: int = Query(..., ge=0), lag_index: int = Query(...,
     if ir_store is None:
         raise HTTPException(status_code=503, detail="IR data not available (S3 not configured)")
 
+    # Translate merge index → swath index (IR zarr is swath-indexed)
+    ir_idx = case_index
+    if data_type == "merge":
+        ir_idx = _merge_to_swath_index.get(case_index)
+        if ir_idx is None:
+            raise HTTPException(status_code=404, detail=f"No swath mapping for merge case {case_index}")
+
     try:
-        status = int(ir_store['status'][case_index])
+        status = int(ir_store['status'][ir_idx])
     except (IndexError, KeyError):
-        raise HTTPException(status_code=404, detail=f"Case {case_index} not found in IR store")
+        raise HTTPException(status_code=404, detail=f"Case {ir_idx} not found in IR store")
 
     if status != 1:
-        raise HTTPException(status_code=404, detail=f"No IR data for case {case_index}")
+        raise HTTPException(status_code=404, detail=f"No IR data for case {ir_idx}")
 
     import numpy as np
     n_lags = ir_store['Tb'].shape[1]
     if lag_index >= n_lags:
         raise HTTPException(status_code=404, detail=f"lag_index {lag_index} out of range (max {n_lags-1})")
 
-    frame = ir_store['Tb'][case_index, lag_index]
+    frame = ir_store['Tb'][ir_idx, lag_index]
     if np.all(np.isnan(frame)):
         png = None
     else:
@@ -1317,6 +1381,7 @@ def get_era5(
     field: str = Query("shear_mag"),
     include_profiles: bool = Query(True),
     radius_km: float = Query(0, ge=0, le=1200, description="Crop radius in km (0=full domain)"),
+    data_type: str = Query("swath", description="'swath' or 'merge'"),
 ):
     """
     Return ERA5 environmental diagnostics for a TC-RADAR case.
@@ -1327,17 +1392,25 @@ def get_era5(
     field : str - 2D field to return (shear_mag, rh_mid, div200)
     include_profiles : bool - include vertical profiles & hodograph data
     radius_km : float - crop to this radius from TC center (0=full 20° domain)
+    data_type : str - 'swath' or 'merge'
     """
     era5 = get_era5_dataset()
     if era5 is None:
         raise HTTPException(status_code=503, detail="ERA5 data not available")
 
+    # ERA5 zarr is indexed by swath case (0–1509).  Translate merge indices.
+    era5_idx = case_index
+    if data_type == "merge":
+        era5_idx = _merge_to_swath_index.get(case_index)
+        if era5_idx is None:
+            raise HTTPException(status_code=404, detail=f"No swath mapping for merge case {case_index}")
+
     try:
-        status = int(era5['status'][case_index])
+        status = int(era5['status'][era5_idx])
     except (IndexError, KeyError):
-        raise HTTPException(status_code=404, detail=f"Case {case_index} not in ERA5 store")
+        raise HTTPException(status_code=404, detail=f"Case {era5_idx} not in ERA5 store")
     if status != 1:
-        raise HTTPException(status_code=404, detail=f"No ERA5 data for case {case_index}")
+        raise HTTPException(status_code=404, detail=f"No ERA5 data for case {era5_idx}")
 
     if field not in ERA5_FIELD_CONFIG:
         raise HTTPException(status_code=400, detail=f"Unknown field: {field}. Valid: {list(ERA5_FIELD_CONFIG.keys())}")
@@ -1345,13 +1418,13 @@ def get_era5(
     cfg = ERA5_FIELD_CONFIG[field]
 
     # Read full 2D field and coordinate offsets
-    data_2d = era5[field][case_index]  # (81, 81)
+    data_2d = era5[field][era5_idx]  # (81, 81)
     lat_offsets = era5['lat_offsets'][:]
     lon_offsets = era5['lon_offsets'][:]
 
     # Crop to radius_km if specified
     if radius_km > 0:
-        center_lat = float(era5['center_lat'][case_index])
+        center_lat = float(era5['center_lat'][era5_idx])
         crop_deg = radius_km / 111.0  # approximate degrees
         lat_mask = np.abs(lat_offsets) <= crop_deg
         lon_mask = np.abs(lon_offsets) <= crop_deg
@@ -1371,16 +1444,16 @@ def get_era5(
         "field": field,
         "field_config": cfg,
         "data": field_list,
-        "center_lat": float(era5['center_lat'][case_index]),
-        "center_lon": float(era5['center_lon'][case_index]),
+        "center_lat": float(era5['center_lat'][era5_idx]),
+        "center_lon": float(era5['center_lon'][era5_idx]),
         "lat_offsets": lat_offsets.tolist(),
         "lon_offsets": lon_offsets.tolist(),
     }
 
     # Add vector components if field has them (subsampled for readability)
     if cfg.get("has_vectors"):
-        u_full = era5[cfg["vector_u"]][case_index]
-        v_full = era5[cfg["vector_v"]][case_index]
+        u_full = era5[cfg["vector_u"]][era5_idx]
+        v_full = era5[cfg["vector_v"]][era5_idx]
         if radius_km > 0:
             u_full = u_full[np.ix_(lat_mask, lon_mask)]
             v_full = v_full[np.ix_(lat_mask, lon_mask)]
@@ -1401,7 +1474,7 @@ def get_era5(
     for sname in ['shear_mag_env', 'shear_dir_env', 'rh_mid_env', 'div200_env',
                    'sst_env', 'chi_m', 'v_pi', 'vent_index']:
         try:
-            val = float(era5[sname][case_index])
+            val = float(era5[sname][era5_idx])
             if np.isnan(val):
                 result["scalars"][sname] = None
             elif 'div' in sname:
@@ -1419,8 +1492,8 @@ def get_era5(
     if include_profiles:
         try:
             plev = era5['plev'][:].astype(float)           # hPa
-            t_arr = era5['t_profile'][case_index].astype(float)   # K
-            q_arr = era5['q_profile'][case_index].astype(float)   # g/kg from Zarr
+            t_arr = era5['t_profile'][era5_idx].astype(float)   # K
+            q_arr = era5['q_profile'][era5_idx].astype(float)   # g/kg from Zarr
 
             # Convert q from g/kg to kg/kg if stored as g/kg
             q_kgkg = q_arr / 1000.0 if np.nanmax(q_arr) > 0.5 else q_arr
@@ -1440,9 +1513,9 @@ def get_era5(
 
             result["profiles"] = {
                 "plev": plev.tolist(),
-                "u": [round(float(v), 2) if not np.isnan(v) else None for v in era5['u_profile'][case_index]],
-                "v": [round(float(v), 2) if not np.isnan(v) else None for v in era5['v_profile'][case_index]],
-                "rh": [round(float(v), 1) if not np.isnan(v) else None for v in era5['rh_profile'][case_index]],
+                "u": [round(float(v), 2) if not np.isnan(v) else None for v in era5['u_profile'][era5_idx]],
+                "v": [round(float(v), 2) if not np.isnan(v) else None for v in era5['v_profile'][era5_idx]],
+                "rh": [round(float(v), 1) if not np.isnan(v) else None for v in era5['rh_profile'][era5_idx]],
                 "t": [round(float(v), 2) if not np.isnan(v) else None for v in t_arr],
                 "theta": [round(float(v), 1) if not np.isnan(v) else None for v in theta],
                 "theta_e": [round(float(v), 1) if not np.isnan(v) else None for v in theta_e],
@@ -1467,6 +1540,7 @@ def get_era5_scalars(
     case_index: int = Query(..., ge=0),
     inner_km: float = Query(200, ge=0, le=1000, description="Inner annulus radius (km)"),
     outer_km: float = Query(800, ge=50, le=1200, description="Outer annulus radius (km)"),
+    data_type: str = Query("swath", description="'swath' or 'merge'"),
 ):
     """
     Recompute area-mean scalar diagnostics from the gridded ERA5 2D fields
@@ -1479,14 +1553,21 @@ def get_era5_scalars(
     if era5 is None:
         raise HTTPException(status_code=503, detail="ERA5 data not available")
 
+    # ERA5 zarr is indexed by swath case.  Translate merge indices.
+    era5_idx = case_index
+    if data_type == "merge":
+        era5_idx = _merge_to_swath_index.get(case_index)
+        if era5_idx is None:
+            raise HTTPException(status_code=404, detail=f"No swath mapping for merge case {case_index}")
+
     try:
-        status = int(era5['status'][case_index])
+        status = int(era5['status'][era5_idx])
     except (IndexError, KeyError):
         raise HTTPException(status_code=404, detail=f"Case {case_index} not in ERA5 store")
     if status != 1:
         raise HTTPException(status_code=404, detail=f"No ERA5 data for case {case_index}")
 
-    center_lat = float(era5['center_lat'][case_index])
+    center_lat = float(era5['center_lat'][era5_idx])
     lat_offsets = era5['lat_offsets'][:]
     lon_offsets = era5['lon_offsets'][:]
     cos_lat = np.cos(np.deg2rad(center_lat))
@@ -1509,8 +1590,8 @@ def get_era5_scalars(
 
     # Recompute shear from vector components
     try:
-        shear_u = era5['shear_u'][case_index]
-        shear_v = era5['shear_v'][case_index]
+        shear_u = era5['shear_u'][era5_idx]
+        shear_v = era5['shear_v'][era5_idx]
         su = float(np.nanmean(shear_u[mask]))
         sv = float(np.nanmean(shear_v[mask]))
         result["shear_mag_env"] = round(float(np.sqrt(su**2 + sv**2)), 1)
@@ -1522,21 +1603,21 @@ def get_era5_scalars(
 
     # Recompute RH mid
     try:
-        rh_mid = era5['rh_mid'][case_index]
+        rh_mid = era5['rh_mid'][era5_idx]
         result["rh_mid_env"] = round(float(np.nanmean(rh_mid[mask])), 0)
     except Exception:
         result["rh_mid_env"] = None
 
     # Recompute divergence
     try:
-        div200 = era5['div200'][case_index]
+        div200 = era5['div200'][era5_idx]
         result["div200_env"] = round(float(np.nanmean(div200[mask])), 4)
     except Exception:
         result["div200_env"] = None
 
     # Recompute SST
     try:
-        sst = era5['sst'][case_index]
+        sst = era5['sst'][era5_idx]
         result["sst_env"] = round(float(np.nanmean(sst[mask])), 1)
     except Exception:
         result["sst_env"] = None
@@ -1545,7 +1626,7 @@ def get_era5_scalars(
     # from 2D grids alone (require vertical profiles), so return stored values
     for sname in ['chi_m', 'v_pi', 'vent_index']:
         try:
-            val = float(era5[sname][case_index])
+            val = float(era5[sname][era5_idx])
             result[sname] = round(val, 3) if not np.isnan(val) else None
         except Exception:
             result[sname] = None
@@ -1560,6 +1641,7 @@ def get_era5_scalars(
 def get_era5_sounding(
     case_index: int = Query(..., ge=0),
     radius_km: float = Query(200, ge=50, le=800, description="Averaging radius (km) for sounding"),
+    data_type: str = Query("swath", description="'swath' or 'merge'"),
 ):
     """
     Return ERA5 vertical profiles for Skew-T rendering.
@@ -1572,13 +1654,21 @@ def get_era5_sounding(
     ----------
     case_index : int
     radius_km  : float  - disc radius for azimuthal averaging (km)
+    data_type  : str    - 'swath' or 'merge'
     """
     era5 = get_era5_dataset()
     if era5 is None:
         raise HTTPException(status_code=503, detail="ERA5 data not available")
 
+    # ERA5 zarr is indexed by swath case.  Translate merge indices.
+    era5_idx = case_index
+    if data_type == "merge":
+        era5_idx = _merge_to_swath_index.get(case_index)
+        if era5_idx is None:
+            raise HTTPException(status_code=404, detail=f"No swath mapping for merge case {case_index}")
+
     try:
-        status = int(era5['status'][case_index])
+        status = int(era5['status'][era5_idx])
     except (IndexError, KeyError):
         raise HTTPException(status_code=404, detail=f"Case {case_index} not in ERA5 store")
     if status != 1:
@@ -1603,7 +1693,7 @@ def get_era5_sounding(
 
     if has_3d:
         try:
-            center_lat = float(era5['center_lat'][case_index])
+            center_lat = float(era5['center_lat'][era5_idx])
             lat_offsets = era5['lat_offsets'][:]
             lon_offsets = era5['lon_offsets'][:]
             cos_lat = np.cos(np.deg2rad(center_lat))
@@ -1615,8 +1705,8 @@ def get_era5_sounding(
                 raise ValueError("Too few points")
 
             plev = era5['plev'][:].astype(float)
-            t_3d = era5[t_3d_key][case_index]   # (nlev, nlat, nlon)
-            q_3d = era5[q_3d_key][case_index]
+            t_3d = era5[t_3d_key][era5_idx]   # (nlev, nlat, nlon)
+            q_3d = era5[q_3d_key][era5_idx]
 
             t_prof = np.array([float(np.nanmean(t_3d[k][mask_2d])) for k in range(len(plev))])
             q_prof = np.array([float(np.nanmean(q_3d[k][mask_2d])) for k in range(len(plev))])
@@ -1630,7 +1720,7 @@ def get_era5_sounding(
             # RH: use rh_3d directly if available, else compute from q and T
             rh_3d_key = next((k for k in ['rh_3d', 'relative_humidity_3d'] if k in era5), None)
             if rh_3d_key:
-                rh_3d_arr = era5[rh_3d_key][case_index]
+                rh_3d_arr = era5[rh_3d_key][era5_idx]
                 rh_prof = np.array([float(np.nanmean(rh_3d_arr[k][mask_2d])) for k in range(len(plev))])
                 rh_prof = np.clip(rh_prof, 0, 100)
             else:
@@ -1650,8 +1740,8 @@ def get_era5_sounding(
             # Also average u/v 3D winds if available
             has_uv_3d = u_3d_key is not None and v_3d_key is not None
             if has_uv_3d:
-                u_3d = era5[u_3d_key][case_index]
-                v_3d = era5[v_3d_key][case_index]
+                u_3d = era5[u_3d_key][era5_idx]
+                v_3d = era5[v_3d_key][era5_idx]
                 u_prof = np.array([float(np.nanmean(u_3d[k][mask_2d])) for k in range(len(plev))])
                 v_prof = np.array([float(np.nanmean(v_3d[k][mask_2d])) for k in range(len(plev))])
                 profiles["u"] = [round(float(v), 2) if not np.isnan(v) else None for v in u_prof]
@@ -1659,8 +1749,8 @@ def get_era5_sounding(
             else:
                 # Fall back to precomputed u/v profiles
                 try:
-                    profiles["u"] = [round(float(v), 2) if not np.isnan(v) else None for v in era5['u_profile'][case_index]]
-                    profiles["v"] = [round(float(v), 2) if not np.isnan(v) else None for v in era5['v_profile'][case_index]]
+                    profiles["u"] = [round(float(v), 2) if not np.isnan(v) else None for v in era5['u_profile'][era5_idx]]
+                    profiles["v"] = [round(float(v), 2) if not np.isnan(v) else None for v in era5['v_profile'][era5_idx]]
                 except Exception:
                     pass
 
@@ -1673,8 +1763,8 @@ def get_era5_sounding(
     # Fallback: return precomputed annular-mean profiles
     try:
         plev = era5['plev'][:].astype(float)
-        t_arr = era5['t_profile'][case_index].astype(float)
-        q_arr = era5['q_profile'][case_index].astype(float)
+        t_arr = era5['t_profile'][era5_idx].astype(float)
+        q_arr = era5['q_profile'][era5_idx].astype(float)
         q_kgkg = q_arr / 1000.0 if np.nanmax(q_arr) > 0.5 else q_arr
 
         Rd_Cp = 287.04 / 1005.7
@@ -1688,14 +1778,14 @@ def get_era5_sounding(
             "plev": plev.tolist(),
             "t": [round(float(v), 2) if not np.isnan(v) else None for v in t_arr],
             "q": [round(float(v), 6) if not np.isnan(v) else None for v in q_arr],
-            "rh": [round(float(v), 1) if not np.isnan(v) else None for v in era5['rh_profile'][case_index]],
+            "rh": [round(float(v), 1) if not np.isnan(v) else None for v in era5['rh_profile'][era5_idx]],
             "theta": [round(float(v), 1) if not np.isnan(v) else None for v in theta],
             "theta_e": [round(float(v), 1) if not np.isnan(v) else None for v in theta_e],
         }
         # Include precomputed u/v profiles for wind barbs
         try:
-            result["profiles"]["u"] = [round(float(v), 2) if not np.isnan(v) else None for v in era5['u_profile'][case_index]]
-            result["profiles"]["v"] = [round(float(v), 2) if not np.isnan(v) else None for v in era5['v_profile'][case_index]]
+            result["profiles"]["u"] = [round(float(v), 2) if not np.isnan(v) else None for v in era5['u_profile'][era5_idx]]
+            result["profiles"]["v"] = [round(float(v), 2) if not np.isnan(v) else None for v in era5['v_profile'][era5_idx]]
         except Exception:
             pass
     except Exception:
@@ -4215,12 +4305,14 @@ def get_archive_flight_level(
             except Exception:
                 pass
     # --- Priority 3: ERA5 best-track center ---
+    # ERA5 and IR zarr stores are indexed by swath case; translate if in merge mode.
+    _swath_idx = _merge_to_swath_index.get(case_index, case_index) if data_type == "merge" else case_index
     if center_lat is None:
         try:
             era5 = get_era5_dataset()
             if era5 is not None and 'center_lat' in era5:
-                center_lat = float(era5['center_lat'][case_index])
-                center_lon = float(era5['center_lon'][case_index])
+                center_lat = float(era5['center_lat'][_swath_idx])
+                center_lon = float(era5['center_lon'][_swath_idx])
                 _center_source = "era5"
         except Exception:
             pass
@@ -4229,8 +4321,8 @@ def get_archive_flight_level(
         try:
             ir_store = get_ir_dataset()
             if ir_store is not None and 'center_lat' in ir_store:
-                center_lat = float(ir_store['center_lat'][case_index])
-                center_lon = float(ir_store['center_lon'][case_index])
+                center_lat = float(ir_store['center_lat'][_swath_idx])
+                center_lon = float(ir_store['center_lon'][_swath_idx])
                 _center_source = "ir_zarr"
         except Exception:
             pass
