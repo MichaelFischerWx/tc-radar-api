@@ -34,6 +34,7 @@ import io
 import json
 import math
 import os
+import queue
 import re
 import threading
 import time
@@ -56,7 +57,7 @@ from scipy.interpolate import RegularGridInterpolator
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
-from fastapi.responses import Response, JSONResponse
+from fastapi.responses import Response, JSONResponse, StreamingResponse
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -276,7 +277,7 @@ app.add_middleware(CacheHeaderMiddleware)
 class CompositeGCMiddleware(BaseHTTPMiddleware):
     """
     Force garbage collection after composite endpoints to reclaim numpy arrays
-    and prevent OOM on the 512 MB Render free tier.
+    and prevent OOM on the 2 GB Render plan.
     """
     async def dispatch(self, request, call_next):
         response = await call_next(request)
@@ -2105,6 +2106,46 @@ def quadrant_mean(
 # ---------------------------------------------------------------------------
 _COMPOSITE_MAX_CASES = 1000  # safety cap — batched processing keeps peak RAM bounded regardless of N
 
+_SENTINEL_DONE = "__DONE__"
+_SENTINEL_ERROR = "__ERROR__"
+
+
+def _streaming_composite_response(compute_fn):
+    """
+    Run *compute_fn* in a background thread while streaming NDJSON progress
+    events to the client.  *compute_fn* receives a *progress_cb(done, total)*
+    callback.  It must return the final result dict.
+
+    The response is ``application/x-ndjson``: one JSON object per line.
+    Progress lines look like: ``{"progress": 160, "total": 384}``
+    The final line is the full result JSON (no wrapper).
+    """
+    q: queue.Queue = queue.Queue()
+
+    def _progress_cb(done, total):
+        q.put(json.dumps({"progress": done, "total": total}) + "\n")
+
+    def _run():
+        try:
+            result = compute_fn(_progress_cb)
+            q.put(json.dumps(result) + "\n")
+            q.put(_SENTINEL_DONE)
+        except Exception as exc:
+            q.put(json.dumps({"error": str(exc)}) + "\n")
+            q.put(_SENTINEL_ERROR)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+    def _generate():
+        while True:
+            item = q.get()
+            if item in (_SENTINEL_DONE, _SENTINEL_ERROR):
+                break
+            yield item
+
+    return StreamingResponse(_generate(), media_type="application/x-ndjson")
+
 # Common query parameters for composite filters
 def _composite_filter_params(
     min_intensity:  float = Query(0,    ge=0,   le=200,  description="Min Vmax (kt)"),
@@ -2203,19 +2244,20 @@ def _regrid_to_rmw_normalized(data_2d, x_phys, y_phys, rmw,
 
 
 # Number of parallel threads for composite S3 reads.
-# 6 threads on the upgraded 2 GB Render plan — each concurrent 3D volume
-# read is ~10–15 MB, so peak thread memory ≈ 6 × 15 MB ≈ 90 MB, well
+# 8 threads on the upgraded 2 GB Render plan — each concurrent 3D volume
+# read is ~10–15 MB, so peak thread memory ≈ 8 × 15 MB ≈ 120 MB, well
 # within the ~1.5 GB headroom after base app footprint (~300 MB).
-_COMPOSITE_WORKERS = 6
+_COMPOSITE_WORKERS = 8
 
 # Batch size for composite processing — process this many cases at a time,
-# then GC between batches to keep peak memory bounded.
-_COMPOSITE_BATCH_SIZE = 50
+# then lightweight GC between batches to keep peak memory bounded.
+_COMPOSITE_BATCH_SIZE = 80
 
 
-def _process_composites_batched(worker_fn, work_items, accumulate_fn):
+def _process_composites_batched(worker_fn, work_items, accumulate_fn,
+                                 progress_cb=None):
     """
-    Process composite cases in batches to bound peak memory on low-RAM servers.
+    Process composite cases in batches to bound peak memory.
 
     Parameters
     ----------
@@ -2226,13 +2268,20 @@ def _process_composites_batched(worker_fn, work_items, accumulate_fn):
     accumulate_fn : callable(result)
         Called with each non-None worker result in the main thread.
         Should accumulate into the caller's arrays.
+    progress_cb : callable(done, total) or None
+        Optional callback invoked after each batch completes.  *done* is the
+        cumulative number of work-items processed so far, *total* is
+        len(work_items).  Overhead is negligible since it fires once per batch.
 
     Returns nothing — accumulation is done via side-effect through accumulate_fn.
     """
     total = len(work_items)
-    for batch_start in range(0, total, _COMPOSITE_BATCH_SIZE):
-        batch = work_items[batch_start:batch_start + _COMPOSITE_BATCH_SIZE]
-        with ThreadPoolExecutor(max_workers=_COMPOSITE_WORKERS) as pool:
+    done = 0
+    # Reuse a single thread pool across all batches to avoid repeated
+    # thread creation/teardown overhead.
+    with ThreadPoolExecutor(max_workers=_COMPOSITE_WORKERS) as pool:
+        for batch_start in range(0, total, _COMPOSITE_BATCH_SIZE):
+            batch = work_items[batch_start:batch_start + _COMPOSITE_BATCH_SIZE]
             futures = {
                 pool.submit(worker_fn, *item): item[0]
                 for item in batch
@@ -2243,8 +2292,15 @@ def _process_composites_batched(worker_fn, work_items, accumulate_fn):
                     accumulate_fn(result)
                 del result
             del futures
-        # Free thread pool + intermediate memory between batches
-        gc.collect()
+            done += len(batch)
+            # Lightweight gen-0 GC between batches — avoids the 50–200 ms
+            # cost of a full 3-generation sweep while still freeing short-lived
+            # objects (thread-local buffers, intermediate arrays).
+            gc.collect(0)
+            if progress_cb is not None:
+                progress_cb(done, total)
+    # One full GC at the very end to reclaim any promoted objects.
+    gc.collect()
 
 
 def _process_one_case_azimuthal(case_idx, rmw, variable, overlay, data_type,
@@ -2405,6 +2461,7 @@ def composite_azimuthal_mean(
     max_r_rmw:     float = Query(8.0,   ge=1, le=20,    description="Max radius in R/RMW"),
     dr_rmw:        float = Query(0.25,  ge=0.1, le=2,   description="Radial bin width in R/RMW"),
     coverage_min:  float = Query(0.25,  ge=0.0, le=1.0),
+    stream:        bool  = Query(False,                  description="Stream NDJSON progress events"),
     min_intensity:  float = Query(0),    max_intensity:  float = Query(200),
     min_vmax_change:float = Query(-100), max_vmax_change:float = Query(85),
     min_tilt:       float = Query(0),    max_tilt:       float = Query(200),
@@ -2449,15 +2506,7 @@ def composite_azimuthal_mean(
     height_km = first_ds["height"].values
     x_coords, y_coords, h_axis = _resolve_grid_and_haxis(first_ds, ref_varname)
 
-    accum_sum = None
-    accum_count = None
-    ov_accum_sum = None
-    ov_accum_count = None
-    r_centers = None
-    n_processed = 0
-    processed_indices = []
-
-    # Process cases in batches — keeps peak memory bounded on 512 MB servers.
+    # Process cases in batches — keeps peak memory bounded on the 2 GB Render plan.
     work_items = [
         (case_idx, rmw, variable, overlay, data_type,
          x_coords, y_coords, height_km, h_axis,
@@ -2465,82 +2514,94 @@ def composite_azimuthal_mean(
         for case_idx, rmw in cases_with_rmw
     ]
 
-    def _accum_az(result):
-        nonlocal accum_sum, accum_count, ov_accum_sum, ov_accum_count
-        nonlocal r_centers, n_processed
-        case_idx, az_mean, rc, ov_az = result
-        if accum_sum is None:
-            r_centers = rc
-            accum_sum = np.zeros_like(az_mean)
-            accum_count = np.zeros_like(az_mean)
-        valid = ~np.isnan(az_mean)
-        accum_sum[valid] += az_mean[valid]
-        accum_count[valid] += 1
-        if ov_az is not None:
-            if ov_accum_sum is None:
-                ov_accum_sum = np.zeros_like(ov_az)
-                ov_accum_count = np.zeros_like(ov_az)
-            ov_valid = ~np.isnan(ov_az)
-            ov_accum_sum[ov_valid] += ov_az[ov_valid]
-            ov_accum_count[ov_valid] += 1
-        n_processed += 1
-        processed_indices.append(case_idx)
+    def _compute(progress_cb=None):
+        accum_sum = None
+        accum_count = None
+        ov_accum_sum = None
+        ov_accum_count = None
+        r_centers = None
+        n_processed = 0
+        processed_indices = []
 
-    _process_composites_batched(_process_one_case_azimuthal, work_items, _accum_az)
+        def _accum_az(result):
+            nonlocal accum_sum, accum_count, ov_accum_sum, ov_accum_count
+            nonlocal r_centers, n_processed
+            case_idx, az_mean, rc, ov_az = result
+            if accum_sum is None:
+                r_centers = rc
+                accum_sum = np.zeros_like(az_mean)
+                accum_count = np.zeros_like(az_mean)
+            valid = ~np.isnan(az_mean)
+            accum_sum[valid] += az_mean[valid]
+            accum_count[valid] += 1
+            if ov_az is not None:
+                if ov_accum_sum is None:
+                    ov_accum_sum = np.zeros_like(ov_az)
+                    ov_accum_count = np.zeros_like(ov_az)
+                ov_valid = ~np.isnan(ov_az)
+                ov_accum_sum[ov_valid] += ov_az[ov_valid]
+                ov_accum_count[ov_valid] += 1
+            n_processed += 1
+            processed_indices.append(case_idx)
 
-    if n_processed == 0:
-        raise HTTPException(status_code=500, detail="Could not process any matching cases.")
+        _process_composites_batched(
+            _process_one_case_azimuthal, work_items, _accum_az,
+            progress_cb=progress_cb,
+        )
 
-    # Require each grid cell to have data from at least 33% of processed cases
-    # (or 3, whichever is greater) to suppress noisy bins with sparse sampling
-    min_cases = max(3, int(np.ceil(0.33 * n_processed)))
-    composite = np.where(accum_count >= min_cases, accum_sum / accum_count, np.nan)
+        if n_processed == 0:
+            raise RuntimeError("Could not process any matching cases.")
 
-    result = {
-        "azimuthal_mean": _clean_2d(composite),
-        "radius_rrmw": [round(float(r), 3) for r in r_centers],
-        "height_km": [round(float(h), 2) for h in height_km],
-        "normalized": True,
-        "coverage_min": coverage_min,
-        "min_cases_per_bin": min_cases,
-        "n_cases": n_processed,
-        "n_matched": len(matching),
-        "n_with_rmw": len(cases_with_rmw),
-        "case_list": _build_case_list(processed_indices, data_type),
-        "variable": {
-            "key": variable,
-            "display_name": display_name,
-            "units": units,
-            "vmin": vmin,
-            "vmax": vmax,
-            "colorscale": _cmap_to_plotly(cmap),
-        },
-        "filters": {
-            "intensity": [min_intensity, max_intensity],
-            "vmax_change": [min_vmax_change, max_vmax_change],
-            "tilt": [min_tilt, max_tilt],
-            "year": [min_year, max_year],
-            "shear_mag": [min_shear_mag, max_shear_mag],
-            "shear_dir": [min_shear_dir, max_shear_dir],
-        },
-    }
+        min_cases = max(3, int(np.ceil(0.33 * n_processed)))
+        composite = np.where(accum_count >= min_cases, accum_sum / accum_count, np.nan)
 
-    # Add overlay if computed
-    if overlay and ov_accum_sum is not None:
-        ov_composite = np.where(ov_accum_count >= min_cases, ov_accum_sum / ov_accum_count, np.nan)
-        ov_display, _, ov_cmap, ov_units, ov_vmin, ov_vmax = VARIABLES[overlay]
-        clean_ov = _clean_2d(ov_composite)
-        flat = [v for row in clean_ov for v in row if v is not None]
-        result["overlay"] = {
-            "display_name": ov_display,
-            "key": overlay,
-            "units": ov_units,
-            "azimuthal_mean": clean_ov,
-            "vmin": min(flat) if flat else ov_vmin,
-            "vmax": max(flat) if flat else ov_vmax,
+        result = {
+            "azimuthal_mean": _clean_2d(composite),
+            "radius_rrmw": [round(float(r), 3) for r in r_centers],
+            "height_km": [round(float(h), 2) for h in height_km],
+            "normalized": True,
+            "coverage_min": coverage_min,
+            "min_cases_per_bin": min_cases,
+            "n_cases": n_processed,
+            "n_matched": len(matching),
+            "n_with_rmw": len(cases_with_rmw),
+            "case_list": _build_case_list(processed_indices, data_type),
+            "variable": {
+                "key": variable,
+                "display_name": display_name,
+                "units": units,
+                "vmin": vmin,
+                "vmax": vmax,
+                "colorscale": _cmap_to_plotly(cmap),
+            },
+            "filters": {
+                "intensity": [min_intensity, max_intensity],
+                "vmax_change": [min_vmax_change, max_vmax_change],
+                "tilt": [min_tilt, max_tilt],
+                "year": [min_year, max_year],
+                "shear_mag": [min_shear_mag, max_shear_mag],
+                "shear_dir": [min_shear_dir, max_shear_dir],
+            },
         }
 
-    return JSONResponse(result)
+        if overlay and ov_accum_sum is not None:
+            ov_composite = np.where(ov_accum_count >= min_cases, ov_accum_sum / ov_accum_count, np.nan)
+            ov_display, _, ov_cmap, ov_units, ov_vmin, ov_vmax = VARIABLES[overlay]
+            clean_ov = _clean_2d(ov_composite)
+            flat = [v for row in clean_ov for v in row if v is not None]
+            result["overlay"] = {
+                "display_name": ov_display,
+                "key": overlay,
+                "units": ov_units,
+                "azimuthal_mean": clean_ov,
+                "vmin": min(flat) if flat else ov_vmin,
+                "vmax": max(flat) if flat else ov_vmax,
+            }
+        return result
+
+    if stream:
+        return _streaming_composite_response(_compute)
+    return JSONResponse(_compute())
 
 
 @app.get("/composite/quadrant_mean")
@@ -2551,6 +2612,7 @@ def composite_quadrant_mean(
     max_r_rmw:     float = Query(8.0,   ge=1, le=20,    description="Max radius in R/RMW"),
     dr_rmw:        float = Query(0.25,  ge=0.1, le=2,   description="Radial bin width in R/RMW"),
     coverage_min:  float = Query(0.25,  ge=0.0, le=1.0),
+    stream:        bool  = Query(False,                  description="Stream NDJSON progress events"),
     min_intensity:  float = Query(0),    max_intensity:  float = Query(200),
     min_vmax_change:float = Query(-100), max_vmax_change:float = Query(85),
     min_tilt:       float = Query(0),    max_tilt:       float = Query(200),
@@ -2597,15 +2659,7 @@ def composite_quadrant_mean(
     height_km = first_ds["height"].values
     x_coords, y_coords, h_axis = _resolve_grid_and_haxis(first_ds, ref_varname)
 
-    accum_sum = None
-    accum_count = None
-    ov_accum_sum = None
-    ov_accum_count = None
-    r_centers = None
-    n_processed = 0
-    processed_indices = []
-
-    # Process cases in batches — keeps peak memory bounded on 512 MB servers.
+    # Process cases in batches — keeps peak memory bounded on the 2 GB Render plan.
     work_items = [
         (case_idx, sddc, rmw, variable, overlay, data_type,
          x_coords, y_coords, height_km, h_axis,
@@ -2613,90 +2667,102 @@ def composite_quadrant_mean(
         for case_idx, sddc, rmw in valid_cases
     ]
 
-    def _accum_quad(result):
-        nonlocal accum_sum, accum_count, ov_accum_sum, ov_accum_count
-        nonlocal r_centers, n_processed
-        case_idx, quad_means, rc, ov_quads = result
-        if accum_sum is None:
-            r_centers = rc
-            accum_sum = {q: np.zeros_like(quad_means[q]) for q in QUADRANT_DEFS}
-            accum_count = {q: np.zeros_like(quad_means[q]) for q in QUADRANT_DEFS}
-        for q in QUADRANT_DEFS:
-            valid = ~np.isnan(quad_means[q])
-            accum_sum[q][valid] += quad_means[q][valid]
-            accum_count[q][valid] += 1
-        if ov_quads is not None:
-            if ov_accum_sum is None:
-                ov_accum_sum = {q: np.zeros_like(ov_quads[q]) for q in QUADRANT_DEFS}
-                ov_accum_count = {q: np.zeros_like(ov_quads[q]) for q in QUADRANT_DEFS}
+    def _compute(progress_cb=None):
+        accum_sum = None
+        accum_count = None
+        ov_accum_sum = None
+        ov_accum_count = None
+        r_centers = None
+        n_processed = 0
+        processed_indices = []
+
+        def _accum_quad(result):
+            nonlocal accum_sum, accum_count, ov_accum_sum, ov_accum_count
+            nonlocal r_centers, n_processed
+            case_idx, quad_means, rc, ov_quads = result
+            if accum_sum is None:
+                r_centers = rc
+                accum_sum = {q: np.zeros_like(quad_means[q]) for q in QUADRANT_DEFS}
+                accum_count = {q: np.zeros_like(quad_means[q]) for q in QUADRANT_DEFS}
             for q in QUADRANT_DEFS:
-                ov_valid = ~np.isnan(ov_quads[q])
-                ov_accum_sum[q][ov_valid] += ov_quads[q][ov_valid]
-                ov_accum_count[q][ov_valid] += 1
-        n_processed += 1
-        processed_indices.append(case_idx)
+                valid = ~np.isnan(quad_means[q])
+                accum_sum[q][valid] += quad_means[q][valid]
+                accum_count[q][valid] += 1
+            if ov_quads is not None:
+                if ov_accum_sum is None:
+                    ov_accum_sum = {q: np.zeros_like(ov_quads[q]) for q in QUADRANT_DEFS}
+                    ov_accum_count = {q: np.zeros_like(ov_quads[q]) for q in QUADRANT_DEFS}
+                for q in QUADRANT_DEFS:
+                    ov_valid = ~np.isnan(ov_quads[q])
+                    ov_accum_sum[q][ov_valid] += ov_quads[q][ov_valid]
+                    ov_accum_count[q][ov_valid] += 1
+            n_processed += 1
+            processed_indices.append(case_idx)
 
-    _process_composites_batched(_process_one_case_quadrant, work_items, _accum_quad)
+        _process_composites_batched(
+            _process_one_case_quadrant, work_items, _accum_quad,
+            progress_cb=progress_cb,
+        )
 
-    if n_processed == 0:
-        raise HTTPException(status_code=500, detail="Could not process any matching cases.")
+        if n_processed == 0:
+            raise RuntimeError("Could not process any matching cases.")
 
-    # Require each grid cell to have data from at least 33% of processed cases
-    # (or 3, whichever is greater) to suppress noisy bins with sparse sampling
-    min_cases = max(3, int(np.ceil(0.33 * n_processed)))
-    composite = {}
-    for q in QUADRANT_DEFS:
-        composite[q] = np.where(accum_count[q] >= min_cases, accum_sum[q] / accum_count[q], np.nan)
-
-    result = {
-        "quadrant_means": {q: {"data": _clean_2d(composite[q])} for q in QUADRANT_DEFS},
-        "radius_rrmw": [round(float(r), 3) for r in r_centers],
-        "height_km": [round(float(h), 2) for h in height_km],
-        "normalized": True,
-        "coverage_min": coverage_min,
-        "min_cases_per_bin": min_cases,
-        "n_cases": n_processed,
-        "n_matched": len(matching),
-        "n_with_shear_and_rmw": len(valid_cases),
-        "case_list": _build_case_list(processed_indices, data_type),
-        "variable": {
-            "key": variable,
-            "display_name": display_name,
-            "units": units,
-            "vmin": vmin,
-            "vmax": vmax,
-            "colorscale": _cmap_to_plotly(cmap),
-        },
-        "filters": {
-            "intensity": [min_intensity, max_intensity],
-            "vmax_change": [min_vmax_change, max_vmax_change],
-            "tilt": [min_tilt, max_tilt],
-            "year": [min_year, max_year],
-            "shear_mag": [min_shear_mag, max_shear_mag],
-            "shear_dir": [min_shear_dir, max_shear_dir],
-        },
-    }
-
-    # Add overlay if computed
-    if overlay and ov_accum_sum is not None:
-        ov_display, _, ov_cmap, ov_units, ov_vmin, ov_vmax = VARIABLES[overlay]
-        ov_composite = {}
-        all_flat = []
+        min_cases = max(3, int(np.ceil(0.33 * n_processed)))
+        composite = {}
         for q in QUADRANT_DEFS:
-            ov_composite[q] = np.where(ov_accum_count[q] >= min_cases, ov_accum_sum[q] / ov_accum_count[q], np.nan)
-            clean_q = _clean_2d(ov_composite[q])
-            ov_composite[q] = clean_q
-            all_flat.extend(v for row in clean_q for v in row if v is not None)
-        result["overlay"] = {
-            "display_name": ov_display,
-            "key": overlay,
-            "units": ov_units,
-            "quadrant_means": {q: {"data": ov_composite[q]} for q in QUADRANT_DEFS},
-            "vmin": min(all_flat) if all_flat else ov_vmin,
-            "vmax": max(all_flat) if all_flat else ov_vmax,
+            composite[q] = np.where(accum_count[q] >= min_cases, accum_sum[q] / accum_count[q], np.nan)
+
+        result = {
+            "quadrant_means": {q: {"data": _clean_2d(composite[q])} for q in QUADRANT_DEFS},
+            "radius_rrmw": [round(float(r), 3) for r in r_centers],
+            "height_km": [round(float(h), 2) for h in height_km],
+            "normalized": True,
+            "coverage_min": coverage_min,
+            "min_cases_per_bin": min_cases,
+            "n_cases": n_processed,
+            "n_matched": len(matching),
+            "n_with_shear_and_rmw": len(valid_cases),
+            "case_list": _build_case_list(processed_indices, data_type),
+            "variable": {
+                "key": variable,
+                "display_name": display_name,
+                "units": units,
+                "vmin": vmin,
+                "vmax": vmax,
+                "colorscale": _cmap_to_plotly(cmap),
+            },
+            "filters": {
+                "intensity": [min_intensity, max_intensity],
+                "vmax_change": [min_vmax_change, max_vmax_change],
+                "tilt": [min_tilt, max_tilt],
+                "year": [min_year, max_year],
+                "shear_mag": [min_shear_mag, max_shear_mag],
+                "shear_dir": [min_shear_dir, max_shear_dir],
+            },
         }
 
-    return JSONResponse(result)
+        if overlay and ov_accum_sum is not None:
+            ov_display, _, ov_cmap, ov_units, ov_vmin, ov_vmax = VARIABLES[overlay]
+            ov_composite = {}
+            all_flat = []
+            for q in QUADRANT_DEFS:
+                ov_composite[q] = np.where(ov_accum_count[q] >= min_cases, ov_accum_sum[q] / ov_accum_count[q], np.nan)
+                clean_q = _clean_2d(ov_composite[q])
+                ov_composite[q] = clean_q
+                all_flat.extend(v for row in clean_q for v in row if v is not None)
+            result["overlay"] = {
+                "display_name": ov_display,
+                "key": overlay,
+                "units": ov_units,
+                "quadrant_means": {q: {"data": ov_composite[q]} for q in QUADRANT_DEFS},
+                "vmin": min(all_flat) if all_flat else ov_vmin,
+                "vmax": max(all_flat) if all_flat else ov_vmax,
+            }
+        return result
+
+    if stream:
+        return _streaming_composite_response(_compute)
+    return JSONResponse(_compute())
 
 
 # ---------------------------------------------------------------------------
@@ -2714,6 +2780,7 @@ def composite_plan_view(
     dr_rmw:         float = Query(0.1,  ge=0.05, le=1,    description="Grid spacing in R/RMW"),
     shear_relative: bool  = Query(False,                   description="Rotate to shear-relative frame?"),
     coverage_min:   float = Query(0.25, ge=0.0,  le=1.0,  description="Min coverage fraction"),
+    stream:         bool  = Query(False,                  description="Stream NDJSON progress events"),
     min_intensity:  float = Query(0),    max_intensity:  float = Query(200),
     min_vmax_change:float = Query(-100), max_vmax_change:float = Query(85),
     min_tilt:       float = Query(0),    max_tilt:       float = Query(200),
@@ -2788,14 +2855,7 @@ def composite_plan_view(
     # ------------------------------------------------------------------
     # Parallel processing
     # ------------------------------------------------------------------
-    accum_sum = None
-    accum_count = None
-    ov_accum_sum = None
-    ov_accum_count = None
-    n_processed = 0
-    processed_indices: list[int] = []
-
-    # Process cases in batches — keeps peak memory bounded on 512 MB servers.
+    # Process cases in batches — keeps peak memory bounded on the 2 GB Render plan.
     work_items = [
         (ci, rmw, sddc, variable, overlay, data_type,
          x_coords, y_coords, z_idx,
@@ -2803,100 +2863,109 @@ def composite_plan_view(
         for ci, rmw, sddc in cases_ready
     ]
 
-    def _accum_pv(result):
-        nonlocal accum_sum, accum_count, ov_accum_sum, ov_accum_count, n_processed
-        ci, plan_2d, x_grid, y_grid, ov_2d = result
-        if accum_sum is None:
-            accum_sum = np.zeros((len(y_grid), len(x_grid)))
-            accum_count = np.zeros_like(accum_sum)
-        valid = ~np.isnan(plan_2d)
-        accum_sum[valid] += plan_2d[valid]
-        accum_count[valid] += 1
-        if ov_2d is not None:
-            if ov_accum_sum is None:
-                ov_accum_sum = np.zeros_like(ov_2d)
-                ov_accum_count = np.zeros_like(ov_2d)
-            ov_valid = ~np.isnan(ov_2d)
-            ov_accum_sum[ov_valid] += ov_2d[ov_valid]
-            ov_accum_count[ov_valid] += 1
-        n_processed += 1
-        processed_indices.append(ci)
+    def _compute(progress_cb=None):
+        accum_sum = None
+        accum_count = None
+        ov_accum_sum = None
+        ov_accum_count = None
+        n_processed = 0
+        processed_indices: list[int] = []
 
-    _process_composites_batched(_process_one_case_plan_view, work_items, _accum_pv)
+        def _accum_pv(result):
+            nonlocal accum_sum, accum_count, ov_accum_sum, ov_accum_count, n_processed
+            ci, plan_2d, x_grid, y_grid, ov_2d = result
+            if accum_sum is None:
+                accum_sum = np.zeros((len(y_grid), len(x_grid)))
+                accum_count = np.zeros_like(accum_sum)
+            valid = ~np.isnan(plan_2d)
+            accum_sum[valid] += plan_2d[valid]
+            accum_count[valid] += 1
+            if ov_2d is not None:
+                if ov_accum_sum is None:
+                    ov_accum_sum = np.zeros_like(ov_2d)
+                    ov_accum_count = np.zeros_like(ov_2d)
+                ov_valid = ~np.isnan(ov_2d)
+                ov_accum_sum[ov_valid] += ov_2d[ov_valid]
+                ov_accum_count[ov_valid] += 1
+            n_processed += 1
+            processed_indices.append(ci)
 
-    if n_processed == 0:
-        raise HTTPException(status_code=500, detail="Could not process any matching cases.")
-
-    # ------------------------------------------------------------------
-    # Build composite — same 33 % minimum-cases rule as az-mean
-    # ------------------------------------------------------------------
-    min_cases = max(3, int(np.ceil(0.33 * n_processed)))
-    composite = np.where(accum_count >= min_cases, accum_sum / accum_count, np.nan)
-
-    # Determine output axis arrays & labels
-    if normalize_rmw:
-        half_n = int(round(max_r_rmw / dr_rmw))
-        x_out = np.linspace(-max_r_rmw, max_r_rmw, 2 * half_n + 1)
-        y_out = np.linspace(-max_r_rmw, max_r_rmw, 2 * half_n + 1)
-        x_label = "X / RMW"
-        y_label = "Y / RMW"
-    else:
-        x_out = x_coords
-        y_out = y_coords
-        x_label = "Eastward distance (km)"
-        y_label = "Northward distance (km)"
-
-    result = {
-        "plan_view": _clean_2d(composite),
-        "x_axis": [round(float(v), 3) for v in x_out],
-        "y_axis": [round(float(v), 3) for v in y_out],
-        "x_label": x_label,
-        "y_label": y_label,
-        "level_km": round(actual_level, 2),
-        "normalize_rmw": normalize_rmw,
-        "shear_relative": shear_relative,
-        "coverage_min": coverage_min,
-        "min_cases_per_bin": min_cases,
-        "n_cases": n_processed,
-        "n_matched": len(matching),
-        "n_with_valid_meta": len(cases_ready),
-        "case_list": _build_case_list(processed_indices, data_type),
-        "variable": {
-            "key": variable,
-            "display_name": display_name,
-            "units": units,
-            "vmin": vmin,
-            "vmax": vmax,
-            "colorscale": _cmap_to_plotly(cmap),
-        },
-        "filters": {
-            "intensity": [min_intensity, max_intensity],
-            "vmax_change": [min_vmax_change, max_vmax_change],
-            "tilt": [min_tilt, max_tilt],
-            "year": [min_year, max_year],
-            "shear_mag": [min_shear_mag, max_shear_mag],
-            "shear_dir": [min_shear_dir, max_shear_dir],
-        },
-    }
-
-    # Overlay
-    if overlay and ov_accum_sum is not None:
-        ov_composite = np.where(
-            ov_accum_count >= min_cases, ov_accum_sum / ov_accum_count, np.nan
+        _process_composites_batched(
+            _process_one_case_plan_view, work_items, _accum_pv,
+            progress_cb=progress_cb,
         )
-        ov_display, _, _, ov_units, ov_vmin, ov_vmax = VARIABLES[overlay]
-        clean_ov = _clean_2d(ov_composite)
-        flat = [v for row in clean_ov for v in row if v is not None]
-        result["overlay"] = {
-            "display_name": ov_display,
-            "key": overlay,
-            "units": ov_units,
-            "plan_view": clean_ov,
-            "vmin": min(flat) if flat else ov_vmin,
-            "vmax": max(flat) if flat else ov_vmax,
+
+        if n_processed == 0:
+            raise RuntimeError("Could not process any matching cases.")
+
+        min_cases = max(3, int(np.ceil(0.33 * n_processed)))
+        composite = np.where(accum_count >= min_cases, accum_sum / accum_count, np.nan)
+
+        if normalize_rmw:
+            half_n = int(round(max_r_rmw / dr_rmw))
+            x_out = np.linspace(-max_r_rmw, max_r_rmw, 2 * half_n + 1)
+            y_out = np.linspace(-max_r_rmw, max_r_rmw, 2 * half_n + 1)
+            x_label = "X / RMW"
+            y_label = "Y / RMW"
+        else:
+            x_out = x_coords
+            y_out = y_coords
+            x_label = "Eastward distance (km)"
+            y_label = "Northward distance (km)"
+
+        result = {
+            "plan_view": _clean_2d(composite),
+            "x_axis": [round(float(v), 3) for v in x_out],
+            "y_axis": [round(float(v), 3) for v in y_out],
+            "x_label": x_label,
+            "y_label": y_label,
+            "level_km": round(actual_level, 2),
+            "normalize_rmw": normalize_rmw,
+            "shear_relative": shear_relative,
+            "coverage_min": coverage_min,
+            "min_cases_per_bin": min_cases,
+            "n_cases": n_processed,
+            "n_matched": len(matching),
+            "n_with_valid_meta": len(cases_ready),
+            "case_list": _build_case_list(processed_indices, data_type),
+            "variable": {
+                "key": variable,
+                "display_name": display_name,
+                "units": units,
+                "vmin": vmin,
+                "vmax": vmax,
+                "colorscale": _cmap_to_plotly(cmap),
+            },
+            "filters": {
+                "intensity": [min_intensity, max_intensity],
+                "vmax_change": [min_vmax_change, max_vmax_change],
+                "tilt": [min_tilt, max_tilt],
+                "year": [min_year, max_year],
+                "shear_mag": [min_shear_mag, max_shear_mag],
+                "shear_dir": [min_shear_dir, max_shear_dir],
+            },
         }
 
-    return JSONResponse(result)
+        if overlay and ov_accum_sum is not None:
+            ov_composite = np.where(
+                ov_accum_count >= min_cases, ov_accum_sum / ov_accum_count, np.nan
+            )
+            ov_display, _, _, ov_units, ov_vmin, ov_vmax = VARIABLES[overlay]
+            clean_ov = _clean_2d(ov_composite)
+            flat = [v for row in clean_ov for v in row if v is not None]
+            result["overlay"] = {
+                "display_name": ov_display,
+                "key": overlay,
+                "units": ov_units,
+                "plan_view": clean_ov,
+                "vmin": min(flat) if flat else ov_vmin,
+                "vmax": max(flat) if flat else ov_vmax,
+            }
+        return result
+
+    if stream:
+        return _streaming_composite_response(_compute)
+    return JSONResponse(_compute())
 
 
 # ---------------------------------------------------------------------------
@@ -2991,6 +3060,7 @@ def composite_era5_plan_view(
     include_vectors: bool = Query(False, description="Include vector components"),
     shear_relative: bool = Query(False, description="Rotate to shear-relative frame?"),
     data_type: str = Query("swath", description="'swath' or 'merge'"),
+    stream: bool = Query(False, description="Stream NDJSON progress events"),
 ):
     """Composite mean + std of an ERA5 2D field in storm-relative km coordinates."""
     era5 = get_era5_dataset()
@@ -3032,83 +3102,89 @@ def composite_era5_plan_view(
     target_y_km = _ENV_COMP_GRID_KM.copy()
     grid_shape = (len(target_y_km), len(target_x_km))
 
-    accum_sum = np.zeros(grid_shape, dtype=np.float64)
-    accum_sq = np.zeros(grid_shape, dtype=np.float64)
-    accum_count = np.zeros(grid_shape, dtype=np.float64)
-    vec_u_sum = np.zeros(grid_shape, dtype=np.float64) if include_vectors else None
-    vec_v_sum = np.zeros(grid_shape, dtype=np.float64) if include_vectors else None
-    vec_count = np.zeros(grid_shape, dtype=np.float64) if include_vectors else None
-    processed = []
-
-    # Process cases in batches — keeps peak memory bounded on 512 MB servers.
+    # Process cases in batches — keeps peak memory bounded on the 2 GB Render plan.
     work_items = [
         (ci, field, include_vectors, target_x_km, target_y_km, sddc)
         for ci, sddc in cases_with_sddc
     ]
 
-    def _accum_era5(result):
-        nonlocal vec_u_sum, vec_v_sum, vec_count
-        ci, data_km, vu, vv = result
-        valid = np.isfinite(data_km)
-        accum_sum[valid] += data_km[valid]
-        accum_sq[valid] += data_km[valid] ** 2
-        accum_count[valid] += 1
-        if include_vectors and vu is not None:
-            vu_valid = np.isfinite(vu)
-            vec_u_sum[vu_valid] += vu[vu_valid]
-            vv_valid = np.isfinite(vv)
-            vec_v_sum[vv_valid] += vv[vv_valid]
-            vec_count[vu_valid] += 1
-        processed.append(ci)
+    def _compute(progress_cb=None):
+        accum_sum = np.zeros(grid_shape, dtype=np.float64)
+        accum_sq = np.zeros(grid_shape, dtype=np.float64)
+        accum_count = np.zeros(grid_shape, dtype=np.float64)
+        vec_u_sum = np.zeros(grid_shape, dtype=np.float64) if include_vectors else None
+        vec_v_sum = np.zeros(grid_shape, dtype=np.float64) if include_vectors else None
+        vec_count = np.zeros(grid_shape, dtype=np.float64) if include_vectors else None
+        processed = []
 
-    _process_composites_batched(_process_one_case_era5_plan_view, work_items, _accum_era5)
+        def _accum_era5(result):
+            nonlocal vec_u_sum, vec_v_sum, vec_count
+            ci, data_km, vu, vv = result
+            valid = np.isfinite(data_km)
+            accum_sum[valid] += data_km[valid]
+            accum_sq[valid] += data_km[valid] ** 2
+            accum_count[valid] += 1
+            if include_vectors and vu is not None:
+                vu_valid = np.isfinite(vu)
+                vec_u_sum[vu_valid] += vu[vu_valid]
+                vv_valid = np.isfinite(vv)
+                vec_v_sum[vv_valid] += vv[vv_valid]
+                vec_count[vu_valid] += 1
+            processed.append(ci)
 
-    n_cases = len(processed)
-    if n_cases == 0:
-        raise HTTPException(status_code=404, detail="No valid ERA5 cases processed")
+        _process_composites_batched(
+            _process_one_case_era5_plan_view, work_items, _accum_era5,
+            progress_cb=progress_cb,
+        )
 
-    min_cases = max(2, int(0.33 * n_cases))
-    mean_2d = np.where(accum_count >= min_cases, accum_sum / accum_count, np.nan)
-    variance = np.where(
-        accum_count >= min_cases,
-        accum_sq / accum_count - (accum_sum / accum_count) ** 2,
-        np.nan
-    )
-    std_2d = np.sqrt(np.maximum(variance, 0))
+        n_cases = len(processed)
+        if n_cases == 0:
+            raise RuntimeError("No valid ERA5 cases processed")
 
-    # Crop to radius_km
-    yy, xx = np.meshgrid(target_y_km, target_x_km, indexing='ij')
-    dist = np.sqrt(xx**2 + yy**2)
-    crop_mask = dist > radius_km
-    mean_2d[crop_mask] = np.nan
-    std_2d[crop_mask] = np.nan
+        min_cases = max(2, int(0.33 * n_cases))
+        mean_2d = np.where(accum_count >= min_cases, accum_sum / accum_count, np.nan)
+        variance = np.where(
+            accum_count >= min_cases,
+            accum_sq / accum_count - (accum_sum / accum_count) ** 2,
+            np.nan
+        )
+        std_2d = np.sqrt(np.maximum(variance, 0))
 
-    cfg = ERA5_FIELD_CONFIG[field]
-    response = {
-        "field": field,
-        "field_config": cfg,
-        "mean": _clean_2d(mean_2d),
-        "std": _clean_2d(std_2d),
-        "x_km": [round(float(v), 1) for v in target_x_km],
-        "y_km": [round(float(v), 1) for v in target_y_km],
-        "n_cases": n_cases,
-        "shear_relative": shear_relative,
-        "case_list": _build_case_list(processed, data_type),
-    }
+        yy, xx = np.meshgrid(target_y_km, target_x_km, indexing='ij')
+        dist = np.sqrt(xx**2 + yy**2)
+        crop_mask = dist > radius_km
+        mean_2d[crop_mask] = np.nan
+        std_2d[crop_mask] = np.nan
 
-    if include_vectors and vec_u_sum is not None:
-        vec_mean_u = np.where(vec_count >= min_cases, vec_u_sum / vec_count, np.nan)
-        vec_mean_v = np.where(vec_count >= min_cases, vec_v_sum / vec_count, np.nan)
-        vec_mean_u[crop_mask] = np.nan
-        vec_mean_v[crop_mask] = np.nan
-        stride = max(1, len(target_x_km) // 12)
-        response["vectors"] = {
-            "u": _clean_2d(vec_mean_u[::stride, ::stride]),
-            "v": _clean_2d(vec_mean_v[::stride, ::stride]),
-            "stride": stride,
+        cfg = ERA5_FIELD_CONFIG[field]
+        response = {
+            "field": field,
+            "field_config": cfg,
+            "mean": _clean_2d(mean_2d),
+            "std": _clean_2d(std_2d),
+            "x_km": [round(float(v), 1) for v in target_x_km],
+            "y_km": [round(float(v), 1) for v in target_y_km],
+            "n_cases": n_cases,
+            "shear_relative": shear_relative,
+            "case_list": _build_case_list(processed, data_type),
         }
 
-    return JSONResponse(response)
+        if include_vectors and vec_u_sum is not None:
+            vec_mean_u = np.where(vec_count >= min_cases, vec_u_sum / vec_count, np.nan)
+            vec_mean_v = np.where(vec_count >= min_cases, vec_v_sum / vec_count, np.nan)
+            vec_mean_u[crop_mask] = np.nan
+            vec_mean_v[crop_mask] = np.nan
+            stride = max(1, len(target_x_km) // 12)
+            response["vectors"] = {
+                "u": _clean_2d(vec_mean_u[::stride, ::stride]),
+                "v": _clean_2d(vec_mean_v[::stride, ::stride]),
+                "stride": stride,
+            }
+        return response
+
+    if stream:
+        return _streaming_composite_response(_compute)
+    return JSONResponse(_compute())
 
 
 @app.get("/composite/era5_profiles")
