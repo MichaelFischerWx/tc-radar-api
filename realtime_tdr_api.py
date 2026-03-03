@@ -40,6 +40,8 @@ import xarray as xr
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse, Response
 
+from scipy.interpolate import RegularGridInterpolator
+
 try:
     import requests as _requests
 except ImportError:
@@ -439,6 +441,47 @@ def _interp_tdr_along_track(
         val = (v00 * (1 - wx) * (1 - wy) + v10 * wx * (1 - wy) +
                v01 * (1 - wx) * wy + v11 * wx * wy)
         result[k] = float(val)
+    return result
+
+
+def _interp_tdr_3d_along_track(
+    ds, variable: str,
+    x_pts: np.ndarray, y_pts: np.ndarray, z_pts_km: np.ndarray
+) -> np.ndarray:
+    """
+    Trilinear-interpolate a TDR 3D field to arbitrary (x_km, y_km, height_km)
+    points — i.e. at the aircraft's actual GPS altitude.
+
+    Uses scipy RegularGridInterpolator for efficient 3D interpolation.
+    Returns array of interpolated values (NaN where outside domain).
+    """
+    vol, levels = _extract_3d(ds, variable)  # (level, y, x)
+    x_km, y_km = _get_xy_coords(ds)
+
+    interp = RegularGridInterpolator(
+        (levels.astype(float), y_km.astype(float), x_km.astype(float)),
+        vol.astype(float),
+        method="linear",
+        bounds_error=False,
+        fill_value=np.nan,
+    )
+
+    # Query points: (z, y, x) ordering to match grid axes
+    pts = np.column_stack([z_pts_km, y_pts, x_pts])
+    result = interp(pts)
+
+    # Nearest-neighbor fallback for NaN results
+    nan_mask = np.isnan(result)
+    if np.any(nan_mask):
+        interp_nn = RegularGridInterpolator(
+            (levels.astype(float), y_km.astype(float), x_km.astype(float)),
+            vol.astype(float),
+            method="nearest",
+            bounds_error=False,
+            fill_value=np.nan,
+        )
+        result[nan_mask] = interp_nn(pts[nan_mask])
+
     return result
 
 
@@ -2173,14 +2216,26 @@ def get_flight_level(
         tdr_05 = _interp_tdr_along_track(ds, "WIND_SPEED", 0.5, x_arr, y_arr)
         tdr_20 = _interp_tdr_along_track(ds, "WIND_SPEED", 2.0, x_arr, y_arr)
 
+        # 3D interpolation at aircraft altitude
+        z_arr = np.array([
+            (o.get("gps_alt_m") or 0) / 1000.0 for o in averaged_obs
+        ], dtype=float)
+        has_alt = np.any(z_arr > 0)
+        if has_alt:
+            tdr_fl = _interp_tdr_3d_along_track(ds, "WIND_SPEED", x_arr, y_arr, z_arr)
+        else:
+            tdr_fl = np.full(len(averaged_obs), np.nan)
+
         for i, obs in enumerate(averaged_obs):
             obs["tdr_wspd_0p5km"] = round(float(tdr_05[i]), 2) if not np.isnan(tdr_05[i]) else None
             obs["tdr_wspd_2km"]   = round(float(tdr_20[i]), 2) if not np.isnan(tdr_20[i]) else None
+            obs["tdr_wspd_fl_alt"] = round(float(tdr_fl[i]), 2) if not np.isnan(tdr_fl[i]) else None
     except Exception:
         # Graceful fallback: if TDR interpolation fails, leave fields as None
         for obs in averaged_obs:
             obs.setdefault("tdr_wspd_0p5km", None)
             obs.setdefault("tdr_wspd_2km", None)
+            obs.setdefault("tdr_wspd_fl_alt", None)
 
     # Compute summary statistics from the RAW 1-Hz data for accuracy
     fl_wspds = [o["fl_wspd_ms"] for o in raw_obs if o["fl_wspd_ms"] is not None]
