@@ -3059,6 +3059,211 @@ def composite_plan_view(
 
 
 # ---------------------------------------------------------------------------
+# Composite CFAD (Contoured Frequency by Altitude Diagram) endpoint
+# ---------------------------------------------------------------------------
+
+def _process_one_case_cfad(case_idx, variable, data_type, height_km, h_axis,
+                           x_coords, y_coords, bin_edges, max_radius_km,
+                           rmw=None):
+    """
+    Process a single case for CFAD: at each height, histogram all spatial
+    pixel values into the caller-supplied bin_edges.
+
+    If rmw is given and > 0, only pixels within max_radius_km * rmw (treated
+    as R/RMW limit) are included.  Otherwise max_radius_km is used directly.
+
+    Returns (case_idx, histogram_2d) where histogram_2d has shape
+    (n_heights, n_bins) — raw counts — or None on failure.
+    """
+    try:
+        ds, local_idx = resolve_case(case_idx, data_type)
+        vol, _ = _extract_3d_volume(ds, local_idx, variable)
+
+        n_heights = len(height_km)
+        n_bins = len(bin_edges) - 1
+
+        # 2-D radius mask
+        xx, yy = np.meshgrid(x_coords, y_coords)
+        rr = np.sqrt(xx**2 + yy**2)
+        if rmw is not None and rmw > 0:
+            # max_radius_km here acts as max R/RMW when normalising
+            radius_mask = (rr / rmw) <= max_radius_km
+        else:
+            radius_mask = rr <= max_radius_km
+
+        hist_2d = np.zeros((n_heights, n_bins), dtype=np.float64)
+
+        for h in range(n_heights):
+            if h_axis == 0:
+                slab = vol[h, :, :]
+            elif h_axis == 2:
+                slab = vol[:, :, h]
+            else:
+                slab = vol[:, h, :]
+
+            vals = slab[radius_mask & ~np.isnan(slab)]
+            if len(vals) == 0:
+                continue
+            counts, _ = np.histogram(vals, bins=bin_edges)
+            hist_2d[h, :] = counts
+
+        return (case_idx, hist_2d)
+    except Exception as e:
+        print(f"Composite CFAD: skipping case {case_idx}: {e}")
+        return None
+
+
+@app.get("/composite/cfad")
+def composite_cfad(
+    variable:      str   = Query(DEFAULT_VARIABLE,       description="Variable key"),
+    data_type:     str   = Query("swath",                description="'swath' or 'merge'"),
+    bin_min:       float = Query(None,                   description="Lower edge of first bin (auto from variable if omitted)"),
+    bin_max:       float = Query(None,                   description="Upper edge of last bin (auto from variable if omitted)"),
+    bin_width:     float = Query(None,                   description="Bin width (auto-calculated if omitted)"),
+    n_bins:        int   = Query(40,   ge=5, le=200,     description="Number of bins (used when bin_width not given)"),
+    max_radius:    float = Query(200,  ge=10, le=500,    description="Maximum radius (km, or R/RMW if use_rmw)"),
+    use_rmw:       bool  = Query(False,                  description="Normalise radius by RMW (max_radius becomes R/RMW limit)"),
+    normalise:     str   = Query("total",                description="'total' = % of all pixels; 'height' = % at each level; 'raw' = counts"),
+    stream:        bool  = Query(False,                  description="Stream NDJSON progress events"),
+    min_intensity:  float = Query(0),    max_intensity:  float = Query(200),
+    min_vmax_change:float = Query(-100), max_vmax_change:float = Query(85),
+    min_tilt:       float = Query(0),    max_tilt:       float = Query(200),
+    min_year:       int   = Query(1997), max_year:       int   = Query(2024),
+    min_shear_mag:  float = Query(0),    max_shear_mag:  float = Query(100),
+    min_shear_dir:  float = Query(0),    max_shear_dir:  float = Query(360),
+):
+    """Compute a Contoured Frequency by Altitude Diagram across matching cases."""
+    if variable not in VARIABLES:
+        raise HTTPException(status_code=400, detail=f"Unknown variable '{variable}'.")
+    if data_type not in ("swath", "merge"):
+        raise HTTPException(status_code=400, detail="data_type must be 'swath' or 'merge'")
+    if normalise not in ("total", "height", "raw"):
+        raise HTTPException(status_code=400, detail="normalise must be 'total', 'height', or 'raw'")
+
+    meta_cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
+    matching = _filter_cases_for_composite(
+        min_intensity, max_intensity, min_vmax_change, max_vmax_change,
+        min_tilt, max_tilt, min_year, max_year,
+        min_shear_mag, max_shear_mag, min_shear_dir, max_shear_dir,
+        data_type=data_type,
+    )
+    if not matching:
+        raise HTTPException(status_code=400, detail="No cases match the specified criteria.")
+    if len(matching) > _COMPOSITE_MAX_CASES:
+        matching = matching[:_COMPOSITE_MAX_CASES]
+
+    display_name, varname, cmap, units, vmin, vmax = VARIABLES[variable]
+    ref_varname = DERIVED_VARIABLES[variable][0] if variable in DERIVED_VARIABLES else varname
+
+    # Determine bin edges
+    b_min = bin_min if bin_min is not None else vmin
+    b_max = bin_max if bin_max is not None else vmax
+    if bin_width is not None and bin_width > 0:
+        bin_edges = np.arange(b_min, b_max + bin_width * 0.5, bin_width)
+    else:
+        bin_edges = np.linspace(b_min, b_max, n_bins + 1)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+    actual_n_bins = len(bin_centers)
+
+    # Pre-fetch grid info
+    first_ds, _ = resolve_case(matching[0], data_type)
+    height_km = first_ds["height"].values
+    x_coords, y_coords, h_axis = _resolve_grid_and_haxis(first_ds, ref_varname)
+
+    # Optionally use RMW normalisation for the radius mask
+    if use_rmw:
+        cases_to_process = []
+        for ci in matching:
+            rmw = meta_cache.get(ci, {}).get("rmw_km")
+            if rmw is not None and not np.isnan(float(rmw)) and float(rmw) > 0:
+                cases_to_process.append((ci, float(rmw)))
+        if not cases_to_process:
+            raise HTTPException(status_code=400, detail="No matching cases have valid RMW data.")
+    else:
+        cases_to_process = [(ci, None) for ci in matching]
+
+    work_items = [
+        (case_idx, variable, data_type, height_km, h_axis,
+         x_coords, y_coords, bin_edges, max_radius,
+         rmw)
+        for case_idx, rmw in cases_to_process
+    ]
+
+    def _compute(progress_cb=None):
+        accum = None
+        n_processed = 0
+        processed_indices = []
+
+        def _accum_cfad(result):
+            nonlocal accum, n_processed
+            case_idx, hist_2d = result
+            if accum is None:
+                accum = np.zeros_like(hist_2d)
+            accum += hist_2d
+            n_processed += 1
+            processed_indices.append(case_idx)
+
+        _process_composites_batched(
+            _process_one_case_cfad, work_items, _accum_cfad,
+            progress_cb=progress_cb,
+        )
+
+        if n_processed == 0:
+            raise RuntimeError("Could not process any matching cases.")
+
+        # Normalise
+        if normalise == "total":
+            total = np.nansum(accum)
+            if total > 0:
+                cfad_out = (accum / total) * 100.0  # percentage
+            else:
+                cfad_out = accum
+            norm_label = "% of total"
+        elif normalise == "height":
+            row_sums = np.nansum(accum, axis=1, keepdims=True)
+            row_sums[row_sums == 0] = 1  # avoid division by zero
+            cfad_out = (accum / row_sums) * 100.0
+            norm_label = "% at each height"
+        else:
+            cfad_out = accum
+            norm_label = "count"
+
+        return {
+            "cfad": _clean_2d(cfad_out),
+            "bin_centers": [round(float(b), 4) for b in bin_centers],
+            "bin_edges": [round(float(b), 4) for b in bin_edges],
+            "bin_width": round(float(bin_edges[1] - bin_edges[0]), 4),
+            "height_km": [round(float(h), 2) for h in height_km],
+            "normalise": normalise,
+            "norm_label": norm_label,
+            "n_cases": n_processed,
+            "n_matched": len(matching),
+            "n_processed": len(cases_to_process),
+            "case_list": _build_case_list(processed_indices, data_type),
+            "variable": {
+                "key": variable,
+                "display_name": display_name,
+                "units": units,
+                "vmin": vmin,
+                "vmax": vmax,
+                "colorscale": _cmap_to_plotly(cmap),
+            },
+            "filters": {
+                "intensity": [min_intensity, max_intensity],
+                "vmax_change": [min_vmax_change, max_vmax_change],
+                "tilt": [min_tilt, max_tilt],
+                "year": [min_year, max_year],
+                "shear_mag": [min_shear_mag, max_shear_mag],
+                "shear_dir": [min_shear_dir, max_shear_dir],
+            },
+        }
+
+    if stream:
+        return _streaming_composite_response(_compute)
+    return JSONResponse(_compute())
+
+
+# ---------------------------------------------------------------------------
 # Environmental composite endpoints (ERA5)
 # ---------------------------------------------------------------------------
 
