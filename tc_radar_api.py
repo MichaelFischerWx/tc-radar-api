@@ -488,6 +488,7 @@ def startup():
             ds = get_dataset(data_type, era)
             print(f"Pre-warmed {data_type}/{era}")
             _enrich_metadata_with_ships(ds, data_type, era)
+            _enrich_metadata_with_max_wind(ds, data_type, era)
         except Exception as e:
             print(f"Pre-warm failed {data_type}/{era}: {e}")
 
@@ -519,6 +520,69 @@ def _enrich_metadata_with_ships(ds, data_type, era):
             cache[case_index]["shdc"] = shdc
         enriched += 1
     print(f"Enriched {enriched} cases with SHIPS shear data ({data_type}/{era})")
+
+
+def _enrich_metadata_with_max_wind(ds, data_type, era):
+    """
+    Enrich metadata cache with maximum earth-relative TDR wind speed at
+    z = 0.5 km and z = 2.0 km for each case.  Runs once per dataset at
+    startup alongside SHIPS enrichment.
+
+    The values are the domain-wide maximum of sqrt(u² + v²) on the 2-D
+    plan-view grid at each height level.  Units: m/s, rounded to 1 dp.
+    """
+    cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
+    early_count = CASE_COUNTS[(data_type, "early")]
+    offset = 0 if era == "early" else early_count
+    n_cases = ds.sizes.get("num_cases", 0)
+
+    # Identify the height indices for 0.5 km and 2.0 km
+    height_vals = ds["height"].values
+    z05_idx = int(np.argmin(np.abs(height_vals - 0.5)))
+    z20_idx = int(np.argmin(np.abs(height_vals - 2.0)))
+
+    # Determine which variable to use
+    u_name = v_name = None
+    for u_cand, v_cand in [
+        ("recentered_earth_relative_eastward_wind", "recentered_earth_relative_northward_wind"),
+        ("recentered_eastward_wind", "recentered_northward_wind"),
+    ]:
+        if u_cand in ds and v_cand in ds:
+            u_name, v_name = u_cand, v_cand
+            break
+
+    has_components = u_name is not None
+    fallback_var = "recentered_wind_speed" if "recentered_wind_speed" in ds else None
+
+    if not has_components and fallback_var is None:
+        print(f"  Skipping max-wind enrichment — no suitable variables ({data_type}/{era})")
+        return
+
+    enriched = 0
+    for local_idx in range(n_cases):
+        case_index = local_idx + offset
+        if case_index not in cache:
+            continue
+        try:
+            for z_idx, field_name in [(z05_idx, "max_er_wspd_05km"), (z20_idx, "max_er_wspd_20km")]:
+                if has_components:
+                    u = ds[u_name].isel(num_cases=local_idx, height=z_idx).values
+                    v = ds[v_name].isel(num_cases=local_idx, height=z_idx).values
+                    wspd = np.sqrt(u**2 + v**2)
+                else:
+                    wspd = ds[fallback_var].isel(num_cases=local_idx, height=z_idx).values
+
+                max_val = float(np.nanmax(wspd))
+                if np.isfinite(max_val):
+                    cache[case_index][field_name] = round(max_val, 1)
+                else:
+                    cache[case_index][field_name] = None
+            enriched += 1
+        except Exception:
+            cache[case_index].setdefault("max_er_wspd_05km", None)
+            cache[case_index].setdefault("max_er_wspd_20km", None)
+
+    print(f"Enriched {enriched} cases with max earth-rel wind speed ({data_type}/{era})")
 
 
 def _filter_cases_for_composite(
@@ -633,6 +697,20 @@ def get_metadata(
     if case_index not in cache:
         raise HTTPException(status_code=404, detail=f"case_index {case_index} not found")
     return JSONResponse(cache[case_index])
+
+
+@app.get("/metadata_all")
+def get_metadata_all(
+    data_type: str = Query("swath", description="'swath' or 'merge'"),
+):
+    """
+    Return all enriched metadata as a JSON array.
+    Includes fields added at startup (SHIPS shear, max earth-rel wind speed).
+    The frontend uses this to populate filters that depend on Zarr-derived data.
+    """
+    cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
+    cases = sorted(cache.values(), key=lambda c: c.get("case_index", 0))
+    return JSONResponse({"total_cases": len(cases), "cases": cases})
 
 
 # ---------------------------------------------------------------------------
