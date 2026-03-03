@@ -3063,17 +3063,27 @@ def composite_plan_view(
 # ---------------------------------------------------------------------------
 
 def _process_one_case_cfad(case_idx, variable, data_type, height_km, h_axis,
-                           x_coords, y_coords, bin_edges, max_radius_km,
-                           rmw=None):
+                           x_coords, y_coords, bin_edges,
+                           min_radius, max_radius,
+                           rmw=None, sddc=None, quadrants=None):
     """
     Process a single case for CFAD: at each height, histogram all spatial
     pixel values into the caller-supplied bin_edges.
 
-    If rmw is given and > 0, only pixels within max_radius_km * rmw (treated
-    as R/RMW limit) are included.  Otherwise max_radius_km is used directly.
+    Parameters
+    ----------
+    min_radius, max_radius : float
+        Radial bounds in km, or in R/RMW if rmw is provided.
+    rmw : float or None
+        If given and > 0, radii are normalised by RMW before applying the
+        min/max radius filter.
+    sddc : float or None
+        Deep-layer shear heading (met deg).  Required when quadrants is set.
+    quadrants : list[str] or None
+        Subset of QUADRANT_DEFS keys (e.g. ["DSL", "DSR"]).  If None or empty,
+        all azimuths are included.
 
-    Returns (case_idx, histogram_2d) where histogram_2d has shape
-    (n_heights, n_bins) — raw counts — or None on failure.
+    Returns (case_idx, histogram_2d) — shape (n_heights, n_bins) — or None.
     """
     try:
         ds, local_idx = resolve_case(case_idx, data_type)
@@ -3082,14 +3092,27 @@ def _process_one_case_cfad(case_idx, variable, data_type, height_km, h_axis,
         n_heights = len(height_km)
         n_bins = len(bin_edges) - 1
 
-        # 2-D radius mask
+        # 2-D radius grid
         xx, yy = np.meshgrid(x_coords, y_coords)
         rr = np.sqrt(xx**2 + yy**2)
         if rmw is not None and rmw > 0:
-            # max_radius_km here acts as max R/RMW when normalising
-            radius_mask = (rr / rmw) <= max_radius_km
+            rr_norm = rr / rmw
         else:
-            radius_mask = rr <= max_radius_km
+            rr_norm = rr
+
+        # Radial annulus mask (min ≤ r ≤ max)
+        spatial_mask = (rr_norm >= min_radius) & (rr_norm <= max_radius)
+
+        # Optional shear-relative quadrant mask
+        if quadrants and sddc is not None:
+            azimuth_math_deg = np.degrees(np.arctan2(yy, xx))
+            azimuth_met = (90.0 - azimuth_math_deg) % 360.0
+            shear_rel_az = (azimuth_met - sddc) % 360.0
+            quad_mask = np.zeros_like(rr, dtype=bool)
+            for qname in quadrants:
+                az_start, az_end = QUADRANT_DEFS[qname]
+                quad_mask |= (shear_rel_az >= az_start) & (shear_rel_az < az_end)
+            spatial_mask = spatial_mask & quad_mask
 
         hist_2d = np.zeros((n_heights, n_bins), dtype=np.float64)
 
@@ -3101,7 +3124,7 @@ def _process_one_case_cfad(case_idx, variable, data_type, height_km, h_axis,
             else:
                 slab = vol[:, h, :]
 
-            vals = slab[radius_mask & ~np.isnan(slab)]
+            vals = slab[spatial_mask & ~np.isnan(slab)]
             if len(vals) == 0:
                 continue
             counts, _ = np.histogram(vals, bins=bin_edges)
@@ -3121,9 +3144,11 @@ def composite_cfad(
     bin_max:       float = Query(None,                   description="Upper edge of last bin (auto from variable if omitted)"),
     bin_width:     float = Query(None,                   description="Bin width (auto-calculated if omitted)"),
     n_bins:        int   = Query(40,   ge=5, le=200,     description="Number of bins (used when bin_width not given)"),
+    min_radius:    float = Query(0,    ge=0,  le=500,    description="Minimum radius (km, or R/RMW if use_rmw)"),
     max_radius:    float = Query(200,  ge=10, le=500,    description="Maximum radius (km, or R/RMW if use_rmw)"),
-    use_rmw:       bool  = Query(False,                  description="Normalise radius by RMW (max_radius becomes R/RMW limit)"),
-    normalise:     str   = Query("total",                description="'total' = % of all pixels; 'height' = % at each level; 'raw' = counts"),
+    use_rmw:       bool  = Query(False,                  description="Normalise radius by RMW (radii become R/RMW)"),
+    quadrants:     str   = Query("",                     description="Shear-relative quadrant filter: comma-separated from DSL,DSR,USL,USR (empty = all)"),
+    normalise:     str   = Query("height",               description="'height' = % at each level (standard CFAD); 'total' = % of all pixels; 'raw' = counts"),
     stream:        bool  = Query(False,                  description="Stream NDJSON progress events"),
     min_intensity:  float = Query(0),    max_intensity:  float = Query(200),
     min_vmax_change:float = Query(-100), max_vmax_change:float = Query(85),
@@ -3139,6 +3164,16 @@ def composite_cfad(
         raise HTTPException(status_code=400, detail="data_type must be 'swath' or 'merge'")
     if normalise not in ("total", "height", "raw"):
         raise HTTPException(status_code=400, detail="normalise must be 'total', 'height', or 'raw'")
+
+    # Parse quadrant filter
+    quad_list = None
+    if quadrants.strip():
+        quad_list = [q.strip().upper() for q in quadrants.split(",") if q.strip()]
+        invalid = [q for q in quad_list if q not in QUADRANT_DEFS]
+        if invalid:
+            raise HTTPException(status_code=400,
+                                detail=f"Invalid quadrant(s): {invalid}. Use DSL, DSR, USL, USR.")
+    need_shear = bool(quad_list)
 
     meta_cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
     matching = _filter_cases_for_composite(
@@ -3170,23 +3205,39 @@ def composite_cfad(
     height_km = first_ds["height"].values
     x_coords, y_coords, h_axis = _resolve_grid_and_haxis(first_ds, ref_varname)
 
-    # Optionally use RMW normalisation for the radius mask
-    if use_rmw:
-        cases_to_process = []
-        for ci in matching:
-            rmw = meta_cache.get(ci, {}).get("rmw_km")
-            if rmw is not None and not np.isnan(float(rmw)) and float(rmw) > 0:
-                cases_to_process.append((ci, float(rmw)))
-        if not cases_to_process:
-            raise HTTPException(status_code=400, detail="No matching cases have valid RMW data.")
-    else:
-        cases_to_process = [(ci, None) for ci in matching]
+    # Build cases list: filter by RMW (if needed) and look up SDDC (if quadrant filtering)
+    cases_to_process = []
+    for ci in matching:
+        meta = meta_cache.get(ci, {})
+        rmw_val = None
+        if use_rmw:
+            rmw = meta.get("rmw_km")
+            if rmw is None or np.isnan(float(rmw)) or float(rmw) <= 0:
+                continue
+            rmw_val = float(rmw)
+        sddc_val = None
+        if need_shear:
+            sddc_val = meta.get("sddc")
+            if sddc_val is None:
+                continue  # skip cases without shear data when quadrant filtering
+        cases_to_process.append((ci, rmw_val, sddc_val))
+
+    if not cases_to_process:
+        detail = "No matching cases have valid "
+        if use_rmw and need_shear:
+            detail += "RMW and shear data."
+        elif use_rmw:
+            detail += "RMW data."
+        else:
+            detail += "shear data."
+        raise HTTPException(status_code=400, detail=detail)
 
     work_items = [
         (case_idx, variable, data_type, height_km, h_axis,
-         x_coords, y_coords, bin_edges, max_radius,
-         rmw)
-        for case_idx, rmw in cases_to_process
+         x_coords, y_coords, bin_edges,
+         min_radius, max_radius,
+         rmw, sddc_val, quad_list)
+        for case_idx, rmw, sddc_val in cases_to_process
     ]
 
     def _compute(progress_cb=None):
@@ -3249,6 +3300,9 @@ def composite_cfad(
                 "colorscale": _cmap_to_plotly(cmap),
             },
             "cfad_colorscale": _cmap_to_plotly("Spectral_r"),
+            "radial_domain": [min_radius, max_radius],
+            "use_rmw": use_rmw,
+            "quadrants": quad_list or [],
             "filters": {
                 "intensity": [min_intensity, max_intensity],
                 "vmax_change": [min_vmax_change, max_vmax_change],
