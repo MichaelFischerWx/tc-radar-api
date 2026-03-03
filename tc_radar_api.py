@@ -3316,6 +3316,74 @@ def _hrd_parse_directory(url: str) -> list[str]:
     return links
 
 
+def _parse_hrd_trak(text: str) -> list[tuple]:
+    """
+    Parse an HRD .trak file into a list of (datetime, lat, lon) tuples.
+
+    Format (whitespace-delimited, 2-minute intervals):
+        Track for Katrina              2005
+        Date         Time (UTC)   Latitude    Longitude
+        MM/DD/Year   HH:MM:SS      (deg)        (deg)
+        08/23/2005   18:49:02    23.239 N    75.328 W
+        ...
+
+    Returns list of (datetime, lat_degN, lon_degE) tuples.
+    Longitude is converted from degrees West to degrees East (negative).
+    """
+    entries = []
+    for line in text.strip().splitlines():
+        parts = line.split()
+        # Data lines: MM/DD/YYYY HH:MM:SS lat N/S lon E/W
+        if len(parts) < 6:
+            continue
+        # First field must look like a date MM/DD/YYYY
+        date_str = parts[0]
+        if date_str.count('/') != 2:
+            continue
+        time_str = parts[1]
+        if time_str.count(':') < 1:
+            continue
+        try:
+            dt = datetime.strptime(f"{date_str} {time_str}", "%m/%d/%Y %H:%M:%S")
+        except ValueError:
+            continue
+        try:
+            lat_val = float(parts[2])
+            lat_hem = parts[3].upper() if len(parts) > 3 else 'N'
+            lon_val = float(parts[4])
+            lon_hem = parts[5].upper() if len(parts) > 5 else 'W'
+        except (ValueError, IndexError):
+            continue
+        if lat_hem == 'S':
+            lat_val = -lat_val
+        # Convert to degrees East (standard): W → negative
+        if lon_hem == 'W':
+            lon_val = -lon_val
+        entries.append((dt, lat_val, lon_val))
+    return entries
+
+
+def _get_trak_center(
+    trak_entries: list[tuple], target_dt: datetime, max_offset_min: float = 30.0
+) -> tuple:
+    """
+    Find the .trak entry closest to target_dt within max_offset_min.
+    Returns (lat, lon) or (None, None) if no entry is close enough.
+    """
+    if not trak_entries:
+        return None, None
+    best_dt_diff = float('inf')
+    best_lat, best_lon = None, None
+    for dt, lat, lon in trak_entries:
+        diff = abs((dt - target_dt).total_seconds())
+        if diff < best_dt_diff:
+            best_dt_diff = diff
+            best_lat, best_lon = lat, lon
+    if best_dt_diff <= max_offset_min * 60:
+        return best_lat, best_lon
+    return None, None
+
+
 def _merge_hrd_header_tokens(line: str, expected_ncols: int) -> list[str]:
     """
     Parse a whitespace-aligned header/units line into tokens, merging
@@ -3911,24 +3979,25 @@ def get_archive_flight_level(
     storm_name = case_meta.get("storm_name", "").strip()
     mission_id = case_meta.get("mission_id", "").strip()
     dt_str = case_meta.get("datetime", "")
-    # Get storm center lat/lon from ERA5 or IR Zarr store
+    # Get storm center lat/lon — prefer the TDR WCM recentered center so
+    # that FL positions align with the TDR plan-view grid.  Fallback to
+    # HRD .trak file (2-min center fixes), then ERA5 / IR best-track.
     center_lat = None
     center_lon = None
+    _center_source = None
+    # --- Priority 1: TDR Zarr WCM recentered TC center ---
+    _tdr_ds, _tdr_li = None, None
     try:
-        era5 = get_era5_dataset()
-        if era5 is not None and 'center_lat' in era5:
-            center_lat = float(era5['center_lat'][case_index])
-            center_lon = float(era5['center_lon'][case_index])
+        _tdr_ds, _tdr_li = resolve_case(case_index, data_type)
+        if 'center_lat' in _tdr_ds and 'center_lon' in _tdr_ds:
+            center_lat = float(_tdr_ds['center_lat'].values[_tdr_li])
+            center_lon = float(_tdr_ds['center_lon'].values[_tdr_li])
+            _center_source = "tdr_zarr"
     except Exception:
         pass
-    if center_lat is None:
-        try:
-            ir_store = get_ir_dataset()
-            if ir_store is not None and 'center_lat' in ir_store:
-                center_lat = float(ir_store['center_lat'][case_index])
-                center_lon = float(ir_store['center_lon'][case_index])
-        except Exception:
-            pass
+    # Priorities 2-4 (.trak, ERA5, IR) are applied after the HRD
+    # directory is resolved, since the .trak file lives in that directory
+    # and we need scan_dt to find the closest entry.
 
     if not mission_id:
         result = {
@@ -3975,6 +4044,41 @@ def get_archive_flight_level(
             "message": f"Could not list HRD directory: {e}",
         }
         return JSONResponse(result)
+
+    # --- Priority 2: HRD .trak file (2-min center fixes) ---
+    if center_lat is None:
+        trak_files = [f for f in hrd_files if f.lower().endswith('.trak')]
+        if trak_files:
+            try:
+                trak_text = _hrd_fetch_text(f"{storm_url}{trak_files[0]}", timeout=30)
+                trak_entries = _parse_hrd_trak(trak_text)
+                _trak_lat, _trak_lon = _get_trak_center(trak_entries, scan_dt, max_offset_min=30.0)
+                if _trak_lat is not None:
+                    center_lat = _trak_lat
+                    center_lon = _trak_lon
+                    _center_source = "hrd_trak"
+            except Exception:
+                pass
+    # --- Priority 3: ERA5 best-track center ---
+    if center_lat is None:
+        try:
+            era5 = get_era5_dataset()
+            if era5 is not None and 'center_lat' in era5:
+                center_lat = float(era5['center_lat'][case_index])
+                center_lon = float(era5['center_lon'][case_index])
+                _center_source = "era5"
+        except Exception:
+            pass
+    # --- Priority 4: IR Zarr best-track center ---
+    if center_lat is None:
+        try:
+            ir_store = get_ir_dataset()
+            if ir_store is not None and 'center_lat' in ir_store:
+                center_lat = float(ir_store['center_lat'][case_index])
+                center_lon = float(ir_store['center_lon'][case_index])
+                _center_source = "ir_zarr"
+        except Exception:
+            pass
 
     # Match mission_id to HRD files
     matched_files = _match_hrd_files(mission_id, hrd_files, year=year)
@@ -4082,7 +4186,11 @@ def get_archive_flight_level(
     # add storm motion vector, then compute earth-relative speed.
     # This avoids depending on pre-computed earth-relative fields in the Zarr.
     try:
-        ds, local_idx = resolve_case(case_index, data_type)
+        # Reuse TDR dataset if already resolved for center extraction above
+        if _tdr_ds is not None:
+            ds, local_idx = _tdr_ds, _tdr_li
+        else:
+            ds, local_idx = resolve_case(case_index, data_type)
 
         # Check which Cartesian u/v components are available
         _u_var = None
@@ -4170,6 +4278,7 @@ def get_archive_flight_level(
         "analysis_time": scan_dt.strftime("%Y-%m-%d %H:%M:%SZ"),
         "center_lat": center_lat,
         "center_lon": center_lon,
+        "center_source": _center_source,
         "mission_id": mission_id,
         "storm_name": storm_name,
         "time_window_min": _FL_TIME_WINDOW_MIN,
