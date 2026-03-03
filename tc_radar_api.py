@@ -2203,13 +2203,14 @@ def _regrid_to_rmw_normalized(data_2d, x_phys, y_phys, rmw,
 
 
 # Number of parallel threads for composite S3 reads.
-# 2 keeps concurrent memory usage manageable on the 512 MB Render free tier
-# (~2 concurrent 3D volumes × ~10 MB ≈ 20 MB peak).
-_COMPOSITE_WORKERS = 2
+# 6 threads on the upgraded 2 GB Render plan — each concurrent 3D volume
+# read is ~10–15 MB, so peak thread memory ≈ 6 × 15 MB ≈ 90 MB, well
+# within the ~1.5 GB headroom after base app footprint (~300 MB).
+_COMPOSITE_WORKERS = 6
 
 # Batch size for composite processing — process this many cases at a time,
 # then GC between batches to keep peak memory bounded.
-_COMPOSITE_BATCH_SIZE = 25
+_COMPOSITE_BATCH_SIZE = 50
 
 
 def _process_composites_batched(worker_fn, work_items, accumulate_fn):
