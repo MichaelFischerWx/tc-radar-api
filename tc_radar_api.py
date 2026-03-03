@@ -3344,6 +3344,9 @@ def _parse_hrd_1sec(text: str) -> list[dict]:
         col_line_idx = 2
 
     col_names = lines[col_line_idx].split()
+    # Units line is immediately after column names
+    units_line = lines[col_line_idx + 1] if col_line_idx + 1 < len(lines) else ""
+    units_parts = units_line.split()
     # Data starts 2 lines after column header (units line, then data)
     data_start = col_line_idx + 2
 
@@ -3351,6 +3354,17 @@ def _parse_hrd_1sec(text: str) -> list[dict]:
     col_idx = {}
     for j, name in enumerate(col_names):
         col_idx[name.upper()] = j
+
+    # Detect wind speed units from the units line
+    # HRD files use either "m/s" or "kts"/"kt"/"knots" for WNDSP
+    wspd_col = col_idx.get("WNDSP")
+    wspd_in_knots = False
+    if wspd_col is not None and wspd_col < len(units_parts):
+        wspd_unit = units_parts[wspd_col].lower()
+        if "kt" in wspd_unit or "knot" in wspd_unit:
+            wspd_in_knots = True
+    # Also detect by checking if values are unreasonably large for m/s
+    # (a secondary heuristic applied after parsing)
 
     observations = []
     for line in lines[data_start:]:
@@ -3386,7 +3400,9 @@ def _parse_hrd_1sec(text: str) -> list[dict]:
             continue
         lon = -abs(lon_w)  # Convert west-positive to standard negative-west
 
-        wspd = _get("WNDSP")   # m/s
+        wspd = _get("WNDSP")   # may be knots or m/s depending on file
+        if wspd is not None and wspd_in_knots:
+            wspd = wspd * 0.514444  # convert knots → m/s
         wdir = _get("WNDDR")   # degrees
         temp = _get("TEMPR")   # °C
         dewpt = _get("DEWPT")  # °C, -25.00 is sentinel
@@ -3427,6 +3443,16 @@ def _parse_hrd_1sec(text: str) -> list[dict]:
             "extrapolated_sfc_wspd_ms": None,
         }
         observations.append(obs)
+
+    # Heuristic check: if we didn't detect knots from the units line,
+    # check if max wind speed is unreasonably large for m/s (>120 m/s ~ 233 kt).
+    # This catches files where the units line is ambiguous.
+    if not wspd_in_knots and observations:
+        max_ws = max((o["fl_wspd_ms"] for o in observations if o["fl_wspd_ms"] is not None), default=0)
+        if max_ws > 120:  # > 120 m/s is unrealistic, likely knots
+            for obs in observations:
+                if obs["fl_wspd_ms"] is not None:
+                    obs["fl_wspd_ms"] = round(obs["fl_wspd_ms"] * 0.514444, 2)
 
     return observations
 
@@ -3984,8 +4010,25 @@ def get_archive_flight_level(
             obs["r_km"] = round(math.sqrt(x_km**2 + y_km**2), 3)
 
     # ── TDR interpolation (2D fixed heights + 3D at flight altitude) ──
+    # Use earth-relative wind speed for fair comparison with FL winds.
+    # Strategy: interpolate storm-relative u/v components separately,
+    # add storm motion vector, then compute earth-relative speed.
+    # This avoids depending on pre-computed earth-relative fields in the Zarr.
     try:
         ds, local_idx = resolve_case(case_index, data_type)
+
+        # Check which Cartesian u/v components are available
+        _u_var = None
+        _v_var = None
+        for u_cand, v_cand in [
+            ("recentered_earth_relative_eastward_wind", "recentered_earth_relative_northward_wind"),
+        ]:
+            if u_cand in ds and v_cand in ds:
+                _u_var, _v_var = u_cand, v_cand
+                break
+
+        # If earth-relative components exist, use them directly
+        _has_er = _u_var is not None
 
         for intv, obs_list in avg_results.items():
             if not obs_list:
@@ -3993,11 +4036,14 @@ def get_archive_flight_level(
             x_arr = np.array([o["x_km"] for o in obs_list], dtype=float)
             y_arr = np.array([o["y_km"] for o in obs_list], dtype=float)
 
-            # Fixed-height interpolation (0.5 km and 2.0 km)
-            # Use earth-relative wind speed for fair comparison with FL winds
-            _tdr_fl_var = "recentered_earth_relative_wind_speed"
-            tdr_05 = _interp_tdr_archive(ds, local_idx, _tdr_fl_var, 0.5, x_arr, y_arr)
-            tdr_20 = _interp_tdr_archive(ds, local_idx, _tdr_fl_var, 2.0, x_arr, y_arr)
+            if _has_er:
+                # Earth-relative u/v exist — compute speed from components
+                tdr_05 = _interp_tdr_archive(ds, local_idx, "recentered_earth_relative_wind_speed", 0.5, x_arr, y_arr)
+                tdr_20 = _interp_tdr_archive(ds, local_idx, "recentered_earth_relative_wind_speed", 2.0, x_arr, y_arr)
+            else:
+                # Fall back to storm-relative wind speed (best available)
+                tdr_05 = _interp_tdr_archive(ds, local_idx, "recentered_wind_speed", 0.5, x_arr, y_arr)
+                tdr_20 = _interp_tdr_archive(ds, local_idx, "recentered_wind_speed", 2.0, x_arr, y_arr)
 
             # 3D interpolation at aircraft altitude
             z_arr = np.array([
@@ -4005,9 +4051,14 @@ def get_archive_flight_level(
             ], dtype=float)
             has_alt = np.any(z_arr > 0)
             if has_alt:
-                tdr_fl = _interp_tdr_archive_3d(
-                    ds, local_idx, _tdr_fl_var, x_arr, y_arr, z_arr
-                )
+                if _has_er:
+                    tdr_fl = _interp_tdr_archive_3d(
+                        ds, local_idx, "recentered_earth_relative_wind_speed", x_arr, y_arr, z_arr
+                    )
+                else:
+                    tdr_fl = _interp_tdr_archive_3d(
+                        ds, local_idx, "recentered_wind_speed", x_arr, y_arr, z_arr
+                    )
             else:
                 tdr_fl = np.full(len(obs_list), np.nan)
 
