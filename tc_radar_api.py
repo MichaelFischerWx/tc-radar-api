@@ -3761,7 +3761,9 @@ def _match_hrd_files(mission_id: str, hrd_files: list[str], year: int = None) ->
     mission_prefix = f"{date_str}{aircraft}{num}"
 
     for fname in hrd_files:
-        if not fname.lower().endswith(".txt"):
+        fl = fname.lower()
+        # Accept .sec.txt, .1sec.txt, .1sec, .sec (some older files lack .txt)
+        if not (fl.endswith(".txt") or fl.endswith(".1sec") or fl.endswith(".sec")):
             continue
         # Check if the filename starts with the mission prefix
         fname_upper = fname.upper()
