@@ -3248,6 +3248,7 @@ def composite_cfad(
                 "vmax": vmax,
                 "colorscale": _cmap_to_plotly(cmap),
             },
+            "cfad_colorscale": _cmap_to_plotly("Spectral_r"),
             "filters": {
                 "intensity": [min_intensity, max_intensity],
                 "vmax_change": [min_vmax_change, max_vmax_change],
