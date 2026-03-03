@@ -3316,6 +3316,44 @@ def _hrd_parse_directory(url: str) -> list[str]:
     return links
 
 
+def _merge_hrd_header_tokens(line: str, expected_ncols: int) -> list[str]:
+    """
+    Parse a whitespace-aligned header/units line into tokens, merging
+    multi-word names (e.g. 'D Val', 'Deg N', 'Deg W') by greedily
+    combining the closest-together word pairs until len == expected_ncols.
+    """
+    # Find each word's (start, end, text)
+    words = []
+    i, n = 0, len(line)
+    while i < n:
+        if line[i] != ' ':
+            j = i
+            while j < n and line[j] != ' ':
+                j += 1
+            words.append((i, j, line[i:j]))
+            i = j
+        else:
+            i += 1
+    if len(words) <= expected_ncols:
+        return [w[2] for w in words]
+    # Greedily merge the closest pair of consecutive words until we
+    # reach the expected column count.
+    while len(words) > expected_ncols:
+        min_gap = float('inf')
+        merge_idx = -1
+        for k in range(len(words) - 1):
+            gap = words[k + 1][0] - words[k][1]  # char gap between words
+            if gap < min_gap:
+                min_gap = gap
+                merge_idx = k
+        if merge_idx < 0:
+            break
+        merged = (words[merge_idx][0], words[merge_idx + 1][1],
+                  words[merge_idx][2] + words[merge_idx + 1][2])
+        words = words[:merge_idx] + [merged] + words[merge_idx + 2:]
+    return [w[2] for w in words]
+
+
 def _parse_hrd_1sec(text: str) -> list[dict]:
     """
     Parse an HRD archive 1-second flight-level .sec.txt file.
@@ -3327,6 +3365,8 @@ def _parse_hrd_1sec(text: str) -> list[dict]:
       Line 4: units (HHMMSS, Deg N, Deg W, ...)
       Line 5+: data rows (whitespace-delimited)
 
+    Handles multi-word column names (e.g. 'D Val') and mid-file
+    field-count changes (day-offset flag inserted after midnight).
     Returns list of observation dicts with consistent field names.
     """
     lines = text.strip().splitlines()
@@ -3343,17 +3383,28 @@ def _parse_hrd_1sec(text: str) -> list[dict]:
         # Fallback: assume line index 2 has column names
         col_line_idx = 2
 
-    col_names = lines[col_line_idx].split()
     # Units line is immediately after column names
     units_line = lines[col_line_idx + 1] if col_line_idx + 1 < len(lines) else ""
-    units_parts = units_line.split()
     # Data starts 2 lines after column header (units line, then data)
     data_start = col_line_idx + 2
+
+    # ---------- Determine expected field count from data sample ----------
+    from collections import Counter
+    sample_counts = Counter()
+    for sline in lines[data_start:min(data_start + 200, len(lines))]:
+        nf = len(sline.split())
+        if nf >= 15:  # skip blank / short lines
+            sample_counts[nf] += 1
+    expected_nf = sample_counts.most_common(1)[0][0] if sample_counts else 19
+
+    # ---------- Parse header with multi-word name merging ----------
+    col_names = _merge_hrd_header_tokens(lines[col_line_idx], expected_nf)
+    units_parts = _merge_hrd_header_tokens(units_line, expected_nf)
 
     # Build column index map
     col_idx = {}
     for j, name in enumerate(col_names):
-        col_idx[name.upper()] = j
+        col_idx[name.upper().replace(" ", "")] = j
 
     # Detect wind speed units from the units line
     # HRD files use either "m/s" or "kts"/"kt"/"knots" for WNDSP
@@ -3363,14 +3414,28 @@ def _parse_hrd_1sec(text: str) -> list[dict]:
         wspd_unit = units_parts[wspd_col].lower()
         if "kt" in wspd_unit or "knot" in wspd_unit:
             wspd_in_knots = True
-    # Also detect by checking if values are unreasonably large for m/s
-    # (a secondary heuristic applied after parsing)
 
     observations = []
     for line in lines[data_start:]:
         parts = line.split()
-        if len(parts) < len(col_names) - 2:  # allow a couple missing at end
+        if len(parts) < expected_nf - 2:  # allow a couple missing at end
             continue
+
+        # --- Handle day-offset flag for flights crossing midnight ---
+        # Some HRD files insert a small integer (day offset, e.g. "1")
+        # at index 1 after midnight, adding one extra field per row.
+        # Detect by checking: parts[0] is TIME (>=6 chars), parts[1] is
+        # a single-digit integer (no decimal point → not a lat value).
+        # This handles both normal +1 field rows AND rows that are
+        # simultaneously missing trailing columns.
+        if len(parts) >= 2 and len(parts[0]) >= 6:
+            p1 = parts[1]
+            if len(p1) <= 2 and '.' not in p1:
+                try:
+                    if 0 <= int(p1) <= 9:
+                        parts = [parts[0]] + parts[2:]  # strip day flag
+                except (ValueError, TypeError):
+                    pass
 
         def _get(name):
             idx = col_idx.get(name.upper())
