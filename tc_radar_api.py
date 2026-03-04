@@ -3136,6 +3136,62 @@ def _process_one_case_cfad(case_idx, variable, data_type, height_km, h_axis,
         return None
 
 
+def _process_one_case_cfad_multi(case_idx, variable, data_type, height_km, h_axis,
+                                  x_coords, y_coords, bin_edges,
+                                  min_radius, max_radius,
+                                  rmw=None, sddc=None, quadrants_unused=None):
+    """
+    Process a single case for MULTI-quadrant CFAD: compute histograms for all
+    four shear-relative quadrants (DSL, DSR, USL, USR) in one data load.
+
+    Returns (case_idx, {qname: hist_2d}) or None.
+    """
+    try:
+        ds, local_idx = resolve_case(case_idx, data_type)
+        vol, _ = _extract_3d_volume(ds, local_idx, variable)
+
+        n_heights = len(height_km)
+        n_bins = len(bin_edges) - 1
+
+        xx, yy = np.meshgrid(x_coords, y_coords)
+        rr = np.sqrt(xx**2 + yy**2)
+        if rmw is not None and rmw > 0:
+            rr_norm = rr / rmw
+        else:
+            rr_norm = rr
+
+        # Radial annulus mask
+        radial_mask = (rr_norm >= min_radius) & (rr_norm <= max_radius)
+
+        # Compute shear-relative azimuths
+        azimuth_math_deg = np.degrees(np.arctan2(yy, xx))
+        azimuth_met = (90.0 - azimuth_math_deg) % 360.0
+        shear_rel_az = (azimuth_met - sddc) % 360.0
+
+        quad_hists = {}
+        for qname, (az_start, az_end) in QUADRANT_DEFS.items():
+            quad_mask = radial_mask & (shear_rel_az >= az_start) & (shear_rel_az < az_end)
+            hist_2d = np.zeros((n_heights, n_bins), dtype=np.float64)
+            for h in range(n_heights):
+                if h_axis == 0:
+                    slab = vol[h, :, :]
+                elif h_axis == 2:
+                    slab = vol[:, :, h]
+                else:
+                    slab = vol[:, h, :]
+                vals = slab[quad_mask & ~np.isnan(slab)]
+                if len(vals) == 0:
+                    continue
+                counts, _ = np.histogram(vals, bins=bin_edges)
+                hist_2d[h, :] = counts
+            quad_hists[qname] = hist_2d
+
+        return (case_idx, quad_hists)
+    except Exception as e:
+        print(f"Composite CFAD-MULTI: skipping case {case_idx}: {e}")
+        return None
+
+
 @app.get("/composite/cfad")
 def composite_cfad(
     variable:      str   = Query(DEFAULT_VARIABLE,       description="Variable key"),
@@ -3166,14 +3222,15 @@ def composite_cfad(
         raise HTTPException(status_code=400, detail="normalise must be 'total', 'height', or 'raw'")
 
     # Parse quadrant filter
+    multi_mode = quadrants.strip().upper() == "MULTI"
     quad_list = None
-    if quadrants.strip():
+    if not multi_mode and quadrants.strip():
         quad_list = [q.strip().upper() for q in quadrants.split(",") if q.strip()]
         invalid = [q for q in quad_list if q not in QUADRANT_DEFS]
         if invalid:
             raise HTTPException(status_code=400,
-                                detail=f"Invalid quadrant(s): {invalid}. Use DSL, DSR, USL, USR.")
-    need_shear = bool(quad_list)
+                                detail=f"Invalid quadrant(s): {invalid}. Use DSL, DSR, USL, USR, or MULTI.")
+    need_shear = bool(quad_list) or multi_mode
 
     meta_cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
     matching = _filter_cases_for_composite(
@@ -3232,6 +3289,8 @@ def composite_cfad(
             detail += "shear data."
         raise HTTPException(status_code=400, detail=detail)
 
+    # Choose worker function and build work items
+    worker_fn = _process_one_case_cfad_multi if multi_mode else _process_one_case_cfad
     work_items = [
         (case_idx, variable, data_type, height_km, h_axis,
          x_coords, y_coords, bin_edges,
@@ -3240,47 +3299,57 @@ def composite_cfad(
         for case_idx, rmw, sddc_val in cases_to_process
     ]
 
+    def _normalise_array(accum):
+        if normalise == "total":
+            total = np.nansum(accum)
+            if total > 0:
+                return (accum / total) * 100.0
+            return accum
+        elif normalise == "height":
+            row_sums = np.nansum(accum, axis=1, keepdims=True)
+            row_sums[row_sums == 0] = 1
+            return (accum / row_sums) * 100.0
+        return accum  # raw
+
     def _compute(progress_cb=None):
-        accum = None
         n_processed = 0
         processed_indices = []
 
-        def _accum_cfad(result):
-            nonlocal accum, n_processed
-            case_idx, hist_2d = result
-            if accum is None:
-                accum = np.zeros_like(hist_2d)
-            accum += hist_2d
-            n_processed += 1
-            processed_indices.append(case_idx)
+        if multi_mode:
+            accum_multi = {}  # {qname: ndarray}
+
+            def _accum_cfad(result):
+                nonlocal n_processed
+                case_idx, quad_hists = result
+                for qname, hist_2d in quad_hists.items():
+                    if qname not in accum_multi:
+                        accum_multi[qname] = np.zeros_like(hist_2d)
+                    accum_multi[qname] += hist_2d
+                n_processed += 1
+                processed_indices.append(case_idx)
+        else:
+            accum = None
+
+            def _accum_cfad(result):
+                nonlocal accum, n_processed
+                case_idx, hist_2d = result
+                if accum is None:
+                    accum = np.zeros_like(hist_2d)
+                accum += hist_2d
+                n_processed += 1
+                processed_indices.append(case_idx)
 
         _process_composites_batched(
-            _process_one_case_cfad, work_items, _accum_cfad,
+            worker_fn, work_items, _accum_cfad,
             progress_cb=progress_cb,
         )
 
         if n_processed == 0:
             raise RuntimeError("Could not process any matching cases.")
 
-        # Normalise
-        if normalise == "total":
-            total = np.nansum(accum)
-            if total > 0:
-                cfad_out = (accum / total) * 100.0  # percentage
-            else:
-                cfad_out = accum
-            norm_label = "% of total"
-        elif normalise == "height":
-            row_sums = np.nansum(accum, axis=1, keepdims=True)
-            row_sums[row_sums == 0] = 1  # avoid division by zero
-            cfad_out = (accum / row_sums) * 100.0
-            norm_label = "% at each height"
-        else:
-            cfad_out = accum
-            norm_label = "count"
+        norm_label = {"total": "% of total", "height": "% at each height"}.get(normalise, "count")
 
-        return {
-            "cfad": _clean_2d(cfad_out),
+        base_result = {
             "bin_centers": [round(float(b), 4) for b in bin_centers],
             "bin_edges": [round(float(b), 4) for b in bin_edges],
             "bin_width": round(float(bin_edges[1] - bin_edges[0]), 4),
@@ -3302,7 +3371,6 @@ def composite_cfad(
             "cfad_colorscale": _cmap_to_plotly("Spectral_r"),
             "radial_domain": [min_radius, max_radius],
             "use_rmw": use_rmw,
-            "quadrants": quad_list or [],
             "filters": {
                 "intensity": [min_intensity, max_intensity],
                 "vmax_change": [min_vmax_change, max_vmax_change],
@@ -3312,6 +3380,20 @@ def composite_cfad(
                 "shear_dir": [min_shear_dir, max_shear_dir],
             },
         }
+
+        if multi_mode:
+            base_result["multi"] = True
+            base_result["quadrants"] = ["MULTI"]
+            base_result["cfad_multi"] = {
+                qname: _clean_2d(_normalise_array(arr))
+                for qname, arr in accum_multi.items()
+            }
+        else:
+            base_result["multi"] = False
+            base_result["quadrants"] = quad_list or []
+            base_result["cfad"] = _clean_2d(_normalise_array(accum))
+
+        return base_result
 
     if stream:
         return _streaming_composite_response(_compute)
