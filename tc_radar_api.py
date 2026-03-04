@@ -3145,7 +3145,7 @@ def composite_cfad(
     bin_width:     float = Query(None,                   description="Bin width (auto-calculated if omitted)"),
     n_bins:        int   = Query(40,   ge=5, le=200,     description="Number of bins (used when bin_width not given)"),
     min_radius:    float = Query(0,    ge=0,  le=500,    description="Minimum radius (km, or R/RMW if use_rmw)"),
-    max_radius:    float = Query(200,  ge=10, le=500,    description="Maximum radius (km, or R/RMW if use_rmw)"),
+    max_radius:    float = Query(200,  ge=0.1, le=500,   description="Maximum radius (km, or R/RMW if use_rmw)"),
     use_rmw:       bool  = Query(False,                  description="Normalise radius by RMW (radii become R/RMW)"),
     quadrants:     str   = Query("",                     description="Shear-relative quadrant filter: comma-separated from DSL,DSR,USL,USR (empty = all)"),
     normalise:     str   = Query("height",               description="'height' = % at each level (standard CFAD); 'total' = % of all pixels; 'raw' = counts"),
