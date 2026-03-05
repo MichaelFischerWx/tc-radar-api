@@ -5307,7 +5307,7 @@ def anomaly_azimuthal_mean(
 
     cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
     meta = cache.get(case_index, {})
-    display_name, _, _, units, _, _ = VARIABLES[variable]
+    display_name, _, cmap_raw, units, vmin_raw, vmax_raw = VARIABLES[variable]
 
     result["variable"] = {
         "key": variable,
@@ -5316,6 +5316,8 @@ def anomaly_azimuthal_mean(
         "anomaly_units": "σ (standardized)",
         "colorscale": _cmap_to_plotly("RdBu_r"),
         "vmin": -3, "vmax": 3,
+        "raw_vmin": vmin_raw, "raw_vmax": vmax_raw,
+        "raw_colorscale": _cmap_to_plotly(cmap_raw),
     }
     result["case_meta"] = {
         "case_index": case_index,
