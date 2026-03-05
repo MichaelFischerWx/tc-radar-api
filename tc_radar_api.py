@@ -221,6 +221,21 @@ DERIVED_VARIABLES = {
 
 DEFAULT_VARIABLE = "recentered_tangential_wind"
 
+# Mapping: any variable key → its merged climatology equivalent.
+# The climatology was computed only for merged_* variables, so we map
+# recentered, total_recentered, and swath variants to their merged counterpart.
+_CLIMO_VAR_MAP = {}
+_MERGED_BASES = [
+    "tangential_wind", "radial_wind", "upward_air_velocity",
+    "reflectivity", "wind_speed", "relative_vorticity", "divergence",
+]
+for _base in _MERGED_BASES:
+    _merged = f"merged_{_base}"
+    _CLIMO_VAR_MAP[_merged] = _merged
+    _CLIMO_VAR_MAP[f"recentered_{_base}"] = _merged
+    _CLIMO_VAR_MAP[f"total_recentered_{_base}"] = _merged
+    _CLIMO_VAR_MAP[f"swath_{_base}"] = _merged
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
@@ -1238,7 +1253,7 @@ def _enrich_metadata_with_ships_extended(ds, data_type, era):
     n_cases = ds.sizes.get("num_cases", 0)
 
     # Check availability of key SHIPS variables
-    has_vmpi = "vmpi_ships" in ds
+    has_vmpi = "mpi_ships" in ds
     has_rhlo = "rhlo_ships" in ds
     has_shgc = "shgc_ships" in ds
     has_vmax = "vmax_ships" in ds  # best-track Vmax in SHIPS lag-hour format
@@ -1257,7 +1272,7 @@ def _enrich_metadata_with_ships_extended(ds, data_type, era):
             continue
 
         # VP components
-        vmpi = _get_ships_value(ds, local_idx, "vmpi_ships") if has_vmpi else None
+        vmpi = _get_ships_value(ds, local_idx, "mpi_ships") if has_vmpi else None
         rhlo = _get_ships_value(ds, local_idx, "rhlo_ships") if has_rhlo else None
         shgc = _get_ships_value(ds, local_idx, "shgc_ships") if has_shgc else None
 
@@ -5235,8 +5250,10 @@ def _compute_anomaly_for_case(ds, local_idx, case_index, variable, data_type):
         vol, x_coords, y_coords, height_vals, h_axis, rmw, coverage_min=0.5
     )
 
+    # Map variable to its merged_* climatology equivalent
+    climo_varname = _CLIMO_VAR_MAP.get(varname, varname)
     clim_mean, clim_std, clim_count, bin_centre = _get_climatology_for_intensity(
-        varname, vmax
+        climo_varname, vmax
     )
 
     if clim_mean is None:
