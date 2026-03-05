@@ -1257,12 +1257,14 @@ def _enrich_metadata_with_ships_extended(ds, data_type, era):
     has_rhlo = "rhlo_ships" in ds
     has_shgc = "shgc_ships" in ds
     has_vmax = "vmax_ships" in ds  # best-track Vmax in SHIPS lag-hour format
+    has_dtl  = "dtl_ships" in ds   # distance to land (km)
 
     avail = []
     if has_vmpi: avail.append("vmpi")
     if has_rhlo: avail.append("rhlo")
     if has_shgc: avail.append("shgc")
     if has_vmax: avail.append("vmax")
+    if has_dtl:  avail.append("dtl")
     print(f"  Extended SHIPS vars available ({data_type}/{era}): {avail or 'NONE'}")
 
     enriched = 0
@@ -1297,6 +1299,21 @@ def _enrich_metadata_with_ships_extended(ds, data_type, era):
                 cache[case_index]["dvmax_12h"] = round(vmax_t12 - vmax_t0, 1)
             if vmax_t0 is not None and vmax_t24 is not None:
                 cache[case_index]["dvmax_24h"] = round(vmax_t24 - vmax_t0, 1)
+
+        # Minimum distance-to-land over 0–12 h and 0–24 h forecast windows
+        # Used to filter land-interacting cases from ellipse computations
+        if has_dtl:
+            # t=0 → idx 8, t=+6h → 9, t=+12h → 10, t=+18h → 11, t=+24h → 12
+            dtl_vals_12 = [_get_ships_value_at_lag(ds, local_idx, "dtl_ships", i)
+                           for i in range(SHIPS_T0_IDX, SHIPS_T12_IDX + 1)]
+            dtl_vals_24 = [_get_ships_value_at_lag(ds, local_idx, "dtl_ships", i)
+                           for i in range(SHIPS_T0_IDX, SHIPS_T24_IDX + 1)]
+            valid_12 = [v for v in dtl_vals_12 if v is not None]
+            valid_24 = [v for v in dtl_vals_24 if v is not None]
+            if valid_12:
+                cache[case_index]["dtl_min_12h"] = round(min(valid_12), 1)
+            if valid_24:
+                cache[case_index]["dtl_min_24h"] = round(min(valid_24), 1)
 
         enriched += 1
 
@@ -5566,6 +5583,8 @@ def scatter_vp_favorability(
             "vortex_favorability": meta.get("vortex_favorability"),
             "vortex_height": meta.get("vortex_height"),
             "vortex_width": meta.get("vortex_width"),
+            "dtl_min_12h": meta.get("dtl_min_12h"),
+            "dtl_min_24h": meta.get("dtl_min_24h"),
             color_by: dvmax,
         })
 
