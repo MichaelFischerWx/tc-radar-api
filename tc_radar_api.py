@@ -5596,12 +5596,15 @@ def scatter_vp_favorability(
             "n": len(pts),
         }
 
-    return JSONResponse({
-        "points": points, "color_by": color_by,
-        "ellipses": ellipses,
-        "n_total": len(points),
-        "n_with_vf": sum(1 for p in points if p["vortex_favorability"] is not None),
-    })
+    return JSONResponse(
+        content={
+            "points": points, "color_by": color_by,
+            "ellipses": ellipses,
+            "n_total": len(points),
+            "n_with_vf": sum(1 for p in points if p["vortex_favorability"] is not None),
+        },
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/climatology/info")
