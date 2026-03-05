@@ -468,6 +468,10 @@ METADATA_PATH = Path(os.environ.get("METADATA_PATH", "./tc_radar_metadata.json")
 MERGE_METADATA_PATH = Path(os.environ.get("MERGE_METADATA_PATH", "./tc_radar_metadata_merge.json"))
 _metadata_cache: dict[int, dict] = {}
 _merge_metadata_cache: dict[int, dict] = {}
+# Staging area for two-pass vortex metrics (raw values before DB mean subtraction)
+_vortex_raw: dict[int, dict] = {}       # case_index -> {raw_h1_max, raw_width_diff}
+_vortex_eras_done = 0                    # how many merge eras have finished pass 1
+_vortex_lock = threading.Lock()          # guard the counter + finalize
 _plot_cache: OrderedDict = OrderedDict()
 _PLOT_CACHE_MAX = 40   # ~40 plots × ~150 KB ≈ 6 MB max (was 150)
 
@@ -1322,14 +1326,22 @@ def _enrich_metadata_with_ships_extended(ds, data_type, era):
 
 def _enrich_metadata_with_vortex_metrics(ds, era):
     """
-    Compute vortex height, width, and favorability for every merged case
-    and store in _merge_metadata_cache.  Requires _climatology to be loaded.
-    Runs at startup after SHIPS enrichment (only for merged data).
+    Pass 1 of the two-pass vortex-metric computation (Fischer et al. 2025,
+    MWR, Table 1).  Computes raw (un-centred) metrics for every merged case
+    and stores them in the global _vortex_raw dict.
+
+    When both merge eras have finished pass 1, _finalize_vortex_metrics()
+    is called automatically to compute a *single* database mean across ALL
+    cases and subtract it — producing zero-centred vortex_height,
+    vortex_width, and vortex_favorability in _merge_metadata_cache.
     """
+    global _vortex_eras_done
+
     early_count = CASE_COUNTS[("merge", "early")]
     offset = 0 if era == "early" else early_count
     n_cases = ds.sizes.get("num_cases", 0)
-    computed = 0
+
+    local_raw = {}
     skipped = 0
 
     for local_idx in range(n_cases):
@@ -1337,18 +1349,59 @@ def _enrich_metadata_with_vortex_metrics(ds, era):
         if case_index not in _merge_metadata_cache:
             continue
         try:
-            metrics = _compute_vortex_metrics_for_case(case_index, ds, local_idx, "merge")
-            if metrics:
-                _merge_metadata_cache[case_index].update(metrics)
-                computed += 1
+            raw = _compute_vortex_metrics_for_case(case_index, ds, local_idx, "merge")
+            if raw:
+                local_raw[case_index] = raw
             else:
                 skipped += 1
         except Exception as e:
             skipped += 1
-            if local_idx < 3:  # only log first few errors
+            if local_idx < 3:
                 print(f"  Vortex metrics warning case {case_index}: {e}")
 
-    print(f"  Vortex metrics: computed={computed}, skipped={skipped} (merge/{era})")
+    print(f"  Vortex pass-1: {len(local_raw)} raw metrics, "
+          f"{skipped} skipped (merge/{era})")
+
+    # Merge into the global staging dict and check if both eras are done
+    with _vortex_lock:
+        _vortex_raw.update(local_raw)
+        _vortex_eras_done += 1
+        if _vortex_eras_done >= 2:
+            _finalize_vortex_metrics()
+
+
+def _finalize_vortex_metrics():
+    """
+    Pass 2: compute a single database mean across ALL cases (both eras)
+    and subtract it from each case's raw metrics to produce zero-centred
+    vortex_height, vortex_width, and vortex_favorability.
+
+    Called automatically once both merge eras have completed pass 1.
+    Must be called while holding _vortex_lock.
+    """
+    if not _vortex_raw:
+        print("  Vortex finalize: no raw metrics to process")
+        return
+
+    all_h1 = [r["raw_h1_max"] for r in _vortex_raw.values()]
+    all_wd = [r["raw_width_diff"] for r in _vortex_raw.values()]
+    db_mean_h1 = float(np.nanmean(all_h1))
+    db_mean_wd = float(np.nanmean(all_wd))
+
+    computed = 0
+    for case_index, raw in _vortex_raw.items():
+        vh = raw["raw_h1_max"] - db_mean_h1
+        vw = raw["raw_width_diff"] - db_mean_wd
+        _merge_metadata_cache[case_index].update({
+            "vortex_height": round(vh, 3),
+            "vortex_width": round(vw, 3),
+            "vortex_favorability": round(vh - vw, 3),
+        })
+        computed += 1
+
+    print(f"  Vortex finalize: global DB means height={db_mean_h1:.4f}, "
+          f"width_diff={db_mean_wd:.4f} (n={len(_vortex_raw)})")
+    print(f"  Vortex finalize: {computed} cases centred")
 
 
 # ---------------------------------------------------------------------------
@@ -5534,18 +5587,22 @@ def _compute_vortex_metrics_for_case(case_index, ds, local_idx, data_type):
         h1_vt = vt_anom[np.ix_(h1_z, h1_r)]
         if np.all(np.isnan(h1_vt)):
             return None
-        vortex_height = float(np.nanmax(h1_vt))
+        raw_h1_max = float(np.nanmax(h1_vt))
 
         w1_zeta = zeta_anom[np.ix_(w1_z, w1_r)]
         w2_zeta = zeta_anom[np.ix_(w2_z, w2_r)]
         if np.all(np.isnan(w1_zeta)) or np.all(np.isnan(w2_zeta)):
             return None
-        vortex_width = float(np.nanmean(w2_zeta) - np.nanmean(w1_zeta))
+        raw_w1_mean = float(np.nanmean(w1_zeta))
+        raw_w2_mean = float(np.nanmean(w2_zeta))
+        raw_width_diff = raw_w2_mean - raw_w1_mean
 
+        # Return RAW (un-centered) metrics — the caller will subtract
+        # database means in a second pass to produce zero-centred metrics
+        # per Fischer et al. (2025, MWR) Table 1.
         return {
-            "vortex_height": round(vortex_height, 3),
-            "vortex_width": round(vortex_width, 3),
-            "vortex_favorability": round(vortex_height - vortex_width, 3),
+            "raw_h1_max": raw_h1_max,
+            "raw_width_diff": raw_width_diff,
         }
     except Exception:
         return None
