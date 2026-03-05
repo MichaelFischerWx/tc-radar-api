@@ -251,6 +251,7 @@ class CacheHeaderMiddleware(BaseHTTPMiddleware):
         '/data', '/ir', '/ir_frame', '/era5',
         '/azimuthal_mean', '/quadrant_mean',
         '/cross_section', '/plot', '/volume',
+        '/anomaly', '/hybrid', '/scatter', '/climatology',
     )
     SEMI_STABLE_PREFIXES = ('/composite',)
     SHORT_CACHE_PATHS = ('/health', '/metadata', '/variables', '/levels')
@@ -458,6 +459,11 @@ _PLOT_CACHE_MAX = 40   # ~40 plots × ~150 KB ≈ 6 MB max (was 150)
 _data_cache: OrderedDict = OrderedDict()
 _DATA_CACHE_MAX = 20   # ~20 entries — JSON dicts can be large (was 100)
 
+# Precomputed hybrid-coordinate climatology (Fischer et al. 2025)
+# Loaded at startup from climatology_hybrid.npz
+_climatology: dict = {}      # Loaded numpy arrays keyed by name
+CLIMATOLOGY_PATH = Path(os.environ.get("CLIMATOLOGY_PATH", "./climatology_hybrid.npz"))
+
 # Merge case_index → swath case_index mapping for IR/ERA5 lookups.
 # The MergIR and ERA5 zarr stores are indexed by swath case (0–1509),
 # but merge mode passes merge case indices (0–435).  This dict maps
@@ -485,6 +491,17 @@ def startup():
         print(f"Loaded {len(_merge_metadata_cache)} merge cases from {MERGE_METADATA_PATH}")
     else:
         print(f"Warning: {MERGE_METADATA_PATH} not found — merge composites will not filter correctly")
+
+    # Load precomputed climatology for anomaly diagnostics
+    global _climatology
+    if CLIMATOLOGY_PATH.exists():
+        _clim_data = np.load(str(CLIMATOLOGY_PATH), allow_pickle=False)
+        _climatology = {k: _clim_data[k] for k in _clim_data.files}
+        print(f"Loaded hybrid climatology from {CLIMATOLOGY_PATH} "
+              f"({len(_climatology)} arrays)")
+    else:
+        print(f"Note: {CLIMATOLOGY_PATH} not found — anomaly diagnostics disabled. "
+              f"Run precompute_climatology.py to generate it.")
 
     # Build merge→swath index mapping for IR/ERA5 lookups.
     # The MergIR and ERA5 zarr stores are indexed by swath case number,
@@ -531,6 +548,10 @@ def startup():
             print(f"Pre-warmed {data_type}/{era}")
             _enrich_metadata_with_ships(ds, data_type, era)
             _enrich_metadata_with_max_wind(ds, data_type, era)
+            _enrich_metadata_with_ships_extended(ds, data_type, era)
+            # Compute vortex metrics for merged cases (requires climatology)
+            if data_type == "merge" and _climatology:
+                _enrich_metadata_with_vortex_metrics(ds, era)
         except Exception as e:
             print(f"Pre-warm failed {data_type}/{era}: {e}")
 
@@ -1176,6 +1197,126 @@ def _get_shdc(ds, local_idx):
     return _get_ships_value(ds, local_idx, "shdc_ships")
 
 
+def _get_ships_value_at_lag(ds, local_idx, varname, lag_idx):
+    """
+    Look up a SHIPS variable at an arbitrary lag-hour index.
+
+    The SHIPS lag-hour axis has 17 entries: -48, -42, -36, …, 0, …, +42, +48 h.
+    Index 8 = t=0, Index 10 = t=+12 h, Index 12 = t=+24 h.
+    """
+    if varname not in ds:
+        return None
+    try:
+        raw = ds[varname].isel(num_cases=local_idx).values
+        val = float(raw[lag_idx]) if raw.ndim >= 1 else float(raw)
+    except Exception:
+        return None
+    if val == 9999 or np.isnan(val):
+        return None
+    return round(val, 1)
+
+
+def _enrich_metadata_with_ships_extended(ds, data_type, era):
+    """
+    Enrich metadata with extended SHIPS variables for anomaly diagnostics:
+    - vmpi: maximum potential intensity (kt)
+    - rhlo: 850-700 hPa mean relative humidity (%)
+    - shgc: generalized vertical wind shear (kt)
+    - vp: ventilation proxy = shgc * (100 - rhlo) / vmpi
+    - dvmax_12h: 12-hour future intensity change from SHIPS best-track Vmax
+    - dvmax_24h: 24-hour future intensity change from SHIPS best-track Vmax
+
+    Runs at startup alongside the standard SHIPS enrichment.
+    """
+    SHIPS_T0_IDX = 8
+    SHIPS_T12_IDX = 10   # t = +12 h
+    SHIPS_T24_IDX = 12   # t = +24 h
+
+    cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
+    early_count = CASE_COUNTS[(data_type, "early")]
+    offset = 0 if era == "early" else early_count
+    n_cases = ds.sizes.get("num_cases", 0)
+
+    # Check availability of key SHIPS variables
+    has_vmpi = "vmpi_ships" in ds
+    has_rhlo = "rhlo_ships" in ds
+    has_shgc = "shgc_ships" in ds
+    has_vmax = "vmax_ships" in ds  # best-track Vmax in SHIPS lag-hour format
+
+    avail = []
+    if has_vmpi: avail.append("vmpi")
+    if has_rhlo: avail.append("rhlo")
+    if has_shgc: avail.append("shgc")
+    if has_vmax: avail.append("vmax")
+    print(f"  Extended SHIPS vars available ({data_type}/{era}): {avail or 'NONE'}")
+
+    enriched = 0
+    for local_idx in range(n_cases):
+        case_index = local_idx + offset
+        if case_index not in cache:
+            continue
+
+        # VP components
+        vmpi = _get_ships_value(ds, local_idx, "vmpi_ships") if has_vmpi else None
+        rhlo = _get_ships_value(ds, local_idx, "rhlo_ships") if has_rhlo else None
+        shgc = _get_ships_value(ds, local_idx, "shgc_ships") if has_shgc else None
+
+        if vmpi is not None:
+            cache[case_index]["vmpi"] = vmpi
+        if rhlo is not None:
+            cache[case_index]["rhlo"] = rhlo
+        if shgc is not None:
+            cache[case_index]["shgc"] = shgc
+
+        # Compute ventilation proxy
+        if vmpi and rhlo is not None and shgc is not None and vmpi > 0:
+            vp = round(shgc * (100.0 - rhlo) / vmpi, 2)
+            cache[case_index]["vp"] = vp
+
+        # Intensity change from SHIPS best-track Vmax
+        if has_vmax:
+            vmax_t0 = _get_ships_value_at_lag(ds, local_idx, "vmax_ships", SHIPS_T0_IDX)
+            vmax_t12 = _get_ships_value_at_lag(ds, local_idx, "vmax_ships", SHIPS_T12_IDX)
+            vmax_t24 = _get_ships_value_at_lag(ds, local_idx, "vmax_ships", SHIPS_T24_IDX)
+            if vmax_t0 is not None and vmax_t12 is not None:
+                cache[case_index]["dvmax_12h"] = round(vmax_t12 - vmax_t0, 1)
+            if vmax_t0 is not None and vmax_t24 is not None:
+                cache[case_index]["dvmax_24h"] = round(vmax_t24 - vmax_t0, 1)
+
+        enriched += 1
+
+    print(f"  Extended SHIPS enrichment: {enriched} cases ({data_type}/{era})")
+
+
+def _enrich_metadata_with_vortex_metrics(ds, era):
+    """
+    Compute vortex height, width, and favorability for every merged case
+    and store in _merge_metadata_cache.  Requires _climatology to be loaded.
+    Runs at startup after SHIPS enrichment (only for merged data).
+    """
+    early_count = CASE_COUNTS[("merge", "early")]
+    offset = 0 if era == "early" else early_count
+    n_cases = ds.sizes.get("num_cases", 0)
+    computed = 0
+    skipped = 0
+
+    for local_idx in range(n_cases):
+        case_index = local_idx + offset
+        if case_index not in _merge_metadata_cache:
+            continue
+        try:
+            metrics = _compute_vortex_metrics_for_case(case_index, ds, local_idx, "merge")
+            if metrics:
+                _merge_metadata_cache[case_index].update(metrics)
+                computed += 1
+            else:
+                skipped += 1
+        except Exception as e:
+            skipped += 1
+            if local_idx < 3:  # only log first few errors
+                print(f"  Vortex metrics warning case {case_index}: {e}")
+
+    print(f"  Vortex metrics: computed={computed}, skipped={skipped} (merge/{era})")
 
 
 # ---------------------------------------------------------------------------
@@ -1885,6 +2026,138 @@ def _compute_azimuthal_mean(vol, x_coords, y_coords, height_vals, h_axis,
                 az_mean[h, r] = float(np.nanmean(slab[in_bin]))
 
     return az_mean, coverage, r_centers
+
+
+# ---------------------------------------------------------------------------
+# Hybrid radial coordinate (R_H) — Fischer et al. (2025, MWR)
+# ---------------------------------------------------------------------------
+
+# Default hybrid-coordinate grid parameters
+HYBRID_DR_INNER = 0.05     # R/RMW spacing inward of RMW  (dimensionless)
+HYBRID_DR_OUTER_KM = 2.0   # km spacing outward of RMW (matches TC-RADAR grid)
+HYBRID_MAX_OUTER_KM = 100.0  # max distance beyond RMW (km)
+
+
+def _build_hybrid_r_axis():
+    """
+    Build the hybrid R_H radial axis (bin edges and centres).
+
+    Inward of RMW:  normalised by RMW (0 to 1, spacing = HYBRID_DR_INNER)
+    Outward of RMW: physical distance beyond RMW (0 to HYBRID_MAX_OUTER_KM km,
+                    spacing = HYBRID_DR_OUTER_KM)
+
+    Returns
+    -------
+    inner_edges : 1D array  — bin edges from 0 to 1 (R/RMW, inward regime)
+    outer_edges : 1D array  — bin edges from 0 to HYBRID_MAX_OUTER_KM (km, outward regime)
+    r_labels    : list[str] — human-readable labels for each bin centre
+    n_inner     : int       — number of inward bins
+    n_outer     : int       — number of outward bins
+    """
+    inner_edges = np.arange(0, 1.0 + HYBRID_DR_INNER / 2, HYBRID_DR_INNER)
+    outer_edges = np.arange(0, HYBRID_MAX_OUTER_KM + HYBRID_DR_OUTER_KM / 2,
+                            HYBRID_DR_OUTER_KM)
+    n_inner = len(inner_edges) - 1
+    n_outer = len(outer_edges) - 1
+
+    # Build labels: inner bins as fractional R/RMW, outer as "RMW + X km"
+    r_labels = []
+    for i in range(n_inner):
+        c = (inner_edges[i] + inner_edges[i + 1]) / 2.0
+        r_labels.append(round(float(c), 2))
+    for i in range(n_outer):
+        c = (outer_edges[i] + outer_edges[i + 1]) / 2.0
+        r_labels.append(round(float(c), 2))
+
+    return inner_edges, outer_edges, r_labels, n_inner, n_outer
+
+
+def _compute_azimuthal_mean_hybrid(vol, x_coords, y_coords, height_vals,
+                                    h_axis, rmw, coverage_min=0.5):
+    """
+    Compute azimuthal mean on the hybrid R_H coordinate of Fischer et al. (2025).
+
+    Parameters
+    ----------
+    vol         : 3D array — (height, y, x) or other axis order per h_axis
+    x_coords    : 1D array — x (eastward_distance) in km
+    y_coords    : 1D array — y (northward_distance) in km
+    height_vals : 1D array — heights in km
+    h_axis      : int      — position of the height axis in vol
+    rmw         : float    — radius of maximum wind in km (must be > 0)
+    coverage_min: float    — minimum fraction of valid data per bin
+
+    Returns
+    -------
+    az_mean  : 2D array (n_heights × n_total_bins)
+    coverage : 2D array (n_heights × n_total_bins)
+    r_h_axis : 1D list of bin-centre values (for plotting)
+    n_inner  : int — number of inner (RMW-normalised) bins
+    """
+    if rmw is None or rmw <= 0:
+        raise ValueError("rmw must be positive for hybrid coordinate")
+
+    inner_edges, outer_edges, r_labels, n_inner, n_outer = _build_hybrid_r_axis()
+    n_total = n_inner + n_outer
+    n_heights = len(height_vals)
+
+    # Build 2D radius grid
+    xx, yy = np.meshgrid(x_coords, y_coords)
+    rr = np.sqrt(xx**2 + yy**2)  # physical radius in km
+
+    # Classify each grid point as inner or outer
+    is_inner = rr < rmw
+    is_outer = ~is_inner
+
+    # Map to bin index:
+    # Inner: normalise by RMW, digitise into inner_edges
+    rr_norm = np.where(is_inner, rr / rmw, np.nan)
+    inner_bin_idx = np.digitize(np.nan_to_num(rr_norm, nan=-1), inner_edges) - 1
+
+    # Outer: distance beyond RMW in km, digitise into outer_edges
+    rr_beyond = np.where(is_outer, rr - rmw, np.nan)
+    outer_bin_idx = np.digitize(np.nan_to_num(rr_beyond, nan=-1), outer_edges) - 1
+
+    az_mean  = np.full((n_heights, n_total), np.nan)
+    coverage = np.full((n_heights, n_total), 0.0)
+
+    for h in range(n_heights):
+        if h_axis == 0:
+            slab = vol[h, :, :]
+        elif h_axis == 2:
+            slab = vol[:, :, h]
+        else:
+            slab = vol[:, h, :]
+
+        valid = ~np.isnan(slab)
+
+        # Inner bins
+        for r in range(n_inner):
+            mask = is_inner & (inner_bin_idx == r)
+            n_total_pts = np.count_nonzero(mask)
+            if n_total_pts == 0:
+                continue
+            in_bin = mask & valid
+            n_valid = np.count_nonzero(in_bin)
+            frac = n_valid / n_total_pts
+            coverage[h, r] = frac
+            if frac >= coverage_min:
+                az_mean[h, r] = float(np.nanmean(slab[in_bin]))
+
+        # Outer bins
+        for r in range(n_outer):
+            mask = is_outer & (outer_bin_idx == r)
+            n_total_pts = np.count_nonzero(mask)
+            if n_total_pts == 0:
+                continue
+            in_bin = mask & valid
+            n_valid = np.count_nonzero(in_bin)
+            frac = n_valid / n_total_pts
+            coverage[h, n_inner + r] = frac
+            if frac >= coverage_min:
+                az_mean[h, n_inner + r] = float(np.nanmean(slab[in_bin]))
+
+    return az_mean, coverage, r_labels, n_inner
 
 
 @app.get("/azimuthal_mean")
@@ -4883,6 +5156,463 @@ def get_archive_flight_level(
         _hrd_fl_cache.popitem(last=False)
 
     return JSONResponse(result)
+
+
+# ---------------------------------------------------------------------------
+# Anomaly diagnostics — Fischer et al. (2025, MWR)
+# ---------------------------------------------------------------------------
+
+def _get_climatology_for_intensity(varname: str, vmax_kt: float):
+    """
+    Look up the precomputed climatological mean and std for a variable
+    at the nearest intensity bin centre.
+
+    Returns (mean_2d, std_2d, count, bin_centre) or (None, None, 0, None).
+    """
+    if not _climatology:
+        return None, None, 0, None
+
+    centres = _climatology.get("intensity_centres")
+    if centres is None:
+        return None, None, 0, None
+
+    idx = int(np.argmin(np.abs(centres - vmax_kt)))
+    bin_centre = int(centres[idx])
+
+    mean_key = f"{varname}_mean_{bin_centre}"
+    std_key = f"{varname}_std_{bin_centre}"
+    count_key = f"{varname}_count_{bin_centre}"
+
+    if mean_key not in _climatology or std_key not in _climatology:
+        return None, None, 0, bin_centre
+
+    return (_climatology[mean_key], _climatology[std_key],
+            int(_climatology.get(count_key, 0)), bin_centre)
+
+
+def _compute_anomaly_for_case(ds, local_idx, case_index, variable, data_type):
+    """
+    Compute the Z-score anomaly field for a single case on the hybrid R_H grid.
+    """
+    cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
+    case_meta = cache.get(case_index, {})
+    vmax = case_meta.get("vmax_kt")
+    rmw = case_meta.get("rmw_km")
+
+    if vmax is None or rmw is None or rmw <= 0:
+        raise HTTPException(status_code=400,
+                            detail=f"Case {case_index} missing vmax_kt or rmw_km")
+
+    display_name, varname, cmap, units, vmin_lim, vmax_lim = VARIABLES[variable]
+
+    if variable in DERIVED_VARIABLES:
+        ref_varname = DERIVED_VARIABLES[variable][0]
+    else:
+        if varname not in ds:
+            raise HTTPException(status_code=400, detail=f"'{varname}' not in dataset.")
+        ref_varname = varname
+
+    var_dims = set(ds[ref_varname].dims)
+    if "eastward_distance" in var_dims and "northward_distance" in var_dims:
+        x_coords = ds["eastward_distance"].values
+        y_coords = ds["northward_distance"].values
+    elif "latitude" in var_dims and "longitude" in var_dims:
+        nx = ds.sizes["longitude"]
+        ny = ds.sizes["latitude"]
+        x_coords = np.linspace(-(nx - 1), (nx - 1), nx)
+        y_coords = np.linspace(-(ny - 1), (ny - 1), ny)
+    else:
+        raise HTTPException(status_code=500, detail="Cannot determine spatial grid")
+
+    dim_list = [d for d in ds[ref_varname].dims if d != "num_cases"]
+    if "height" not in dim_list:
+        raise HTTPException(status_code=500, detail="Cannot determine height axis")
+    h_axis = dim_list.index("height")
+    height_vals = ds["height"].values
+
+    vol, _ = _extract_3d_volume(ds, local_idx, variable)
+    az_raw, cov, r_h_axis, n_inner = _compute_azimuthal_mean_hybrid(
+        vol, x_coords, y_coords, height_vals, h_axis, rmw, coverage_min=0.5
+    )
+
+    clim_mean, clim_std, clim_count, bin_centre = _get_climatology_for_intensity(
+        varname, vmax
+    )
+
+    if clim_mean is None:
+        return {
+            "anomaly": None,
+            "raw": _clean_2d(az_raw),
+            "clim_mean": None, "clim_std": None,
+            "r_h_axis": r_h_axis, "n_inner": n_inner,
+            "height_km": [round(float(h), 2) for h in height_vals],
+            "clim_count": 0, "clim_bin_kt": None,
+            "error": "Climatology not available. Run precompute_climatology.py.",
+        }
+
+    anomaly = np.where(
+        np.isnan(az_raw) | np.isnan(clim_mean) | np.isnan(clim_std),
+        np.nan, (az_raw - clim_mean) / clim_std
+    )
+
+    return {
+        "anomaly": _clean_2d(anomaly),
+        "raw": _clean_2d(az_raw),
+        "clim_mean": _clean_2d(clim_mean),
+        "clim_std": _clean_2d(clim_std),
+        "r_h_axis": r_h_axis, "n_inner": n_inner,
+        "height_km": [round(float(h), 2) for h in height_vals],
+        "clim_count": clim_count, "clim_bin_kt": bin_centre,
+    }
+
+
+@app.get("/anomaly/azimuthal_mean")
+def anomaly_azimuthal_mean(
+    case_index:   int = Query(..., ge=0, description="0-based case index"),
+    variable:     str = Query("merged_tangential_wind", description="Variable key"),
+    data_type:    str = Query("merge", description="'swath' or 'merge'"),
+):
+    """
+    Return Z-score anomaly of the azimuthal-mean field on the hybrid R_H
+    grid for a single case (Fischer et al. 2025, MWR, Eq. 1).
+    """
+    if variable not in VARIABLES:
+        raise HTTPException(status_code=400, detail=f"Unknown variable '{variable}'")
+    if data_type not in ("swath", "merge"):
+        raise HTTPException(status_code=400, detail="data_type must be 'swath' or 'merge'")
+
+    try:
+        ds, local_idx = resolve_case(case_index, data_type)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    result = _compute_anomaly_for_case(ds, local_idx, case_index, variable, data_type)
+
+    cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
+    meta = cache.get(case_index, {})
+    display_name, _, _, units, _, _ = VARIABLES[variable]
+
+    result["variable"] = {
+        "key": variable,
+        "display_name": display_name,
+        "units": units,
+        "anomaly_units": "σ (standardized)",
+        "colorscale": _cmap_to_plotly("RdBu_r"),
+        "vmin": -3, "vmax": 3,
+    }
+    result["case_meta"] = {
+        "case_index": case_index,
+        "storm_name": meta.get("storm_name", ""),
+        "datetime": meta.get("datetime", ""),
+        "vmax_kt": meta.get("vmax_kt"),
+        "rmw_km": meta.get("rmw_km"),
+    }
+    return JSONResponse(result)
+
+
+@app.get("/hybrid/azimuthal_mean")
+def hybrid_azimuthal_mean(
+    case_index:    int   = Query(..., ge=0, description="0-based case index"),
+    variable:      str   = Query(DEFAULT_VARIABLE, description="Variable key"),
+    data_type:     str   = Query("merge", description="'swath' or 'merge'"),
+    coverage_min:  float = Query(0.5, ge=0.0, le=1.0),
+    overlay:       str   = Query("", description="Optional overlay variable key"),
+):
+    """Return azimuthal mean on the hybrid R_H coordinate (no anomaly)."""
+    if variable not in VARIABLES:
+        raise HTTPException(status_code=400, detail=f"Unknown variable '{variable}'")
+    if data_type not in ("swath", "merge"):
+        raise HTTPException(status_code=400, detail="data_type must be 'swath' or 'merge'")
+
+    try:
+        ds, local_idx = resolve_case(case_index, data_type)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
+    meta = cache.get(case_index, {})
+    rmw = meta.get("rmw_km")
+    if rmw is None or rmw <= 0:
+        raise HTTPException(status_code=400,
+                            detail=f"Case {case_index} missing valid rmw_km")
+
+    display_name, varname, cmap, units, vmin, vmax = VARIABLES[variable]
+    height_vals = ds["height"].values
+
+    ref_varname = DERIVED_VARIABLES[variable][0] if variable in DERIVED_VARIABLES else varname
+    var_dims = set(ds[ref_varname].dims)
+    if "eastward_distance" in var_dims and "northward_distance" in var_dims:
+        x_coords = ds["eastward_distance"].values
+        y_coords = ds["northward_distance"].values
+    elif "latitude" in var_dims and "longitude" in var_dims:
+        nx = ds.sizes["longitude"]
+        ny = ds.sizes["latitude"]
+        x_coords = np.linspace(-(nx - 1), (nx - 1), nx)
+        y_coords = np.linspace(-(ny - 1), (ny - 1), ny)
+    else:
+        raise HTTPException(status_code=500, detail="Cannot determine spatial grid")
+
+    dim_list = [d for d in ds[ref_varname].dims if d != "num_cases"]
+    h_axis = dim_list.index("height")
+
+    vol, _ = _extract_3d_volume(ds, local_idx, variable)
+    az_mean, coverage, r_h_axis, n_inner = _compute_azimuthal_mean_hybrid(
+        vol, x_coords, y_coords, height_vals, h_axis, rmw, coverage_min
+    )
+
+    case_meta = _build_case_meta(case_index, ds, local_idx, data_type)
+
+    result = {
+        "azimuthal_mean": _clean_2d(az_mean),
+        "coverage": _clean_2d(coverage),
+        "r_h_axis": r_h_axis, "n_inner": n_inner,
+        "height_km": [round(float(h), 2) for h in height_vals],
+        "coverage_min": coverage_min,
+        "coordinate": "hybrid",
+        "variable": {
+            "key": variable, "display_name": display_name, "units": units,
+            "vmin": vmin, "vmax": vmax, "colorscale": _cmap_to_plotly(cmap),
+        },
+        "case_meta": case_meta,
+    }
+
+    if overlay and overlay in VARIABLES:
+        ov_display, _, ov_cmap, ov_units, ov_vmin, ov_vmax = VARIABLES[overlay]
+        try:
+            ov_vol, _ = _extract_3d_volume(ds, local_idx, overlay)
+            ov_az, _, _, _ = _compute_azimuthal_mean_hybrid(
+                ov_vol, x_coords, y_coords, height_vals, h_axis, rmw, coverage_min
+            )
+            result["overlay"] = {
+                "azimuthal_mean": _clean_2d(ov_az),
+                "key": overlay, "display_name": ov_display,
+                "units": ov_units, "vmin": ov_vmin, "vmax": ov_vmax,
+            }
+        except Exception:
+            pass
+
+    return JSONResponse(result)
+
+
+# ---------------------------------------------------------------------------
+# Vortex metrics — Table 1 in Fischer et al. (2025, MWR)
+# ---------------------------------------------------------------------------
+
+def _compute_vortex_metrics_for_case(case_index, ds, local_idx, data_type):
+    """
+    Compute vortex height, width, and favorability for a single case
+    using the anomaly field on the hybrid R_H grid (Table 1).
+    """
+    cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
+    meta = cache.get(case_index, {})
+    vmax = meta.get("vmax_kt")
+    rmw = meta.get("rmw_km")
+    if vmax is None or rmw is None or rmw <= 0:
+        return None
+
+    vt_var = "merged_tangential_wind"
+    zeta_var = "merged_relative_vorticity"
+
+    vt_clim_mean, vt_clim_std, _, _ = _get_climatology_for_intensity(vt_var, vmax)
+    zeta_clim_mean, zeta_clim_std, _, _ = _get_climatology_for_intensity(zeta_var, vmax)
+    if vt_clim_mean is None or zeta_clim_mean is None:
+        return None
+
+    if vt_var not in ds or zeta_var not in ds:
+        return None
+
+    var_dims = set(ds[vt_var].dims)
+    if "eastward_distance" in var_dims and "northward_distance" in var_dims:
+        if "eastward_distance" in ds.coords:
+            x_coords = ds["eastward_distance"].values
+            y_coords = ds["northward_distance"].values
+        else:
+            nx = ds.sizes["eastward_distance"]
+            ny = ds.sizes["northward_distance"]
+            x_coords = np.linspace(-(nx // 2), (nx // 2), nx)
+            y_coords = np.linspace(-(ny // 2), (ny // 2), ny)
+    elif "latitude" in var_dims and "longitude" in var_dims:
+        nx = ds.sizes["longitude"]
+        ny = ds.sizes["latitude"]
+        x_coords = np.linspace(-(nx - 1), (nx - 1), nx)
+        y_coords = np.linspace(-(ny - 1), (ny - 1), ny)
+    else:
+        # Infer from actual data shape
+        sample = ds[vt_var].isel(num_cases=0).shape
+        ny, nx = sample[-2], sample[-1]
+        x_coords = np.linspace(-(nx // 2), (nx // 2), nx)
+        y_coords = np.linspace(-(ny // 2), (ny // 2), ny)
+
+    height_vals = ds["height"].values
+    dim_list = [d for d in ds[vt_var].dims if d != "num_cases"]
+    h_axis = dim_list.index("height") if "height" in dim_list else 0
+
+    vt_vol = ds[vt_var].isel(num_cases=local_idx).values
+    vt_az, _, r_h_axis, n_inner = _compute_azimuthal_mean_hybrid(
+        vt_vol, x_coords, y_coords, height_vals, h_axis, rmw
+    )
+
+    zeta_vol = ds[zeta_var].isel(num_cases=local_idx).values
+    zeta_az, _, _, _ = _compute_azimuthal_mean_hybrid(
+        zeta_vol, x_coords, y_coords, height_vals, h_axis, rmw
+    )
+
+    vt_anom = np.where(
+        np.isnan(vt_az) | np.isnan(vt_clim_mean) | np.isnan(vt_clim_std),
+        np.nan, (vt_az - vt_clim_mean) / vt_clim_std
+    )
+    zeta_anom = np.where(
+        np.isnan(zeta_az) | np.isnan(zeta_clim_mean) | np.isnan(zeta_clim_std),
+        np.nan, (zeta_az - zeta_clim_mean) / zeta_clim_std
+    )
+
+    r_arr = np.array(r_h_axis, dtype=float)
+
+    def r_h_mask(lo_inner, hi_inner, lo_outer, hi_outer):
+        """Boolean mask over r_h bins for inner (R/RMW) and outer (km) ranges."""
+        mask = np.zeros(len(r_arr), dtype=bool)
+        for i, rv in enumerate(r_arr):
+            if i < n_inner:
+                if lo_inner is not None and rv >= lo_inner and rv <= hi_inner:
+                    mask[i] = True
+            else:
+                if lo_outer is not None and rv >= lo_outer and rv <= hi_outer:
+                    mask[i] = True
+        return mask
+
+    z_mask = lambda lo, hi: (height_vals >= lo) & (height_vals <= hi)
+
+    # Domain H1: 0.8×RMW to RMW+20km, Z=10–14 km
+    h1_r = r_h_mask(0.8, 1.0, 0.0, 20.0)
+    h1_z = z_mask(10.0, 14.0)
+
+    # Domain W1: 0.9×RMW to RMW+10km, Z=2–5 km
+    w1_r = r_h_mask(0.9, 1.0, 0.0, 10.0)
+    w1_z = z_mask(2.0, 5.0)
+
+    # Domain W2: RMW+30 to RMW+70km, Z=2–5 km
+    w2_r = r_h_mask(None, None, 30.0, 70.0)
+    w2_z = z_mask(2.0, 5.0)
+
+    try:
+        h1_vt = vt_anom[np.ix_(h1_z, h1_r)]
+        if np.all(np.isnan(h1_vt)):
+            return None
+        vortex_height = float(np.nanmax(h1_vt))
+
+        w1_zeta = zeta_anom[np.ix_(w1_z, w1_r)]
+        w2_zeta = zeta_anom[np.ix_(w2_z, w2_r)]
+        if np.all(np.isnan(w1_zeta)) or np.all(np.isnan(w2_zeta)):
+            return None
+        vortex_width = float(np.nanmean(w2_zeta) - np.nanmean(w1_zeta))
+
+        return {
+            "vortex_height": round(vortex_height, 3),
+            "vortex_width": round(vortex_width, 3),
+            "vortex_favorability": round(vortex_height - vortex_width, 3),
+        }
+    except Exception:
+        return None
+
+
+@app.get("/scatter/vp_favorability")
+def scatter_vp_favorability(
+    data_type: str = Query("merge", description="'swath' or 'merge'"),
+    color_by:  str = Query("dvmax_12h", description="dvmax_12h or dvmax_24h"),
+):
+    """
+    Return VP vs Vortex Favorability scatter data for all cases.
+    Designed for the Fig. 9 scatter plot from Fischer et al. (2025).
+    """
+    if data_type not in ("swath", "merge"):
+        raise HTTPException(status_code=400, detail="data_type must be 'swath' or 'merge'")
+    if color_by not in ("dvmax_12h", "dvmax_24h"):
+        raise HTTPException(status_code=400, detail="color_by must be dvmax_12h or dvmax_24h")
+
+    cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
+
+    points = []
+    for ci, meta in cache.items():
+        vp = meta.get("vp")
+        dvmax = meta.get(color_by)
+        if vp is None or dvmax is None:
+            continue
+
+        points.append({
+            "case_index": ci,
+            "storm_name": meta.get("storm_name", ""),
+            "datetime": meta.get("datetime", ""),
+            "vmax_kt": meta.get("vmax_kt"),
+            "vp": vp,
+            "vortex_favorability": meta.get("vortex_favorability"),
+            "vortex_height": meta.get("vortex_height"),
+            "vortex_width": meta.get("vortex_width"),
+            color_by: dvmax,
+        })
+
+    # Compute group statistics for 2σ ellipses
+    groups = {"RI": [], "SI": [], "NI": []}
+    for p in points:
+        if p["vortex_favorability"] is None:
+            continue
+        dv = p.get(color_by, 0) or 0
+        if dv >= 20:
+            groups["RI"].append(p)
+        elif dv > 0:
+            groups["SI"].append(p)
+        else:
+            groups["NI"].append(p)
+
+    ellipses = {}
+    for name, pts in groups.items():
+        if len(pts) < 3:
+            continue
+        vps = [p["vp"] for p in pts]
+        vfs = [p["vortex_favorability"] for p in pts]
+        ellipses[name] = {
+            "mean_vp": round(float(np.mean(vps)), 2),
+            "mean_vf": round(float(np.mean(vfs)), 2),
+            "std_vp": round(float(np.std(vps)), 2),
+            "std_vf": round(float(np.std(vfs)), 2),
+            "n": len(pts),
+        }
+
+    return JSONResponse({
+        "points": points, "color_by": color_by,
+        "ellipses": ellipses,
+        "n_total": len(points),
+        "n_with_vf": sum(1 for p in points if p["vortex_favorability"] is not None),
+    })
+
+
+@app.get("/climatology/info")
+def climatology_info():
+    """Return metadata about the loaded climatology."""
+    if not _climatology:
+        return JSONResponse({
+            "available": False,
+            "message": "Climatology not loaded. Run precompute_climatology.py.",
+        })
+
+    centres = _climatology.get("intensity_centres", np.array([]))
+    r_h = _climatology.get("r_h_axis", np.array([]))
+    h_km = _climatology.get("height_km", np.array([]))
+    n_inner = int(_climatology.get("n_inner", 0))
+
+    var_names = set()
+    for k in _climatology:
+        if k.endswith("_mean_25"):
+            var_names.add(k.rsplit("_mean_", 1)[0])
+
+    return JSONResponse({
+        "available": True,
+        "intensity_centres": [int(c) for c in centres],
+        "intensity_half_width_kt": 10,
+        "n_radial_bins": len(r_h),
+        "n_inner_bins": n_inner,
+        "n_heights": len(h_km),
+        "variables": sorted(var_names),
+    })
 
 
 from realtime_tdr_api import router as realtime_router
