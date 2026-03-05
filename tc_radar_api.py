@@ -5624,6 +5624,11 @@ def scatter_vp_favorability(
 
     cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
 
+    # Log whether vortex metrics have been finalized (debug aid)
+    print(f"[scatter] _vortex_eras_done={_vortex_eras_done}, "
+          f"_vortex_raw has {len(_vortex_raw)} entries, "
+          f"cache size={len(cache)}")
+
     points = []
     for ci, meta in cache.items():
         vp = meta.get("vp")
@@ -5672,12 +5677,14 @@ def scatter_vp_favorability(
             "n": len(pts),
         }
 
+    vortex_ready = _vortex_eras_done >= 2
     return JSONResponse(
         content={
             "points": points, "color_by": color_by,
             "ellipses": ellipses,
             "n_total": len(points),
             "n_with_vf": sum(1 for p in points if p["vortex_favorability"] is not None),
+            "vortex_ready": vortex_ready,
         },
         headers={"Cache-Control": "no-store"},
     )
