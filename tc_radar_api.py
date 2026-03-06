@@ -674,6 +674,8 @@ def _filter_cases_for_composite(
     min_year: int, max_year: int,
     min_shear_mag: float, max_shear_mag: float,
     min_shear_dir: float, max_shear_dir: float,
+    min_dtl: float = 0,
+    dtl_window: str = "24h",
     data_type: str = "swath",
 ) -> list[int]:
     """Return list of case_index values that pass all composite filters."""
@@ -724,6 +726,13 @@ def _filter_cases_for_composite(
                 # e.g. min=315, max=45 means "NW through NE"
                 if sddc < min_shear_dir and sddc > max_shear_dir:
                     continue
+
+        # Distance-to-land filter: exclude cases that approach/cross land
+        if min_dtl > 0:
+            dtl_key = "dtl_min_24h" if dtl_window == "24h" else "dtl_min_12h"
+            dtl_val = meta.get(dtl_key)
+            if dtl_val is None or dtl_val < min_dtl:
+                continue
 
         matching.append(idx)
     return matching
@@ -2608,6 +2617,8 @@ def _composite_filter_params(
     max_shear_mag:  float = Query(100,  ge=0,   le=100,  description="Max shear magnitude (kt)"),
     min_shear_dir:  float = Query(0,    ge=0,   le=360,  description="Min shear direction (deg)"),
     max_shear_dir:  float = Query(360,  ge=0,   le=360,  description="Max shear direction (deg)"),
+    min_dtl:        float = Query(0,    ge=0,   le=9999, description="Min distance-to-land (km); 0 = no filter"),
+    dtl_window:     str   = Query("24h",                 description="DTL forecast window: '12h' or '24h'"),
 ):
     return dict(
         min_intensity=min_intensity, max_intensity=max_intensity,
@@ -2616,6 +2627,7 @@ def _composite_filter_params(
         min_year=min_year, max_year=max_year,
         min_shear_mag=min_shear_mag, max_shear_mag=max_shear_mag,
         min_shear_dir=min_shear_dir, max_shear_dir=max_shear_dir,
+        min_dtl=min_dtl, dtl_window=dtl_window,
     )
 
 
@@ -2885,12 +2897,15 @@ def composite_count(
     max_shear_mag:  float = Query(100,  ge=0,   le=100),
     min_shear_dir:  float = Query(0,    ge=0,   le=360),
     max_shear_dir:  float = Query(360,  ge=0,   le=360),
+    min_dtl:        float = Query(0,    ge=0,   le=9999),
+    dtl_window:     str   = Query("24h"),
 ):
     """Quick endpoint to get case count for given filter criteria (no data loading)."""
     cases = _filter_cases_for_composite(
         min_intensity, max_intensity, min_vmax_change, max_vmax_change,
         min_tilt, max_tilt, min_year, max_year,
         min_shear_mag, max_shear_mag, min_shear_dir, max_shear_dir,
+        min_dtl=min_dtl, dtl_window=dtl_window,
         data_type=data_type,
     )
     return {
@@ -2916,6 +2931,7 @@ def composite_azimuthal_mean(
     min_year:       int   = Query(1997), max_year:       int   = Query(2024),
     min_shear_mag:  float = Query(0),    max_shear_mag:  float = Query(100),
     min_shear_dir:  float = Query(0),    max_shear_dir:  float = Query(360),
+    min_dtl:        float = Query(0),    dtl_window:     str   = Query("24h"),
 ):
     """Compute RMW-normalised composite azimuthal mean across matching cases."""
     if variable not in VARIABLES:
@@ -2930,6 +2946,7 @@ def composite_azimuthal_mean(
         min_intensity, max_intensity, min_vmax_change, max_vmax_change,
         min_tilt, max_tilt, min_year, max_year,
         min_shear_mag, max_shear_mag, min_shear_dir, max_shear_dir,
+        min_dtl=min_dtl, dtl_window=dtl_window,
         data_type=data_type,
     )
     if not matching:
@@ -3067,6 +3084,7 @@ def composite_quadrant_mean(
     min_year:       int   = Query(1997), max_year:       int   = Query(2024),
     min_shear_mag:  float = Query(0),    max_shear_mag:  float = Query(100),
     min_shear_dir:  float = Query(0),    max_shear_dir:  float = Query(360),
+    min_dtl:        float = Query(0),    dtl_window:     str   = Query("24h"),
 ):
     """Compute RMW-normalised composite shear-relative quadrant means."""
     if variable not in VARIABLES:
@@ -3081,6 +3099,7 @@ def composite_quadrant_mean(
         min_intensity, max_intensity, min_vmax_change, max_vmax_change,
         min_tilt, max_tilt, min_year, max_year,
         min_shear_mag, max_shear_mag, min_shear_dir, max_shear_dir,
+        min_dtl=min_dtl, dtl_window=dtl_window,
         data_type=data_type,
     )
     if not matching:
@@ -3235,6 +3254,7 @@ def composite_plan_view(
     min_year:       int   = Query(1997), max_year:       int   = Query(2024),
     min_shear_mag:  float = Query(0),    max_shear_mag:  float = Query(100),
     min_shear_dir:  float = Query(0),    max_shear_dir:  float = Query(360),
+    min_dtl:        float = Query(0),    dtl_window:     str   = Query("24h"),
 ):
     """Compute a composite plan-view mean at a specified height level."""
 
@@ -3251,6 +3271,7 @@ def composite_plan_view(
         min_intensity, max_intensity, min_vmax_change, max_vmax_change,
         min_tilt, max_tilt, min_year, max_year,
         min_shear_mag, max_shear_mag, min_shear_dir, max_shear_dir,
+        min_dtl=min_dtl, dtl_window=dtl_window,
         data_type=data_type,
     )
     if not matching:
@@ -3570,6 +3591,7 @@ def composite_cfad(
     min_year:       int   = Query(1997), max_year:       int   = Query(2024),
     min_shear_mag:  float = Query(0),    max_shear_mag:  float = Query(100),
     min_shear_dir:  float = Query(0),    max_shear_dir:  float = Query(360),
+    min_dtl:        float = Query(0),    dtl_window:     str   = Query("24h"),
 ):
     """Compute a Contoured Frequency by Altitude Diagram across matching cases."""
     if variable not in VARIABLES:
@@ -3595,6 +3617,7 @@ def composite_cfad(
         min_intensity, max_intensity, min_vmax_change, max_vmax_change,
         min_tilt, max_tilt, min_year, max_year,
         min_shear_mag, max_shear_mag, min_shear_dir, max_shear_dir,
+        min_dtl=min_dtl, dtl_window=dtl_window,
         data_type=data_type,
     )
     if not matching:
@@ -5586,6 +5609,10 @@ def _compute_vortex_metrics_for_case(case_index, ds, local_idx, data_type):
     try:
         h1_vt = vt_anom[np.ix_(h1_z, h1_r)]
         if np.all(np.isnan(h1_vt)):
+            if case_index < 10 or case_index % 50 == 0:
+                print(f"  [vortex skip] case {case_index}: H1 domain all-NaN "
+                      f"(h1_z={h1_z.sum()} levels, h1_r={h1_r.sum()} bins, "
+                      f"vmax={meta.get('vmax_kt')}, rmw={meta.get('rmw_km')})")
             return None
         raw_h1_max = float(np.nanmax(h1_vt))
 
