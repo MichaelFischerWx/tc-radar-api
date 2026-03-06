@@ -5376,6 +5376,172 @@ def _compute_anomaly_for_case(ds, local_idx, case_index, variable, data_type):
     }
 
 
+def _process_one_case_anomaly(case_idx, variable, data_type):
+    """
+    Compute the Z-score anomaly on the hybrid R_H grid for a single case.
+    Runs in the thread-pool worker — all args passed explicitly.
+    Returns (case_idx, anomaly_2d_np, r_h_axis, n_inner) or None on failure.
+    """
+    try:
+        cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
+        meta = cache.get(case_idx, {})
+        vmax = meta.get("vmax_kt")
+        rmw = meta.get("rmw_km")
+        if vmax is None or rmw is None or rmw <= 0:
+            return None
+
+        ds, local_idx = resolve_case(case_idx, data_type)
+
+        display_name, varname, cmap, units, vmin_lim, vmax_lim = VARIABLES[variable]
+        ref_varname = DERIVED_VARIABLES[variable][0] if variable in DERIVED_VARIABLES else varname
+
+        x_coords, y_coords, h_axis = _resolve_grid_and_haxis(ds, ref_varname)
+        height_vals = ds["height"].values
+
+        vol, _ = _extract_3d_volume(ds, local_idx, variable)
+        az_raw, cov, r_h_axis, n_inner = _compute_azimuthal_mean_hybrid(
+            vol, x_coords, y_coords, height_vals, h_axis, rmw, coverage_min=0.5
+        )
+
+        climo_varname = _CLIMO_VAR_MAP.get(varname, varname)
+        clim_mean, clim_std, clim_count, bin_centre = _get_climatology_for_intensity(
+            climo_varname, vmax
+        )
+        if clim_mean is None:
+            return None
+
+        anomaly = np.where(
+            np.isnan(az_raw) | np.isnan(clim_mean) | np.isnan(clim_std) | (clim_std == 0),
+            np.nan, (az_raw - clim_mean) / clim_std
+        )
+        return (case_idx, anomaly, r_h_axis, n_inner)
+    except Exception as e:
+        print(f"Composite anomaly: skipping case {case_idx}: {e}")
+        return None
+
+
+@app.get("/composite/anomaly_azimuthal_mean")
+def composite_anomaly_azimuthal_mean(
+    variable:       str   = Query("merged_tangential_wind", description="Variable key"),
+    data_type:      str   = Query("merge",                  description="'swath' or 'merge'"),
+    stream:         bool  = Query(False,                     description="Stream NDJSON progress events"),
+    min_intensity:  float = Query(0),    max_intensity:  float = Query(200),
+    min_vmax_change:float = Query(-100), max_vmax_change:float = Query(85),
+    min_tilt:       float = Query(0),    max_tilt:       float = Query(200),
+    min_year:       int   = Query(1997), max_year:       int   = Query(2024),
+    min_shear_mag:  float = Query(0),    max_shear_mag:  float = Query(100),
+    min_shear_dir:  float = Query(0),    max_shear_dir:  float = Query(360),
+    min_dtl:        float = Query(0),    dtl_window:     str   = Query("24h"),
+):
+    """
+    Composite Z-score anomaly on the hybrid R_H coordinate (Fischer et al. 2025).
+    Computes per-case anomalies against the intensity-binned climatology, then averages.
+    """
+    if variable not in VARIABLES:
+        raise HTTPException(status_code=400, detail=f"Unknown variable '{variable}'.")
+    if data_type not in ("swath", "merge"):
+        raise HTTPException(status_code=400, detail="data_type must be 'swath' or 'merge'")
+
+    matching = _filter_cases_for_composite(
+        min_intensity, max_intensity, min_vmax_change, max_vmax_change,
+        min_tilt, max_tilt, min_year, max_year,
+        min_shear_mag, max_shear_mag, min_shear_dir, max_shear_dir,
+        min_dtl=min_dtl, dtl_window=dtl_window,
+        data_type=data_type,
+    )
+    if not matching:
+        raise HTTPException(status_code=400, detail="No cases match the specified criteria.")
+    if len(matching) > _COMPOSITE_MAX_CASES:
+        matching = matching[:_COMPOSITE_MAX_CASES]
+
+    # Filter to cases with valid RMW and Vmax (needed for anomaly computation)
+    meta_cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
+    valid_cases = []
+    for ci in matching:
+        meta = meta_cache.get(ci, {})
+        rmw = meta.get("rmw_km")
+        vmax = meta.get("vmax_kt")
+        if (rmw is not None and not np.isnan(float(rmw)) and float(rmw) > 0
+                and vmax is not None):
+            valid_cases.append(ci)
+    if not valid_cases:
+        raise HTTPException(status_code=400, detail="No matching cases have valid RMW/Vmax data.")
+
+    display_name, varname, cmap, units, vmin, vmax_lim = VARIABLES[variable]
+
+    # Build work items — lightweight tuple per case
+    work_items = [(ci, variable, data_type) for ci in valid_cases]
+
+    def _compute(progress_cb=None):
+        accum_sum = None
+        accum_count = None
+        r_h_axis = None
+        n_inner = None
+        n_processed = 0
+        processed_indices = []
+
+        def _accum(result):
+            nonlocal accum_sum, accum_count, r_h_axis, n_inner, n_processed
+            case_idx, anomaly, rh, ni = result
+            if accum_sum is None:
+                r_h_axis = rh
+                n_inner = ni
+                accum_sum = np.zeros_like(anomaly)
+                accum_count = np.zeros_like(anomaly)
+            valid = ~np.isnan(anomaly)
+            accum_sum[valid] += anomaly[valid]
+            accum_count[valid] += 1
+            n_processed += 1
+            processed_indices.append(case_idx)
+
+        _process_composites_batched(
+            _process_one_case_anomaly, work_items, _accum,
+            progress_cb=progress_cb,
+        )
+
+        if n_processed == 0:
+            raise RuntimeError("Could not compute anomaly for any matching case. "
+                               "Ensure climatology is precomputed.")
+
+        min_cases = max(3, int(np.ceil(0.33 * n_processed)))
+        composite = np.where(accum_count >= min_cases, accum_sum / accum_count, np.nan)
+
+        # Get height from first valid case
+        first_ds, _ = resolve_case(processed_indices[0], data_type)
+        height_km = first_ds["height"].values
+
+        return {
+            "anomaly": _clean_2d(composite),
+            "r_h_axis": r_h_axis,
+            "n_inner": n_inner,
+            "height_km": [round(float(h), 2) for h in height_km],
+            "n_cases": n_processed,
+            "n_matched": len(matching),
+            "min_cases_per_bin": min_cases,
+            "case_list": _build_case_list(processed_indices, data_type),
+            "variable": {
+                "key": variable,
+                "display_name": display_name,
+                "units": units,
+                "anomaly_units": "\u03c3 (standardized)",
+                "colorscale": _cmap_to_plotly("RdBu_r"),
+                "vmin": -3, "vmax": 3,
+            },
+            "filters": {
+                "intensity": [min_intensity, max_intensity],
+                "vmax_change": [min_vmax_change, max_vmax_change],
+                "tilt": [min_tilt, max_tilt],
+                "year": [min_year, max_year],
+                "shear_mag": [min_shear_mag, max_shear_mag],
+                "shear_dir": [min_shear_dir, max_shear_dir],
+            },
+        }
+
+    if stream:
+        return _streaming_composite_response(_compute)
+    return JSONResponse(_compute())
+
+
 @app.get("/anomaly/azimuthal_mean")
 def anomaly_azimuthal_mean(
     case_index:   int = Query(..., ge=0, description="0-based case index"),
