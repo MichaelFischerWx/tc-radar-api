@@ -76,7 +76,7 @@ def _setup_earthdata_netrc():
 
     # Skip if no credentials configured
     if not EARTHDATA_USER and not EARTHDATA_TOKEN:
-        logger.info("Earthdata: no credentials configured (MergIR disabled)")
+        print("[global_archive] Earthdata: no credentials configured (MergIR disabled)")
         return
 
     # Write ~/.netrc
@@ -100,9 +100,9 @@ def _setup_earthdata_netrc():
         with open(netrc_path, "w") as f:
             f.write(netrc_entry)
         os.chmod(netrc_path, 0o600)
-        logger.info(f"Earthdata: wrote {netrc_path}")
+        print(f"[global_archive] Earthdata: wrote {netrc_path}")
     except Exception as e:
-        logger.warning(f"Earthdata: failed to write {netrc_path}: {e}")
+        print(f"[global_archive] Earthdata: FAILED to write {netrc_path}: {e}")
 
     # Write ~/.dodsrc for OPeNDAP cookie/redirect handling
     dodsrc_content = (
@@ -112,12 +112,15 @@ def _setup_earthdata_netrc():
     try:
         with open(dodsrc_path, "w") as f:
             f.write(dodsrc_content)
-        logger.info(f"Earthdata: wrote {dodsrc_path}")
+        print(f"[global_archive] Earthdata: wrote {dodsrc_path}")
     except Exception as e:
-        logger.warning(f"Earthdata: failed to write {dodsrc_path}: {e}")
+        print(f"[global_archive] Earthdata: FAILED to write {dodsrc_path}: {e}")
 
 
 # Run netrc setup at import time (before any OPeNDAP requests)
+print(f"[global_archive] EARTHDATA_USER={'set' if EARTHDATA_USER else 'empty'}, "
+      f"EARTHDATA_PASS={'set' if EARTHDATA_PASS else 'empty'}, "
+      f"EARTHDATA_TOKEN={'set' if EARTHDATA_TOKEN else 'empty'}")
 _setup_earthdata_netrc()
 
 _HTTP_HEADERS = {
