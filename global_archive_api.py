@@ -196,8 +196,13 @@ def _render_ir_png(frame_2d, vmin=170.0, vmax=310.0, scale=2):
     Render a 2D brightness temperature array to a base64 PNG.
 
     scale: upscale factor for higher resolution when zoomed in on the map.
-           Default 2 gives 2× resolution (e.g. 301→602 px for HURSAT).
-           Uses bilinear interpolation for smooth appearance.
+           Default 2 for MergIR (4km native). Use scale=4 for 8km data
+           (HURSAT, GridSat) to avoid blurriness when Leaflet stretches
+           the image across the map viewport.
+
+           Uses nearest-neighbor interpolation to preserve crisp pixel
+           boundaries — bilinear smears edges and creates false smoothness
+           that implies resolution the data doesn't have.
     """
     arr = np.asarray(frame_2d, dtype=np.float32)
 
@@ -219,11 +224,12 @@ def _render_ir_png(frame_2d, vmin=170.0, vmax=310.0, scale=2):
 
     img = Image.fromarray(rgba, "RGBA")
 
-    # Upscale for higher resolution when zoomed in on the map
+    # Upscale for higher resolution when zoomed in on the map.
+    # NEAREST preserves crisp pixel boundaries (no false smoothing).
     if scale and scale > 1:
         new_w = img.width * scale
         new_h = img.height * scale
-        img = img.resize((new_w, new_h), Image.BILINEAR)
+        img = img.resize((new_w, new_h), Image.NEAREST)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG", compress_level=1)
@@ -759,8 +765,8 @@ def hursat_frame(
     if frame_2d is None:
         raise HTTPException(status_code=500, detail="Failed to read frame data")
 
-    # Render PNG
-    png = _render_ir_png(frame_2d, vmin=170.0, vmax=310.0)
+    # Render PNG (HURSAT = 8km → scale=4 for crisp pixels)
+    png = _render_ir_png(frame_2d, vmin=170.0, vmax=310.0, scale=4)
 
     result = {
         "sid": sid,
@@ -1595,9 +1601,11 @@ def ir_frame(
         if source == "gridsat":
             frame_2d, ir_bounds = _load_gridsat_subset(frame_dt, frame_lat, frame_lon)
             half_domain = GRIDSAT_HALF_DOMAIN
+            ir_scale = 4  # 8km → 4x upscale
         else:
             frame_2d, ir_bounds = _load_mergir_subset(frame_dt, frame_lat, frame_lon)
             half_domain = MERGIR_HALF_DOMAIN
+            ir_scale = 3  # 4km → 3x upscale
 
         if frame_2d is None:
             raise HTTPException(
@@ -1607,7 +1615,7 @@ def ir_frame(
                 ),
             )
 
-        png = _render_ir_png(frame_2d, vmin=170.0, vmax=310.0)
+        png = _render_ir_png(frame_2d, vmin=170.0, vmax=310.0, scale=ir_scale)
         # Use actual bounds from data (not assumed center ± half_domain)
         bounds = ir_bounds or {
             "south": frame_lat - half_domain,
@@ -1643,7 +1651,7 @@ def ir_frame(
         if frame_2d is None:
             raise HTTPException(status_code=500, detail="Failed to read frame data")
 
-        png = _render_ir_png(frame_2d, vmin=170.0, vmax=310.0)
+        png = _render_ir_png(frame_2d, vmin=170.0, vmax=310.0, scale=4)
         result = {
             "sid": sid, "frame_idx": frame_idx,
             "datetime": dt_str, "source": "hursat",
@@ -1729,16 +1737,18 @@ def ir_batch(
                         frame_dt, frame_lat, frame_lon
                     )
                     half_domain = GRIDSAT_HALF_DOMAIN
+                    ir_scale = 4
                 else:
                     frame_2d, ir_bounds = _load_mergir_subset(
                         frame_dt, frame_lat, frame_lon
                     )
                     half_domain = MERGIR_HALF_DOMAIN
+                    ir_scale = 3
 
                 if frame_2d is None:
                     return (frame_idx, None)
 
-                png = _render_ir_png(frame_2d, vmin=170.0, vmax=310.0)
+                png = _render_ir_png(frame_2d, vmin=170.0, vmax=310.0, scale=ir_scale)
                 bounds = ir_bounds or {
                     "south": frame_lat - half_domain,
                     "north": frame_lat + half_domain,
@@ -1765,7 +1775,7 @@ def ir_batch(
                 if frame_2d is None:
                     return (frame_idx, None)
 
-                png = _render_ir_png(frame_2d, vmin=170.0, vmax=310.0)
+                png = _render_ir_png(frame_2d, vmin=170.0, vmax=310.0, scale=4)
                 result = {
                     "sid": sid, "frame_idx": frame_idx,
                     "datetime": dt_str, "source": "hursat",
