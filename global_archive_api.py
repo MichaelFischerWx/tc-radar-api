@@ -9,11 +9,12 @@ Endpoints:
     GET /global/hursat/meta?sid={SID}    — HURSAT frame list for a storm
     GET /global/hursat/frame?sid={SID}&frame_idx={N}  — Rendered IR frame as base64 PNG
     GET /global/health                   — Cache status
+    GET /global/hursat/debug?sid={SID}   — Debug NCEI connectivity
 
-HURSAT-B1 data on NCEI is available via two path patterns:
-  1. /data/hurricane-satellite-hursat-b1/archive/v06/{YEAR}/{SID}.nc  (combined file)
-  2. /pub/data/satellite/hursat/{YEAR}/{SID}/B1-IR-BD/*.nc  (per-frame files)
-This module tries both patterns with fallback.
+HURSAT-B1 v06 data on NCEI is stored as tar.gz archives:
+    https://www.ncei.noaa.gov/data/hurricane-satellite-hursat-b1/archive/v06/{YEAR}/
+    HURSAT_b1_v06_{SID}_{NAME}_c{DATE}.tar.gz
+Each tar.gz contains multiple per-frame NetCDF files.
 """
 
 import base64
@@ -22,6 +23,7 @@ import io
 import logging
 import os
 import re
+import tarfile
 import tempfile
 from collections import OrderedDict
 from datetime import datetime
@@ -38,24 +40,23 @@ router = APIRouter(tags=["global_archive"])
 
 # ── Configuration ────────────────────────────────────────────
 
-# Multiple NCEI URL patterns to try (in order of preference)
-HURSAT_URLS = [
-    # Pattern 1: v06 archive — combined NetCDF per storm (directory with .nc files)
-    "https://www.ncei.noaa.gov/data/hurricane-satellite-hursat-b1/archive/v06/{year}/{sid}/",
-    # Pattern 2: pub archive — per-frame NetCDFs in B1-IR-BD subfolder
-    "https://www.ncei.noaa.gov/pub/data/satellite/hursat/{year}/{sid}/B1-IR-BD/",
-    # Pattern 3: pub archive — sometimes B1-IR (no BD suffix)
-    "https://www.ncei.noaa.gov/pub/data/satellite/hursat/{year}/{sid}/B1-IR/",
-]
+HURSAT_V06_BASE = (
+    "https://www.ncei.noaa.gov/data/hurricane-satellite-hursat-b1/archive/v06"
+)
 
 HURSAT_START_YEAR = 1978
 HURSAT_END_YEAR = 2015
 
+_HTTP_HEADERS = {
+    "User-Agent": "TC-RADAR-API/1.0 (NOAA/HRD research; https://michaelfischerwx.github.io/TC-RADAR/)"
+}
+
 # ── Caches ───────────────────────────────────────────────────
 
-# LRU cache for open xarray datasets (keyed by SID)
-_ds_cache: OrderedDict = OrderedDict()
-_DS_CACHE_MAX = 5  # Max storms in memory (~5–25 MB each)
+# Cache for extracted NetCDF file paths from tar.gz (keyed by SID)
+# Value: list of (datetime_str, tmp_nc_path) tuples, sorted chronologically
+_extracted_cache: OrderedDict = OrderedDict()
+_EXTRACTED_CACHE_MAX = 5  # Max storms extracted at once
 
 # LRU cache for rendered PNG frames
 _frame_cache: OrderedDict = OrderedDict()
@@ -64,10 +65,6 @@ _FRAME_CACHE_MAX = 200  # ~200 × 250KB ≈ 50 MB max
 # LRU cache for HURSAT metadata (frame lists)
 _meta_cache: OrderedDict = OrderedDict()
 _META_CACHE_MAX = 500
-
-# Cache for per-frame file URLs (keyed by SID)
-_frame_urls_cache: OrderedDict = OrderedDict()
-_FRAME_URLS_CACHE_MAX = 200
 
 
 # ── IR Colormap (NOAA-style enhanced) ────────────────────────
@@ -145,116 +142,151 @@ def _parse_sid_year(sid: str) -> int:
     return 0
 
 
-def _discover_hursat_files(sid: str, year: int):
+def _find_tarball_url(sid: str, year: int) -> str | None:
     """
-    Discover HURSAT NetCDF files for a storm by trying multiple NCEI paths.
-    Returns (dir_url, nc_files) tuple, or (None, []) if not found.
+    Find the tar.gz URL for a storm on NCEI.
+    Scans the year directory listing for a file containing the SID.
     """
     import requests
 
-    headers = {
-        "User-Agent": "TC-RADAR-API/1.0 (NOAA/HRD research; https://michaelfischerwx.github.io/TC-RADAR/)"
-    }
+    year_url = f"{HURSAT_V06_BASE}/{year}/"
 
-    for url_pattern in HURSAT_URLS:
-        dir_url = url_pattern.format(year=year, sid=sid)
-        try:
-            logger.info(f"HURSAT: trying {dir_url}")
-            resp = requests.get(dir_url, timeout=15, headers=headers)
-            logger.info(f"HURSAT: {dir_url} → HTTP {resp.status_code} ({len(resp.text)} bytes)")
-            if resp.status_code != 200:
-                continue
+    try:
+        logger.info(f"HURSAT: listing {year_url}")
+        resp = requests.get(year_url, timeout=20, headers=_HTTP_HEADERS)
+        if resp.status_code != 200:
+            logger.info(f"HURSAT: year listing returned HTTP {resp.status_code}")
+            return None
 
-            # Parse HTML directory listing for .nc files
-            nc_files = re.findall(r'href="([^"]*\.nc[^"]*)"', resp.text)
-            # Filter out parent directory links, keep only filenames
-            nc_files = [f for f in nc_files if '/' not in f and f.endswith('.nc')]
+        # Find tar.gz files matching this SID
+        # Pattern: HURSAT_b1_v06_{SID}_{NAME}_c{DATE}.tar.gz
+        pattern = rf'href="(HURSAT_b1_v06_{re.escape(sid)}_[^"]+\.tar\.gz)"'
+        matches = re.findall(pattern, resp.text)
 
-            if nc_files:
-                # Sort by filename to get chronological order
-                nc_files.sort()
-                logger.info(f"HURSAT: found {len(nc_files)} .nc files at {dir_url}")
-                return dir_url, nc_files
+        if matches:
+            tarball_url = year_url + matches[0]
+            logger.info(f"HURSAT: found tarball {matches[0]}")
+            return tarball_url
 
-            logger.info(f"HURSAT: no .nc files parsed from {dir_url}")
+        logger.info(f"HURSAT: no tarball found for SID {sid} in {year_url}")
+        return None
 
-        except Exception as e:
-            logger.info(f"HURSAT: error checking {dir_url}: {e}")
-            continue
-
-    return None, []
+    except Exception as e:
+        logger.error(f"HURSAT: error listing {year_url}: {e}")
+        return None
 
 
-def _get_hursat_combined_dataset(sid: str):
-    """Fetch and cache a combined HURSAT NetCDF dataset (one file = all frames)."""
-    if sid in _ds_cache:
-        _ds_cache.move_to_end(sid)
-        return _ds_cache[sid]
-
-    import xarray as xr
+def _extract_tarball(sid: str, tarball_url: str) -> list:
+    """
+    Download a HURSAT tar.gz, extract NetCDF files to /tmp, return sorted list
+    of (datetime_str, nc_path) tuples.
+    """
     import requests
+
+    try:
+        logger.info(f"HURSAT: downloading {tarball_url}")
+        resp = requests.get(tarball_url, timeout=120, headers=_HTTP_HEADERS,
+                            stream=True)
+        resp.raise_for_status()
+
+        # Write to temp file
+        tmp_tar = tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False)
+        for chunk in resp.iter_content(chunk_size=1024 * 64):
+            tmp_tar.write(chunk)
+        tmp_tar.close()
+        tar_size = os.path.getsize(tmp_tar.name)
+        logger.info(f"HURSAT: downloaded {tar_size / 1024 / 1024:.1f} MB")
+
+        # Extract .nc files to a temp directory
+        extract_dir = tempfile.mkdtemp(prefix=f"hursat_{sid}_")
+
+        with tarfile.open(tmp_tar.name, "r:gz") as tar:
+            # Security: only extract .nc files, no path traversal
+            nc_members = [
+                m for m in tar.getmembers()
+                if m.name.endswith(".nc") and not m.name.startswith("/")
+                and ".." not in m.name
+            ]
+            logger.info(f"HURSAT: tar contains {len(nc_members)} .nc files")
+
+            frames = []
+            for member in nc_members:
+                # Extract to flat directory
+                member.name = os.path.basename(member.name)
+                tar.extract(member, path=extract_dir)
+                nc_path = os.path.join(extract_dir, member.name)
+
+                # Parse datetime from filename
+                dt_str = _parse_datetime_from_filename(member.name)
+                frames.append((dt_str, nc_path))
+
+        # Clean up tar file
+        os.unlink(tmp_tar.name)
+
+        # Sort by datetime
+        frames.sort(key=lambda x: x[0])
+
+        # Cache extracted paths
+        _evict_extracted_cache()
+        _extracted_cache[sid] = frames
+        if len(_extracted_cache) > _EXTRACTED_CACHE_MAX:
+            _evict_extracted_cache()
+
+        return frames
+
+    except Exception as e:
+        logger.error(f"HURSAT: failed to extract {tarball_url}: {e}")
+        return []
+
+
+def _evict_extracted_cache():
+    """Evict oldest entry from extracted cache and clean up tmp files."""
+    if len(_extracted_cache) >= _EXTRACTED_CACHE_MAX:
+        old_sid, old_frames = _extracted_cache.popitem(last=False)
+        for _, nc_path in old_frames:
+            try:
+                os.unlink(nc_path)
+            except OSError:
+                pass
+        # Try to remove the directory
+        if old_frames:
+            try:
+                os.rmdir(os.path.dirname(old_frames[0][1]))
+            except OSError:
+                pass
+        gc.collect()
+        logger.info(f"HURSAT: evicted cache for {old_sid}")
+
+
+def _get_extracted_frames(sid: str) -> list | None:
+    """Get extracted frames for a storm, downloading if needed."""
+    if sid in _extracted_cache:
+        _extracted_cache.move_to_end(sid)
+        return _extracted_cache[sid]
 
     year = _parse_sid_year(sid)
     if year < HURSAT_START_YEAR or year > HURSAT_END_YEAR:
         return None
 
-    dir_url, nc_files = _discover_hursat_files(sid, year)
-    if not dir_url or not nc_files:
+    tarball_url = _find_tarball_url(sid, year)
+    if not tarball_url:
         return None
 
-    # If there's just one .nc file, it's likely a combined dataset
-    # If there are many, they're per-frame files — store URLs for per-frame access
-    if len(nc_files) > 1:
-        # Per-frame mode — cache the file list and return None for combined ds
-        frame_urls = [dir_url + f for f in nc_files]
-        _frame_urls_cache[sid] = frame_urls
-        if len(_frame_urls_cache) > _FRAME_URLS_CACHE_MAX:
-            _frame_urls_cache.popitem(last=False)
-        return "PER_FRAME"  # sentinel value
-
-    # Single combined file
-    nc_url = dir_url + nc_files[0]
-    logger.info(f"Fetching combined HURSAT: {nc_url}")
-
-    headers = {
-        "User-Agent": "TC-RADAR-API/1.0 (NOAA/HRD research; https://michaelfischerwx.github.io/TC-RADAR/)"
-    }
-
-    try:
-        resp = requests.get(nc_url, timeout=60, headers=headers)
-        resp.raise_for_status()
-
-        tmp = tempfile.NamedTemporaryFile(suffix=".nc", delete=False)
-        tmp.write(resp.content)
-        tmp.close()
-
-        ds = xr.open_dataset(tmp.name, engine="netcdf4")
-
-        # Cache
-        _ds_cache[sid] = ds
-        if len(_ds_cache) > _DS_CACHE_MAX:
-            old_sid, old_ds = _ds_cache.popitem(last=False)
-            old_ds.close()
-            gc.collect()
-
-        return ds
-
-    except Exception as e:
-        logger.error(f"Failed to fetch combined HURSAT for {sid}: {e}")
-        return None
+    frames = _extract_tarball(sid, tarball_url)
+    return frames if frames else None
 
 
-def _parse_datetime_from_filename(filename: str):
+def _parse_datetime_from_filename(filename: str) -> str:
     """
     Extract datetime from HURSAT filename.
     Common patterns:
         HURSAT_b1_v06_2005236N23285_d20050823_s181500.nc
-        HURSAT-B1-2005236N23285-200508231815.nc
     """
     # Try pattern: d{YYYYMMDD}_s{HHMMSS}
     m = re.search(r'd(\d{8})_s(\d{6})', filename)
     if m:
-        return f"{m.group(1)[:4]}-{m.group(1)[4:6]}-{m.group(1)[6:8]}T{m.group(2)[:2]}:{m.group(2)[2:4]}:{m.group(2)[4:6]}"
+        d, t = m.group(1), m.group(2)
+        return f"{d[:4]}-{d[4:6]}-{d[6:8]}T{t[:2]}:{t[2:4]}:{t[4:6]}"
 
     # Try pattern: {SID}-{YYYYMMDDHHMM}
     m = re.search(r'-(\d{12})\.nc', filename)
@@ -262,7 +294,7 @@ def _parse_datetime_from_filename(filename: str):
         d = m.group(1)
         return f"{d[:4]}-{d[4:6]}-{d[6:8]}T{d[8:10]}:{d[10:12]}:00"
 
-    # Try pattern: {YYYYMMDD}{HHMM} somewhere in the name
+    # Fallback: any 8+ digit sequence that looks like a date
     m = re.search(r'(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})', filename)
     if m:
         return f"{m.group(1)}-{m.group(2)}-{m.group(3)}T{m.group(4)}:{m.group(5)}:00"
@@ -270,24 +302,12 @@ def _parse_datetime_from_filename(filename: str):
     return filename
 
 
-def _load_single_frame_nc(nc_url: str):
-    """Download and open a single per-frame NetCDF file, return the IR 2D array."""
+def _load_frame_from_nc(nc_path: str):
+    """Open a local NetCDF file and return the IR 2D array."""
     import xarray as xr
-    import requests
-
-    headers = {
-        "User-Agent": "TC-RADAR-API/1.0 (NOAA/HRD research; https://michaelfischerwx.github.io/TC-RADAR/)"
-    }
 
     try:
-        resp = requests.get(nc_url, timeout=30, headers=headers)
-        resp.raise_for_status()
-
-        tmp = tempfile.NamedTemporaryFile(suffix=".nc", delete=False)
-        tmp.write(resp.content)
-        tmp.close()
-
-        ds = xr.open_dataset(tmp.name, engine="netcdf4")
+        ds = xr.open_dataset(nc_path, engine="netcdf4")
 
         # Find the IR variable
         var_name = None
@@ -297,7 +317,6 @@ def _load_single_frame_nc(nc_url: str):
                 break
 
         if var_name is None:
-            # Try to find any variable that looks like brightness temp
             for v in ds.data_vars:
                 if ds[v].ndim >= 2:
                     var_name = v
@@ -305,10 +324,8 @@ def _load_single_frame_nc(nc_url: str):
 
         if var_name is None:
             ds.close()
-            os.unlink(tmp.name)
             return None
 
-        # Get the 2D frame (may have time dim of size 1)
         data = ds[var_name]
         if "time" in data.dims:
             frame = data.isel(time=0).values
@@ -316,15 +333,10 @@ def _load_single_frame_nc(nc_url: str):
             frame = data.values
 
         ds.close()
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
-
         return frame
 
     except Exception as e:
-        logger.warning(f"Failed to load frame {nc_url}: {e}")
+        logger.warning(f"Failed to load {nc_path}: {e}")
         return None
 
 
@@ -350,57 +362,23 @@ def hursat_meta(sid: str = Query(..., description="IBTrACS storm ID")):
         }
         return JSONResponse(result)
 
-    # Try to discover files
-    ds_or_sentinel = _get_hursat_combined_dataset(sid)
-
-    if ds_or_sentinel == "PER_FRAME":
-        # Per-frame mode — build metadata from filenames
-        frame_urls = _frame_urls_cache.get(sid, [])
-        if not frame_urls:
-            result = {"sid": sid, "available": False, "reason": "Data not found on NCEI"}
-            return JSONResponse(result)
-
-        frames = []
-        for i, url in enumerate(frame_urls):
-            filename = url.rsplit("/", 1)[-1]
-            dt = _parse_datetime_from_filename(filename)
-            frames.append({"index": i, "datetime": dt})
-
-        result = {
-            "sid": sid,
-            "available": True,
-            "n_frames": len(frames),
-            "frames": frames,
-            "mode": "per_frame",
-        }
-
-    elif ds_or_sentinel is not None:
-        # Combined dataset mode
-        ds = ds_or_sentinel
-        try:
-            times = ds["time"].values if "time" in ds.dims else []
-            n_frames = len(times)
-
-            frames = []
-            for i, t in enumerate(times):
-                dt = str(np.datetime_as_string(t, unit="s")) if hasattr(t, "astype") else str(t)
-                frames.append({"index": i, "datetime": dt})
-
-            result = {
-                "sid": sid,
-                "available": True,
-                "n_frames": n_frames,
-                "frames": frames,
-                "mode": "combined",
-            }
-        except Exception as e:
-            logger.error(f"Error reading HURSAT metadata for {sid}: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-    else:
+    frames = _get_extracted_frames(sid)
+    if not frames:
         result = {"sid": sid, "available": False, "reason": "Data not found on NCEI"}
         return JSONResponse(result)
 
-    # Cache result
+    frame_list = []
+    for i, (dt_str, _) in enumerate(frames):
+        frame_list.append({"index": i, "datetime": dt_str})
+
+    result = {
+        "sid": sid,
+        "available": True,
+        "n_frames": len(frames),
+        "frames": frame_list,
+    }
+
+    # Cache metadata
     _meta_cache[sid] = result
     if len(_meta_cache) > _META_CACHE_MAX:
         _meta_cache.popitem(last=False)
@@ -430,67 +408,21 @@ def hursat_frame(
             },
         )
 
-    # Determine if per-frame or combined mode
-    frame_urls = _frame_urls_cache.get(sid)
+    frames = _get_extracted_frames(sid)
+    if not frames:
+        raise HTTPException(status_code=404, detail="HURSAT data not found")
 
-    if frame_urls:
-        # Per-frame mode — download individual file
-        if frame_idx >= len(frame_urls):
-            raise HTTPException(
-                status_code=404,
-                detail=f"Frame index {frame_idx} out of range (0-{len(frame_urls)-1})",
-            )
+    if frame_idx >= len(frames):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Frame index {frame_idx} out of range (0-{len(frames)-1})",
+        )
 
-        nc_url = frame_urls[frame_idx]
-        frame_2d = _load_single_frame_nc(nc_url)
-        if frame_2d is None:
-            raise HTTPException(status_code=500, detail="Failed to load frame data")
+    dt_str, nc_path = frames[frame_idx]
 
-        filename = nc_url.rsplit("/", 1)[-1]
-        frame_dt = _parse_datetime_from_filename(filename)
-
-    else:
-        # Combined dataset mode
-        ds = _get_hursat_combined_dataset(sid)
-        if ds is None or ds == "PER_FRAME":
-            raise HTTPException(status_code=404, detail="HURSAT data not found")
-
-        try:
-            # Find IR variable
-            var_name = "irwin_cdr"
-            if var_name not in ds:
-                for alt in ["irwin", "irwin_2", "Tb", "IRWIN"]:
-                    if alt in ds:
-                        var_name = alt
-                        break
-                else:
-                    # Try any 3D variable
-                    for v in ds.data_vars:
-                        if ds[v].ndim >= 3:
-                            var_name = v
-                            break
-                    else:
-                        raise HTTPException(status_code=404, detail="No IR variable found")
-
-            n_times = ds.dims.get("time", 0)
-            if frame_idx >= n_times:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Frame index {frame_idx} out of range (0-{n_times-1})",
-                )
-
-            frame_2d = ds[var_name].isel(time=frame_idx).values
-
-            frame_dt = ""
-            if "time" in ds:
-                t = ds["time"].values[frame_idx]
-                frame_dt = str(np.datetime_as_string(t, unit="s"))
-
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Error extracting frame {frame_idx} for {sid}: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+    frame_2d = _load_frame_from_nc(nc_path)
+    if frame_2d is None:
+        raise HTTPException(status_code=500, detail="Failed to read frame data")
 
     # Render PNG
     png = _render_ir_png(frame_2d, vmin=170.0, vmax=310.0)
@@ -498,7 +430,7 @@ def hursat_frame(
     result = {
         "sid": sid,
         "frame_idx": frame_idx,
-        "datetime": frame_dt,
+        "datetime": dt_str,
         "frame": png,
     }
 
@@ -522,10 +454,10 @@ def global_health():
     """Health check for global archive endpoints."""
     return {
         "status": "ok",
-        "ds_cache_size": len(_ds_cache),
+        "extracted_cache_size": len(_extracted_cache),
         "frame_cache_size": len(_frame_cache),
         "meta_cache_size": len(_meta_cache),
-        "frame_urls_cache_size": len(_frame_urls_cache),
+        "extracted_storms": list(_extracted_cache.keys()),
     }
 
 
@@ -535,29 +467,26 @@ def hursat_debug(sid: str = Query("1992230N11325", description="IBTrACS storm ID
     import requests
 
     year = _parse_sid_year(sid)
-    headers = {
-        "User-Agent": "TC-RADAR-API/1.0 (NOAA/HRD research; https://michaelfischerwx.github.io/TC-RADAR/)"
-    }
 
-    results = []
-    for url_pattern in HURSAT_URLS:
-        dir_url = url_pattern.format(year=year, sid=sid)
-        try:
-            resp = requests.get(dir_url, timeout=15, headers=headers)
-            nc_files = re.findall(r'href="([^"]*\.nc[^"]*)"', resp.text) if resp.status_code == 200 else []
-            nc_files = [f for f in nc_files if '/' not in f and f.endswith('.nc')]
-            results.append({
-                "url": dir_url,
-                "status": resp.status_code,
-                "content_length": len(resp.text),
-                "nc_files_found": len(nc_files),
-                "nc_files": nc_files[:5],  # first 5 for brevity
-                "snippet": resp.text[:300] if resp.status_code == 200 else "",
-            })
-        except Exception as e:
-            results.append({
-                "url": dir_url,
-                "error": str(e),
-            })
+    # Check year directory
+    year_url = f"{HURSAT_V06_BASE}/{year}/"
+    year_result = {}
+    try:
+        resp = requests.get(year_url, timeout=20, headers=_HTTP_HEADERS)
+        year_result["url"] = year_url
+        year_result["status"] = resp.status_code
 
-    return {"sid": sid, "year": year, "url_checks": results}
+        if resp.status_code == 200:
+            # Find matching tarball
+            pattern = rf'href="(HURSAT_b1_v06_{re.escape(sid)}_[^"]+\.tar\.gz)"'
+            matches = re.findall(pattern, resp.text)
+            year_result["matching_tarballs"] = matches
+
+            # Also show sample tarballs for context
+            all_tarballs = re.findall(r'href="(HURSAT_b1_v06_[^"]+\.tar\.gz)"', resp.text)
+            year_result["total_tarballs"] = len(all_tarballs)
+            year_result["sample_tarballs"] = all_tarballs[:5]
+    except Exception as e:
+        year_result["error"] = str(e)
+
+    return {"sid": sid, "year": year, "year_directory": year_result}
