@@ -461,6 +461,47 @@ def global_health():
     }
 
 
+@router.get("/hursat/inspect")
+def hursat_inspect(sid: str = Query("1992230N11325", description="IBTrACS storm ID")):
+    """Inspect the first extracted NetCDF file to see variables and structure."""
+    import xarray as xr
+
+    frames = _get_extracted_frames(sid)
+    if not frames:
+        return {"error": "No frames extracted", "sid": sid}
+
+    dt_str, nc_path = frames[0]
+    result = {"sid": sid, "n_frames": len(frames), "first_file": nc_path, "datetime": dt_str}
+
+    try:
+        ds = xr.open_dataset(nc_path, engine="netcdf4")
+        result["variables"] = {}
+        for v in ds.data_vars:
+            var = ds[v]
+            result["variables"][v] = {
+                "dims": list(var.dims),
+                "shape": list(var.shape),
+                "dtype": str(var.dtype),
+            }
+            # Add min/max for numeric vars
+            try:
+                vals = var.values
+                if vals.size > 0 and vals.dtype.kind == 'f':
+                    finite = vals[np.isfinite(vals)]
+                    if len(finite) > 0:
+                        result["variables"][v]["min"] = float(np.min(finite))
+                        result["variables"][v]["max"] = float(np.max(finite))
+            except Exception:
+                pass
+        result["dims"] = {k: v for k, v in ds.dims.items()}
+        result["coords"] = list(ds.coords)
+        ds.close()
+    except Exception as e:
+        result["error"] = str(e)
+
+    return result
+
+
 @router.get("/hursat/debug")
 def hursat_debug(sid: str = Query("1992230N11325", description="IBTrACS storm ID to test")):
     """Debug endpoint: test NCEI connectivity for a storm."""
