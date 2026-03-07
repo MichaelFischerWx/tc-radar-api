@@ -331,7 +331,9 @@ def _load_frame_from_nc(nc_path: str):
             return None
 
         data = ds[var_name]
-        if "time" in data.dims:
+        if "htime" in data.dims:
+            frame = data.isel(htime=0).values
+        elif "time" in data.dims:
             frame = data.isel(time=0).values
         else:
             frame = data.values
