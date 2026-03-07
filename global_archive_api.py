@@ -152,12 +152,17 @@ def _discover_hursat_files(sid: str, year: int):
     """
     import requests
 
+    headers = {
+        "User-Agent": "TC-RADAR-API/1.0 (NOAA/HRD research; https://michaelfischerwx.github.io/TC-RADAR/)"
+    }
+
     for url_pattern in HURSAT_URLS:
         dir_url = url_pattern.format(year=year, sid=sid)
         try:
-            resp = requests.get(dir_url, timeout=15)
+            logger.info(f"HURSAT: trying {dir_url}")
+            resp = requests.get(dir_url, timeout=15, headers=headers)
+            logger.info(f"HURSAT: {dir_url} → HTTP {resp.status_code} ({len(resp.text)} bytes)")
             if resp.status_code != 200:
-                logger.debug(f"HURSAT path not found: {dir_url} (HTTP {resp.status_code})")
                 continue
 
             # Parse HTML directory listing for .nc files
@@ -168,13 +173,13 @@ def _discover_hursat_files(sid: str, year: int):
             if nc_files:
                 # Sort by filename to get chronological order
                 nc_files.sort()
-                logger.info(f"Found {len(nc_files)} HURSAT files at {dir_url}")
+                logger.info(f"HURSAT: found {len(nc_files)} .nc files at {dir_url}")
                 return dir_url, nc_files
 
-            logger.debug(f"No .nc files at {dir_url}")
+            logger.info(f"HURSAT: no .nc files parsed from {dir_url}")
 
         except Exception as e:
-            logger.debug(f"Error checking {dir_url}: {e}")
+            logger.info(f"HURSAT: error checking {dir_url}: {e}")
             continue
 
     return None, []
@@ -211,8 +216,12 @@ def _get_hursat_combined_dataset(sid: str):
     nc_url = dir_url + nc_files[0]
     logger.info(f"Fetching combined HURSAT: {nc_url}")
 
+    headers = {
+        "User-Agent": "TC-RADAR-API/1.0 (NOAA/HRD research; https://michaelfischerwx.github.io/TC-RADAR/)"
+    }
+
     try:
-        resp = requests.get(nc_url, timeout=60)
+        resp = requests.get(nc_url, timeout=60, headers=headers)
         resp.raise_for_status()
 
         tmp = tempfile.NamedTemporaryFile(suffix=".nc", delete=False)
@@ -266,8 +275,12 @@ def _load_single_frame_nc(nc_url: str):
     import xarray as xr
     import requests
 
+    headers = {
+        "User-Agent": "TC-RADAR-API/1.0 (NOAA/HRD research; https://michaelfischerwx.github.io/TC-RADAR/)"
+    }
+
     try:
-        resp = requests.get(nc_url, timeout=30)
+        resp = requests.get(nc_url, timeout=30, headers=headers)
         resp.raise_for_status()
 
         tmp = tempfile.NamedTemporaryFile(suffix=".nc", delete=False)
@@ -514,3 +527,37 @@ def global_health():
         "meta_cache_size": len(_meta_cache),
         "frame_urls_cache_size": len(_frame_urls_cache),
     }
+
+
+@router.get("/hursat/debug")
+def hursat_debug(sid: str = Query("1992230N11325", description="IBTrACS storm ID to test")):
+    """Debug endpoint: test NCEI connectivity for a storm."""
+    import requests
+
+    year = _parse_sid_year(sid)
+    headers = {
+        "User-Agent": "TC-RADAR-API/1.0 (NOAA/HRD research; https://michaelfischerwx.github.io/TC-RADAR/)"
+    }
+
+    results = []
+    for url_pattern in HURSAT_URLS:
+        dir_url = url_pattern.format(year=year, sid=sid)
+        try:
+            resp = requests.get(dir_url, timeout=15, headers=headers)
+            nc_files = re.findall(r'href="([^"]*\.nc[^"]*)"', resp.text) if resp.status_code == 200 else []
+            nc_files = [f for f in nc_files if '/' not in f and f.endswith('.nc')]
+            results.append({
+                "url": dir_url,
+                "status": resp.status_code,
+                "content_length": len(resp.text),
+                "nc_files_found": len(nc_files),
+                "nc_files": nc_files[:5],  # first 5 for brevity
+                "snippet": resp.text[:300] if resp.status_code == 200 else "",
+            })
+        except Exception as e:
+            results.append({
+                "url": dir_url,
+                "error": str(e),
+            })
+
+    return {"sid": sid, "year": year, "url_checks": results}
