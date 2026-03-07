@@ -220,16 +220,20 @@ def _render_ir_png(frame_2d, vmin=170.0, vmax=310.0, scale=2):
     """
     arr = np.asarray(frame_2d, dtype=np.float32)
 
+    # Identify invalid pixels BEFORE arithmetic to avoid NaN propagation
+    # warnings during the uint8 cast (NaN → float math → NaN → uint8 = warning)
+    mask = ~np.isfinite(arr) | (arr <= 0)
+
     # Cold clouds (low Tb) → high index → bright colors
     frac = 1.0 - (arr - vmin) / (vmax - vmin)
+    frac[mask] = 0.0  # Pre-zero invalid pixels so clip/cast is clean
     frac = np.clip(frac, 0.0, 1.0)
     indices = (frac * 255).astype(np.uint8)
 
     # Apply LUT
     rgba = _IR_LUT[indices]  # shape (H, W, 4)
 
-    # Set NaN / invalid pixels to transparent
-    mask = ~np.isfinite(arr) | (arr <= 0)
+    # Set invalid pixels to transparent
     rgba[mask] = [0, 0, 0, 0]
 
     # NOTE: Vertical orientation is handled in _load_frame_from_nc()
@@ -1642,41 +1646,74 @@ def ir_frame(
         if frame_lat is None or frame_lon is None:
             raise HTTPException(status_code=400, detail="lat/lon required for MergIR/GridSat")
 
-        if source == "gridsat":
-            frame_2d, ir_bounds = _load_gridsat_subset(frame_dt, frame_lat, frame_lon)
-            half_domain = GRIDSAT_HALF_DOMAIN
-            ir_scale = 4  # 8km → 4x upscale
-        else:
+        # Try primary source, then cascade to alternatives on failure.
+        # Priority: MergIR → GridSat → HURSAT (for 2000+ storms)
+        #           GridSat → HURSAT             (for pre-2000 storms)
+        frame_2d = None
+        actual_source = source
+
+        if source == "mergir":
             frame_2d, ir_bounds = _load_mergir_subset(frame_dt, frame_lat, frame_lon)
             half_domain = MERGIR_HALF_DOMAIN
             ir_scale = 3  # 4km → 3x upscale
 
+        if frame_2d is None and (source in ("mergir", "gridsat")):
+            # Cascade: try GridSat
+            frame_2d, ir_bounds = _load_gridsat_subset(frame_dt, frame_lat, frame_lon)
+            if frame_2d is not None:
+                actual_source = "gridsat"
+                half_domain = GRIDSAT_HALF_DOMAIN
+                ir_scale = 4  # 8km → 4x upscale
+
+        if frame_2d is None:
+            # Final cascade: try HURSAT if available
+            try:
+                hursat_frames = _get_extracted_frames(sid, storm_lon=frame_lon)
+                if hursat_frames and frame_idx < len(hursat_frames):
+                    frame_tuple = hursat_frames[frame_idx]
+                    nc_path = frame_tuple[1]
+                    frame_2d, ir_bounds = _load_frame_from_nc(nc_path)
+                    if frame_2d is not None:
+                        actual_source = "hursat"
+                        ir_scale = 4
+                        png = _render_ir_png(frame_2d, vmin=170.0, vmax=310.0, scale=ir_scale)
+                        result = {
+                            "sid": sid, "frame_idx": frame_idx,
+                            "datetime": frame_info["datetime"],
+                            "source": actual_source,
+                            "frame": png,
+                        }
+                        if ir_bounds:
+                            result["bounds"] = ir_bounds
+            except Exception as e:
+                logger.debug(f"HURSAT fallback failed for {sid} frame {frame_idx}: {e}")
+
         if frame_2d is None:
             raise HTTPException(
                 status_code=502,
-                detail=f"Failed to retrieve {source} data" + (
-                    " (check Earthdata token)" if source == "mergir" else ""
-                ),
+                detail=f"No IR data available from any source for {frame_info['datetime']}",
             )
 
-        png = _render_ir_png(frame_2d, vmin=170.0, vmax=310.0, scale=ir_scale)
-        # Always use consistent requested bounds (center ± half_domain)
-        # rather than actual data extent, so every frame plots the same
-        # domain size on the map. OPeNDAP subsets can return slightly
-        # truncated extents, causing visible domain jumps between frames.
-        # Any edge pixels outside the data are transparent (NaN).
-        bounds = {
-            "south": frame_lat - half_domain,
-            "north": frame_lat + half_domain,
-            "west": frame_lon - half_domain,
-            "east": frame_lon + half_domain,
-        }
-        result = {
-            "sid": sid, "frame_idx": frame_idx,
-            "datetime": frame_info["datetime"], "source": source,
-            "frame": png,
-            "bounds": bounds,
-        }
+        # Build result for MergIR/GridSat path (HURSAT result built above)
+        if actual_source != "hursat":
+            png = _render_ir_png(frame_2d, vmin=170.0, vmax=310.0, scale=ir_scale)
+            # Always use consistent requested bounds (center ± half_domain)
+            # rather than actual data extent, so every frame plots the same
+            # domain size on the map. OPeNDAP subsets can return slightly
+            # truncated extents, causing visible domain jumps between frames.
+            # Any edge pixels outside the data are transparent (NaN).
+            bounds = {
+                "south": frame_lat - half_domain,
+                "north": frame_lat + half_domain,
+                "west": frame_lon - half_domain,
+                "east": frame_lon + half_domain,
+            }
+            result = {
+                "sid": sid, "frame_idx": frame_idx,
+                "datetime": frame_info["datetime"], "source": actual_source,
+                "frame": png,
+                "bounds": bounds,
+            }
 
     else:
         # HURSAT path (default)
