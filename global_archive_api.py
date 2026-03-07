@@ -14,9 +14,10 @@ Endpoints:
     GET /global/hursat/debug?sid={SID}   — Debug NCEI connectivity
 
 Data sources:
-    HURSAT-B1 v06 (1978–2015): NCEI tar.gz archives, storm-centered 8km 3-hourly
+    GridSat-B1 CDR (1980–2024): NCEI THREDDS, global 8km 3-hourly, no auth required
     MergIR (2000–present): NASA GES DISC, global 4km half-hourly, requires Earthdata token
-    Priority: MergIR preferred for 2000+, HURSAT fallback for 1978–1999
+    HURSAT-B1 v06 (1978–2015): NCEI tar.gz archives, storm-centered 8km 3-hourly (legacy fallback)
+    Priority: MergIR (2000+) > GridSat (1980-2024) > HURSAT (1978-2015 fallback)
 """
 
 import base64
@@ -52,6 +53,14 @@ HURSAT_END_YEAR = 2015
 # MergIR (NASA GES DISC GPM_MERGIR) — via OPeNDAP for server-side subsetting
 MERGIR_OPENDAP = "https://disc2.gesdisc.eosdis.nasa.gov/opendap/MERGED_IR/GPM_MERGIR.1"
 MERGIR_START_YEAR = 1998  # Extended back from Feb 2000 in June 2025
+
+# GridSat-B1 CDR (NOAA/NCEI THREDDS) — 3-hourly global IR, 0.07° (~8km), 1980–present
+# No authentication required (public NCEI data)
+GRIDSAT_THREDDS = "https://www.ncei.noaa.gov/thredds/dodsC/cdr/gridsat"
+GRIDSAT_DIRECT = "https://www.ncei.noaa.gov/data/geostationary-ir-channel-brightness-temperature-gridsat-b1/access"
+GRIDSAT_START_YEAR = 1980
+GRIDSAT_END_YEAR = 2024  # Updates paused since March 2024
+GRIDSAT_HALF_DOMAIN = 5.0  # Same box size as MergIR for consistency
 
 # Earthdata credentials for MergIR access (set via env vars on Render)
 # Option 1: Bearer token (EARTHDATA_TOKEN) — preferred
@@ -1076,6 +1085,15 @@ def _load_mergir_subset(target_dt: datetime, center_lat: float, center_lon: floa
                         )
                         continue
 
+                    # Validate data completeness (fix strip/partial frame loading)
+                    valid_frac = np.count_nonzero(np.isfinite(tb) & (tb > 0)) / tb.size
+                    if valid_frac < 0.3:
+                        logger.warning(
+                            f"MergIR: {url_label} data too sparse "
+                            f"({valid_frac:.0%} valid pixels), trying next source"
+                        )
+                        continue
+
                     # MergIR lat is ascending (south→north), flip so
                     # row 0 = north (as Leaflet imageOverlay expects)
                     return tb[::-1], actual_bounds
@@ -1093,6 +1111,236 @@ def _load_mergir_subset(target_dt: datetime, center_lat: float, center_lon: floa
     return None, None
 
 
+# ══════════════════════════════════════════════════════════════
+#  GridSat-B1 Data Access (1980–2024)
+# ══════════════════════════════════════════════════════════════
+
+def _gridsat_thredds_url(dt: datetime) -> str:
+    """
+    Build THREDDS OPeNDAP URL for the GridSat-B1 file at a given datetime.
+    Pattern: {BASE}/{YYYY}/GRIDSAT-B1.{YYYY}.{MM}.{DD}.{HH}.v02r01.nc
+    Files are 3-hourly at 00, 03, 06, 09, 12, 15, 18, 21 UTC.
+    """
+    # Round to nearest 3-hour interval
+    hour_3 = (dt.hour // 3) * 3
+    dt_3h = dt.replace(hour=hour_3, minute=0, second=0, microsecond=0)
+    return (
+        f"{GRIDSAT_THREDDS}/{dt_3h.year}/"
+        f"GRIDSAT-B1.{dt_3h.year}.{dt_3h.month:02d}.{dt_3h.day:02d}"
+        f".{dt_3h.hour:02d}.v02r01.nc"
+    )
+
+
+def _gridsat_direct_url(dt: datetime) -> str:
+    """
+    Build direct HTTPS download URL for GridSat-B1 file.
+    Pattern: {BASE}/{YYYY}/GRIDSAT-B1.{YYYY}.{MM}.{DD}.{HH}.v02r01.nc
+    """
+    hour_3 = (dt.hour // 3) * 3
+    dt_3h = dt.replace(hour=hour_3, minute=0, second=0, microsecond=0)
+    return (
+        f"{GRIDSAT_DIRECT}/{dt_3h.year}/"
+        f"GRIDSAT-B1.{dt_3h.year}.{dt_3h.month:02d}.{dt_3h.day:02d}"
+        f".{dt_3h.hour:02d}.v02r01.nc"
+    )
+
+
+def _load_gridsat_subset(target_dt: datetime, center_lat: float, center_lon: float):
+    """
+    Fetch a single GridSat-B1 Tb snapshot, cropped to a
+    GRIDSAT_HALF_DOMAIN degree box around (center_lat, center_lon).
+
+    Tries OPeNDAP (THREDDS) first for efficient server-side subsetting,
+    falls back to direct HTTPS download if needed.
+
+    GridSat-B1 specs:
+      - Variable: irwin_cdr (CDR-quality IR window ~11μm BT)
+      - Lat: -70 to 70, 0.07° spacing (~2001 points)
+      - Lon: -180 to 180, 0.07° spacing (~5143 points)
+      - Time: single time step per file (3-hourly)
+
+    Returns (2D numpy array of Tb, bounds_dict) or (None, None) on failure.
+    """
+    import requests
+    import xarray as xr
+
+    # Round to nearest 3-hour interval
+    hour_3 = (target_dt.hour // 3) * 3
+    file_dt = target_dt.replace(hour=hour_3, minute=0, second=0, microsecond=0)
+
+    thredds_url = _gridsat_thredds_url(file_dt)
+    direct_url = _gridsat_direct_url(file_dt)
+
+    # Spatial bounds for subsetting
+    lat_min = center_lat - GRIDSAT_HALF_DOMAIN
+    lat_max = center_lat + GRIDSAT_HALF_DOMAIN
+    lon_min = center_lon - GRIDSAT_HALF_DOMAIN
+    lon_max = center_lon + GRIDSAT_HALF_DOMAIN
+
+    # Clamp to GridSat domain
+    lat_min = max(lat_min, -70.0)
+    lat_max = min(lat_max, 70.0)
+    lon_min = max(lon_min, -180.0)
+    lon_max = min(lon_max, 180.0)
+
+    # Strategy 1: OPeNDAP via THREDDS (efficient server-side subsetting)
+    try:
+        logger.info(f"GridSat: trying OPeNDAP {thredds_url[:100]}...")
+        ds = xr.open_dataset(thredds_url, engine="netcdf4")
+
+        # Find the IR window variable
+        var_name = None
+        for candidate in ["irwin_cdr", "irwin", "Tb", "IRWIN"]:
+            if candidate in ds:
+                var_name = candidate
+                break
+        if var_name is None:
+            for v in ds.data_vars:
+                if ds[v].ndim >= 2:
+                    var_name = v
+                    break
+
+        if var_name is None:
+            ds.close()
+            logger.warning("GridSat: no IR variable found in dataset")
+        else:
+            da = ds[var_name]
+            # Select first time step if time dimension exists
+            if "time" in da.dims:
+                da = da.isel(time=0)
+
+            # Spatial subset
+            da_sub = da.sel(
+                lat=slice(lat_min, lat_max),
+                lon=slice(lon_min, lon_max),
+            )
+
+            tb = da_sub.values
+            actual_lats = da_sub.coords["lat"].values
+            actual_lons = da_sub.coords["lon"].values
+            ds.close()
+
+            if tb is not None and tb.size > 0 and len(actual_lats) > 1 and len(actual_lons) > 1:
+                actual_bounds = {
+                    "south": float(np.min(actual_lats)),
+                    "north": float(np.max(actual_lats)),
+                    "west": float(np.min(actual_lons)),
+                    "east": float(np.max(actual_lons)),
+                }
+
+                # Validate coordinate coverage
+                expected_range = 2 * GRIDSAT_HALF_DOMAIN
+                actual_lat_range = actual_bounds["north"] - actual_bounds["south"]
+                actual_lon_range = actual_bounds["east"] - actual_bounds["west"]
+                if actual_lat_range < expected_range * 0.5 or actual_lon_range < expected_range * 0.5:
+                    logger.warning(
+                        f"GridSat: OPeNDAP subset too small "
+                        f"({actual_lat_range:.1f}° × {actual_lon_range:.1f}°)"
+                    )
+                else:
+                    # Validate data completeness (fix strip/partial loading)
+                    valid_frac = np.count_nonzero(np.isfinite(tb) & (tb > 0)) / tb.size
+                    if valid_frac < 0.3:
+                        logger.warning(
+                            f"GridSat: OPeNDAP data too sparse "
+                            f"({valid_frac:.0%} valid pixels), trying direct download"
+                        )
+                    else:
+                        logger.info(
+                            f"GridSat: got {tb.shape} subset, "
+                            f"{valid_frac:.0%} valid, bounds: "
+                            f"S={actual_bounds['south']:.2f} N={actual_bounds['north']:.2f} "
+                            f"W={actual_bounds['west']:.2f} E={actual_bounds['east']:.2f}"
+                        )
+                        # GridSat lat is ascending (-70 to 70), flip to north-at-top
+                        if len(actual_lats) >= 2 and actual_lats[-1] > actual_lats[0]:
+                            tb = tb[::-1]
+                        return tb, actual_bounds
+
+    except Exception as e:
+        logger.warning(f"GridSat: OPeNDAP failed: {e}")
+
+    # Strategy 2: Direct HTTPS download + local subsetting
+    tmp = None
+    try:
+        logger.info(f"GridSat: downloading full file {direct_url[:100]}...")
+        resp = requests.get(direct_url, timeout=120, headers=_HTTP_HEADERS)
+        if resp.status_code != 200:
+            logger.info(f"GridSat: HTTP {resp.status_code} for direct download")
+            return None, None
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".nc", delete=False)
+        tmp.write(resp.content)
+        tmp.close()
+        file_size_mb = len(resp.content) / 1024 / 1024
+        logger.info(f"GridSat: downloaded {file_size_mb:.1f} MB")
+
+        ds = xr.open_dataset(tmp.name, engine="h5netcdf")
+
+        var_name = None
+        for candidate in ["irwin_cdr", "irwin", "Tb", "IRWIN"]:
+            if candidate in ds:
+                var_name = candidate
+                break
+        if var_name is None:
+            for v in ds.data_vars:
+                if ds[v].ndim >= 2:
+                    var_name = v
+                    break
+
+        if var_name is None:
+            ds.close()
+            os.unlink(tmp.name)
+            return None, None
+
+        da = ds[var_name]
+        if "time" in da.dims:
+            da = da.isel(time=0)
+
+        da_sub = da.sel(
+            lat=slice(lat_min, lat_max),
+            lon=slice(lon_min, lon_max),
+        )
+
+        tb = da_sub.values
+        actual_lats = da_sub.coords["lat"].values
+        actual_lons = da_sub.coords["lon"].values
+        ds.close()
+        os.unlink(tmp.name)
+        tmp = None
+
+        if tb is not None and tb.size > 0 and len(actual_lats) > 1 and len(actual_lons) > 1:
+            actual_bounds = {
+                "south": float(np.min(actual_lats)),
+                "north": float(np.max(actual_lats)),
+                "west": float(np.min(actual_lons)),
+                "east": float(np.max(actual_lons)),
+            }
+
+            # Validate data completeness
+            valid_frac = np.count_nonzero(np.isfinite(tb) & (tb > 0)) / tb.size
+            if valid_frac < 0.3:
+                logger.warning(
+                    f"GridSat: direct download data too sparse ({valid_frac:.0%} valid)"
+                )
+                return None, None
+
+            # Flip to north-at-top if needed
+            if len(actual_lats) >= 2 and actual_lats[-1] > actual_lats[0]:
+                tb = tb[::-1]
+            return tb, actual_bounds
+
+    except Exception as e:
+        logger.warning(f"GridSat: direct download failed: {e}")
+        if tmp:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+
+    return None, None
+
+
 # ── Unified IR Endpoints ──────────────────────────────────────
 
 @router.get("/ir/meta")
@@ -1102,10 +1350,10 @@ def ir_meta(
     storm_lon: float = Query(0.0, description="Storm longitude for satellite selection"),
 ):
     """
-    Return IR frame metadata for a storm, auto-selecting HURSAT or MergIR.
+    Return IR frame metadata for a storm, auto-selecting source.
 
-    Priority: MergIR for 2000+, HURSAT for 1978-1999.
-    For MergIR, track data is needed to know storm positions.
+    Priority: MergIR (2000+) > GridSat (1980-2024) > HURSAT (1978-2015 fallback).
+    For MergIR/GridSat, track data is needed to know storm positions.
     """
     import json as json_mod
 
@@ -1119,26 +1367,28 @@ def ir_meta(
 
     year = _parse_sid_year(sid)
 
-    # Determine source
+    # Determine source — priority: MergIR (2000+) > GridSat (1980-2024) > HURSAT (fallback)
     source = None
     _earthdata_configured = bool(EARTHDATA_TOKEN or EARTHDATA_USER)
     if year >= MERGIR_START_YEAR and _earthdata_configured:
         source = "mergir"
+    elif GRIDSAT_START_YEAR <= year <= GRIDSAT_END_YEAR:
+        source = "gridsat"
     elif HURSAT_START_YEAR <= year <= HURSAT_END_YEAR:
         source = "hursat"
     elif year >= MERGIR_START_YEAR and not _earthdata_configured:
-        # MergIR available but no credentials configured
-        result = {
-            "sid": sid,
-            "available": False,
-            "source": "mergir",
-            "reason": "MergIR requires Earthdata credentials (not configured)",
-        }
-        return JSONResponse(result)
+        # MergIR available but no credentials; try GridSat if in range
+        if GRIDSAT_START_YEAR <= year <= GRIDSAT_END_YEAR:
+            source = "gridsat"
+        else:
+            result = {
+                "sid": sid, "available": False, "source": "mergir",
+                "reason": "MergIR requires Earthdata credentials (not configured)",
+            }
+            return JSONResponse(result)
     else:
         result = {
-            "sid": sid,
-            "available": False,
+            "sid": sid, "available": False,
             "reason": f"No IR data available for year {year}",
         }
         return JSONResponse(result)
@@ -1163,6 +1413,67 @@ def ir_meta(
         result = {
             "sid": sid, "available": True, "source": "hursat",
             "n_frames": len(frames), "frames": frame_list,
+        }
+
+    # Handle GridSat path (same track-based frame list as MergIR)
+    elif source == "gridsat":
+        track_points = []
+        if track:
+            try:
+                track_points = json_mod.loads(track)
+            except (json_mod.JSONDecodeError, TypeError):
+                pass
+
+        if not track_points:
+            # Fall back to HURSAT if available
+            if HURSAT_START_YEAR <= year <= HURSAT_END_YEAR:
+                frames = _get_extracted_frames(sid, storm_lon=storm_lon)
+                if frames:
+                    frame_list = [
+                        {
+                            "index": i, "datetime": ft[0],
+                            **({"satellite": ft[2]} if len(ft) > 2 and ft[2] else {}),
+                        }
+                        for i, ft in enumerate(frames)
+                    ]
+                    result = {
+                        "sid": sid, "available": True, "source": "hursat",
+                        "n_frames": len(frames), "frames": frame_list,
+                    }
+                    _mergir_meta_cache[cache_key] = result
+                    if len(_mergir_meta_cache) > _MERGIR_META_CACHE_MAX:
+                        _mergir_meta_cache.popitem(last=False)
+                    return JSONResponse(
+                        result,
+                        headers={"Cache-Control": "public, max-age=3600"},
+                    )
+
+            result = {
+                "sid": sid, "available": False, "source": "gridsat",
+                "reason": "Track data required for GridSat (pass track parameter)",
+            }
+            return JSONResponse(result)
+
+        gridsat_frames = _build_mergir_frame_list(track_points)
+        if not gridsat_frames:
+            result = {
+                "sid": sid, "available": False, "source": "gridsat",
+                "reason": "No valid track times for GridSat",
+            }
+            return JSONResponse(result)
+
+        frame_list = [
+            {
+                "index": i,
+                "datetime": f["datetime"],
+                "lat": f["lat"],
+                "lon": f["lon"],
+            }
+            for i, f in enumerate(gridsat_frames)
+        ]
+        result = {
+            "sid": sid, "available": True, "source": "gridsat",
+            "n_frames": len(gridsat_frames), "frames": frame_list,
         }
 
     # Handle MergIR path
@@ -1248,7 +1559,7 @@ def ir_frame(
 ):
     """
     Return a rendered IR frame as base64 PNG.
-    Auto-selects HURSAT vs MergIR based on cached metadata.
+    Auto-selects source (MergIR/GridSat/HURSAT) based on cached metadata.
     """
     cache_key = (f"ir_{sid}", frame_idx)
 
@@ -1267,8 +1578,8 @@ def ir_frame(
 
     year = _parse_sid_year(sid)
 
-    if source == "mergir" and meta and meta.get("available"):
-        # MergIR path: need lat/lon for the specific frame
+    if source in ("mergir", "gridsat") and meta and meta.get("available"):
+        # MergIR/GridSat path: need lat/lon for the specific frame
         frames = meta.get("frames", [])
         if frame_idx >= len(frames):
             raise HTTPException(status_code=404, detail=f"Frame {frame_idx} out of range")
@@ -1279,27 +1590,34 @@ def ir_frame(
         frame_dt = datetime.fromisoformat(frame_info["datetime"])
 
         if frame_lat is None or frame_lon is None:
-            raise HTTPException(status_code=400, detail="lat/lon required for MergIR")
+            raise HTTPException(status_code=400, detail="lat/lon required for MergIR/GridSat")
 
-        frame_2d, mergir_bounds = _load_mergir_subset(frame_dt, frame_lat, frame_lon)
+        if source == "gridsat":
+            frame_2d, ir_bounds = _load_gridsat_subset(frame_dt, frame_lat, frame_lon)
+            half_domain = GRIDSAT_HALF_DOMAIN
+        else:
+            frame_2d, ir_bounds = _load_mergir_subset(frame_dt, frame_lat, frame_lon)
+            half_domain = MERGIR_HALF_DOMAIN
 
         if frame_2d is None:
             raise HTTPException(
                 status_code=502,
-                detail="Failed to retrieve MergIR data (check Earthdata token)",
+                detail=f"Failed to retrieve {source} data" + (
+                    " (check Earthdata token)" if source == "mergir" else ""
+                ),
             )
 
         png = _render_ir_png(frame_2d, vmin=170.0, vmax=310.0)
         # Use actual bounds from data (not assumed center ± half_domain)
-        bounds = mergir_bounds or {
-            "south": frame_lat - MERGIR_HALF_DOMAIN,
-            "north": frame_lat + MERGIR_HALF_DOMAIN,
-            "west": frame_lon - MERGIR_HALF_DOMAIN,
-            "east": frame_lon + MERGIR_HALF_DOMAIN,
+        bounds = ir_bounds or {
+            "south": frame_lat - half_domain,
+            "north": frame_lat + half_domain,
+            "west": frame_lon - half_domain,
+            "east": frame_lon + half_domain,
         }
         result = {
             "sid": sid, "frame_idx": frame_idx,
-            "datetime": frame_info["datetime"], "source": "mergir",
+            "datetime": frame_info["datetime"], "source": source,
             "frame": png,
             "bounds": bounds,
         }
@@ -1391,7 +1709,7 @@ def ir_batch(
             return (frame_idx, _frame_cache[cache_key])
 
         try:
-            if source == "mergir" and meta and meta.get("available"):
+            if source in ("mergir", "gridsat") and meta and meta.get("available"):
                 frames_meta = meta.get("frames", [])
                 if frame_idx >= len(frames_meta):
                     return (frame_idx, None)
@@ -1406,22 +1724,30 @@ def ir_batch(
                 if frame_lat is None or frame_lon is None:
                     return (frame_idx, None)
 
-                frame_2d, mergir_bounds = _load_mergir_subset(
-                    frame_dt, frame_lat, frame_lon
-                )
+                if source == "gridsat":
+                    frame_2d, ir_bounds = _load_gridsat_subset(
+                        frame_dt, frame_lat, frame_lon
+                    )
+                    half_domain = GRIDSAT_HALF_DOMAIN
+                else:
+                    frame_2d, ir_bounds = _load_mergir_subset(
+                        frame_dt, frame_lat, frame_lon
+                    )
+                    half_domain = MERGIR_HALF_DOMAIN
+
                 if frame_2d is None:
                     return (frame_idx, None)
 
                 png = _render_ir_png(frame_2d, vmin=170.0, vmax=310.0)
-                bounds = mergir_bounds or {
-                    "south": frame_lat - MERGIR_HALF_DOMAIN,
-                    "north": frame_lat + MERGIR_HALF_DOMAIN,
-                    "west": frame_lon - MERGIR_HALF_DOMAIN,
-                    "east": frame_lon + MERGIR_HALF_DOMAIN,
+                bounds = ir_bounds or {
+                    "south": frame_lat - half_domain,
+                    "north": frame_lat + half_domain,
+                    "west": frame_lon - half_domain,
+                    "east": frame_lon + half_domain,
                 }
                 result = {
                     "sid": sid, "frame_idx": frame_idx,
-                    "datetime": frame_info["datetime"], "source": "mergir",
+                    "datetime": frame_info["datetime"], "source": source,
                     "frame": png,
                     "bounds": bounds,
                 }
@@ -1488,6 +1814,7 @@ def global_health():
         "earthdata_configured": bool(EARTHDATA_TOKEN or EARTHDATA_USER),
         "earthdata_method": "token" if EARTHDATA_TOKEN else ("user/pass" if EARTHDATA_USER else "none"),
         "mergir_available": bool(EARTHDATA_TOKEN or EARTHDATA_USER),
+        "gridsat_available": True,
     }
 
 
