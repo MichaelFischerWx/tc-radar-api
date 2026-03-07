@@ -1674,12 +1674,12 @@ def ir_batch(
     """
     Fetch multiple IR frames in one request using concurrent workers.
     Returns a dict mapping frame index → frame data (or null on failure).
-    Server-side concurrency is capped at 3 workers to limit RAM usage.
+    Server-side concurrency is capped at 5 workers to limit RAM usage.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    MAX_BATCH = 10      # Max frames per batch request
-    MAX_WORKERS = 3     # Concurrent OPeNDAP/file reads
+    MAX_BATCH = 15      # Max frames per batch request
+    MAX_WORKERS = 5     # Concurrent OPeNDAP/file reads
 
     # Parse indices
     try:
