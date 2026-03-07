@@ -818,75 +818,196 @@ def _find_nearest_half_hour(target_dt, ir_times):
     return best_idx, best_diff
 
 
+# Earthdata session (reused across requests for cookie persistence)
+_earthdata_session = None
+
+
+def _get_earthdata_session():
+    """Get or create a requests session with Earthdata credentials."""
+    global _earthdata_session
+    if _earthdata_session is not None:
+        return _earthdata_session
+
+    import requests
+
+    session = requests.Session()
+
+    if EARTHDATA_USER and EARTHDATA_PASS:
+        session.auth = (EARTHDATA_USER, EARTHDATA_PASS)
+    elif EARTHDATA_TOKEN:
+        session.headers.update({"Authorization": f"Bearer {EARTHDATA_TOKEN}"})
+
+    _earthdata_session = session
+    return session
+
+
+def _mergir_direct_file_url(dt: datetime) -> str:
+    """
+    Build direct download URL for the MergIR file covering a given datetime.
+    Pattern: {BASE_DATA}/{YYYY}/{DOY:03d}/merg_{YYYYMMDDHH}_4km-pixel.nc4
+    """
+    jday = dt.timetuple().tm_yday
+    time_str = dt.strftime("%Y%m%d%H")
+    return (
+        f"https://disc2.gesdisc.eosdis.nasa.gov/data/MERGED_IR/GPM_MERGIR.1"
+        f"/{dt.year}/{jday:03d}/merg_{time_str}_4km-pixel.nc4"
+    )
+
+
+def _mergir_subset_url(dt: datetime, center_lat: float, center_lon: float) -> str:
+    """
+    Build OPeNDAP subset URL that returns only the geographic subset we need.
+    Appends .nc4 suffix + constraint expression to request server-side subsetting.
+    This downloads ~1-2 MB instead of ~130 MB for the full file.
+
+    GES DISC OPeNDAP supports: {opendap_url}.nc4?Tb[time][lat_start:lat_end][lon_start:lon_end]
+    MergIR grid: lat -60 to 60 (0.03636° spacing, ~3300 pts), lon -180 to 180 (~9896 pts)
+    """
+    jday = dt.timetuple().tm_yday
+    time_str = dt.strftime("%Y%m%d%H")
+    base = (
+        f"{MERGIR_OPENDAP}/{dt.year}/{jday:03d}/"
+        f"merg_{time_str}_4km-pixel.nc4"
+    )
+
+    # Convert lat/lon bounds to grid indices
+    # MergIR: lat from -60 to 60 in ~3301 steps, lon from -180 to 180 in ~9896 steps
+    lat_min = center_lat - MERGIR_HALF_DOMAIN
+    lat_max = center_lat + MERGIR_HALF_DOMAIN
+    lon_min = center_lon - MERGIR_HALF_DOMAIN
+    lon_max = center_lon + MERGIR_HALF_DOMAIN
+
+    # Clamp to grid bounds
+    lat_min = max(lat_min, -60.0)
+    lat_max = min(lat_max, 60.0)
+    lon_min = max(lon_min, -180.0)
+    lon_max = min(lon_max, 180.0)
+
+    # Grid spacing: ~0.036364° for lat, ~0.036378° for lon
+    lat_idx_min = int((lat_min + 60.0) / 0.036364)
+    lat_idx_max = int((lat_max + 60.0) / 0.036364)
+    lon_idx_min = int((lon_min + 180.0) / 0.036378)
+    lon_idx_max = int((lon_max + 180.0) / 0.036378)
+
+    # Build constraint expression for server-side subsetting
+    # Request both time steps (usually 2 per file), subset lat/lon
+    constraint = (
+        f"Tb[0:1][{lat_idx_min}:{lat_idx_max}][{lon_idx_min}:{lon_idx_max}],"
+        f"lat[{lat_idx_min}:{lat_idx_max}],"
+        f"lon[{lon_idx_min}:{lon_idx_max}],"
+        f"time[0:1]"
+    )
+
+    return f"{base}.nc4?{constraint}"
+
+
 def _load_mergir_subset(target_dt: datetime, center_lat: float, center_lon: float):
     """
-    Fetch a single MergIR Tb snapshot via OPeNDAP, cropped to a
+    Fetch a single MergIR Tb snapshot, cropped to a
     MERGIR_HALF_DOMAIN degree box around (center_lat, center_lon).
 
-    Uses xr.open_dataset(url) which leverages OPeNDAP for server-side
-    subsetting — only the needed subset is transferred.
-
-    Requires Earthdata credentials configured for OPeNDAP access via
-    a ~/.netrc file or session cookies on the Render server. On Render,
-    set EARTHDATA_TOKEN env var and configure ~/.netrc at startup.
+    Uses requests with Earthdata session auth to download the file,
+    then opens locally with xarray for subsetting.
+    Downloads to temp file, extracts subset, deletes temp file.
 
     Returns 2D numpy array of brightness temperatures, or None on failure.
     """
     import xarray as xr
+    from datetime import timedelta
 
-    # Try the file matching the truncated hour first, then next hour
+    session = _get_earthdata_session()
+    if not session:
+        logger.warning("MergIR: no Earthdata session available")
+        return None
+
     file_dt = target_dt.replace(minute=0, second=0, microsecond=0)
 
-    from datetime import timedelta
     for attempt_dt in [file_dt, file_dt + timedelta(hours=1)]:
-        url = _mergir_opendap_file_url(attempt_dt)
+        # Try OPeNDAP subset URL first (small ~1-2 MB download)
+        subset_url = _mergir_subset_url(attempt_dt, center_lat, center_lon)
+        # Fall back to full file download if subset fails
+        full_url = _mergir_direct_file_url(attempt_dt)
 
-        try:
-            logger.info(f"MergIR: opening OPeNDAP {url}")
-            ds = xr.open_dataset(url)
-        except (OSError, ValueError) as e:
-            logger.info(f"MergIR: OPeNDAP open failed for {url}: {e}")
-            continue
+        for url_label, url in [("subset", subset_url), ("full", full_url)]:
+            try:
+                logger.info(f"MergIR: downloading {url_label} from {url[:120]}...")
+                resp = session.get(url, timeout=90, allow_redirects=True)
 
-        try:
-            ir_times = ds["time"].values
-            tidx, tdiff = _find_nearest_half_hour(target_dt, ir_times)
+                if resp.status_code in (401, 403):
+                    logger.warning(
+                        f"MergIR: auth failed ({resp.status_code}), "
+                        f"resetting session"
+                    )
+                    global _earthdata_session
+                    _earthdata_session = None
+                    session = _get_earthdata_session()
+                    continue
 
-            if tdiff > 20.0:
-                # Time mismatch too large, try next file
-                ds.close()
+                if resp.status_code != 200:
+                    logger.info(f"MergIR: HTTP {resp.status_code} for {url_label}")
+                    continue
+
+                # Write to temp file
+                tmp = tempfile.NamedTemporaryFile(suffix=".nc4", delete=False)
+                tmp.write(resp.content)
+                tmp.close()
+                file_size_mb = len(resp.content) / 1024 / 1024
+                logger.info(f"MergIR: downloaded {url_label} {file_size_mb:.1f} MB")
+
+            except Exception as e:
+                logger.warning(f"MergIR: {url_label} download failed: {e}")
                 continue
 
-            # Subset spatially on native grid (OPeNDAP does server-side slicing)
-            tb = ds["Tb"].isel(time=tidx).sel(
-                lat=slice(
-                    center_lat - MERGIR_HALF_DOMAIN,
-                    center_lat + MERGIR_HALF_DOMAIN,
-                ),
-                lon=slice(
-                    center_lon - MERGIR_HALF_DOMAIN,
-                    center_lon + MERGIR_HALF_DOMAIN,
-                ),
-            ).values
-
-            ds.close()
-
-            if tb is not None and tb.size > 0:
-                logger.info(
-                    f"MergIR: got {tb.shape} subset for "
-                    f"({center_lat:.1f}, {center_lon:.1f})"
-                )
-                # MergIR lat is ascending (south→north), flip so
-                # row 0 = north (as Leaflet imageOverlay expects)
-                return tb[::-1]
-
-        except Exception as e:
-            logger.warning(f"MergIR: subset failed for {url}: {e}")
             try:
+                ds = xr.open_dataset(tmp.name, engine="h5netcdf")
+
+                ir_times = ds["time"].values
+                tidx, tdiff = _find_nearest_half_hour(target_dt, ir_times)
+
+                if tdiff > 20.0:
+                    ds.close()
+                    os.unlink(tmp.name)
+                    continue
+
+                # For subset download, data is already cropped
+                # For full file, need to subset spatially
+                if url_label == "full":
+                    tb = ds["Tb"].isel(time=tidx).sel(
+                        lat=slice(
+                            center_lat - MERGIR_HALF_DOMAIN,
+                            center_lat + MERGIR_HALF_DOMAIN,
+                        ),
+                        lon=slice(
+                            center_lon - MERGIR_HALF_DOMAIN,
+                            center_lon + MERGIR_HALF_DOMAIN,
+                        ),
+                    ).values
+                else:
+                    # Subset already cropped by OPeNDAP constraint
+                    tb = ds["Tb"].isel(time=tidx).values
+
                 ds.close()
-            except Exception:
-                pass
-            continue
+                os.unlink(tmp.name)
+
+                if tb is not None and tb.size > 0:
+                    logger.info(
+                        f"MergIR: got {tb.shape} subset for "
+                        f"({center_lat:.1f}, {center_lon:.1f})"
+                    )
+                    # MergIR lat is ascending (south→north), flip so
+                    # row 0 = north (as Leaflet imageOverlay expects)
+                    return tb[::-1]
+
+            except Exception as e:
+                logger.warning(f"MergIR: {url_label} parse failed: {e}")
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+                continue
+
+            # If we got here with the subset, no need to try full
+            break
 
     logger.warning(f"MergIR: no data found for {target_dt}")
     return None
@@ -1142,6 +1263,127 @@ def ir_frame(
     return JSONResponse(
         result,
         headers={"Cache-Control": "public, max-age=86400", "X-Cache": "MISS"},
+    )
+
+
+@router.get("/ir/batch")
+def ir_batch(
+    sid: str = Query(..., description="IBTrACS storm ID"),
+    indices: str = Query(..., description="Comma-separated frame indices, e.g. '0,1,2,3,4'"),
+):
+    """
+    Fetch multiple IR frames in one request using concurrent workers.
+    Returns a dict mapping frame index → frame data (or null on failure).
+    Server-side concurrency is capped at 3 workers to limit RAM usage.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    MAX_BATCH = 10      # Max frames per batch request
+    MAX_WORKERS = 3     # Concurrent OPeNDAP/file reads
+
+    # Parse indices
+    try:
+        idx_list = [int(x.strip()) for x in indices.split(",") if x.strip()]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid indices format")
+
+    if len(idx_list) > MAX_BATCH:
+        idx_list = idx_list[:MAX_BATCH]
+
+    # Look up cached meta to determine source
+    meta = _mergir_meta_cache.get(sid)
+    if not meta:
+        meta = _meta_cache.get(sid)
+    source = meta.get("source", "hursat") if meta else "hursat"
+
+    def fetch_single_frame(frame_idx: int):
+        """Fetch one frame, return (idx, result_dict) or (idx, None)."""
+        cache_key = (sid, frame_idx)
+
+        # Check frame cache first
+        if cache_key in _frame_cache:
+            _frame_cache.move_to_end(cache_key)
+            return (frame_idx, _frame_cache[cache_key])
+
+        try:
+            if source == "mergir" and meta and meta.get("available"):
+                frames_meta = meta.get("frames", [])
+                if frame_idx >= len(frames_meta):
+                    return (frame_idx, None)
+
+                frame_info = frames_meta[frame_idx]
+                frame_dt = datetime.strptime(
+                    frame_info["datetime"], "%Y-%m-%dT%H:%M:%S"
+                )
+                frame_lat = frame_info.get("lat")
+                frame_lon = frame_info.get("lon")
+
+                if frame_lat is None or frame_lon is None:
+                    return (frame_idx, None)
+
+                frame_2d = _load_mergir_subset(frame_dt, frame_lat, frame_lon)
+                if frame_2d is None:
+                    return (frame_idx, None)
+
+                png = _render_ir_png(frame_2d, vmin=170.0, vmax=310.0)
+                result = {
+                    "sid": sid, "frame_idx": frame_idx,
+                    "datetime": frame_info["datetime"], "source": "mergir",
+                    "frame": png,
+                    "bounds": {
+                        "south": frame_lat - MERGIR_HALF_DOMAIN,
+                        "north": frame_lat + MERGIR_HALF_DOMAIN,
+                        "west": frame_lon - MERGIR_HALF_DOMAIN,
+                        "east": frame_lon + MERGIR_HALF_DOMAIN,
+                    },
+                }
+            else:
+                # HURSAT path
+                frames = _get_extracted_frames(sid, storm_lon=0.0)
+                if not frames or frame_idx >= len(frames):
+                    return (frame_idx, None)
+
+                frame_tuple = frames[frame_idx]
+                dt_str, nc_path = frame_tuple[0], frame_tuple[1]
+                satellite = frame_tuple[2] if len(frame_tuple) > 2 else ""
+
+                frame_2d, bounds = _load_frame_from_nc(nc_path)
+                if frame_2d is None:
+                    return (frame_idx, None)
+
+                png = _render_ir_png(frame_2d, vmin=170.0, vmax=310.0)
+                result = {
+                    "sid": sid, "frame_idx": frame_idx,
+                    "datetime": dt_str, "source": "hursat",
+                    "frame": png,
+                }
+                if satellite:
+                    result["satellite"] = satellite
+                if bounds:
+                    result["bounds"] = bounds
+
+            # Cache it
+            _frame_cache[cache_key] = result
+            if len(_frame_cache) > _FRAME_CACHE_MAX:
+                _frame_cache.popitem(last=False)
+
+            return (frame_idx, result)
+
+        except Exception as e:
+            logger.warning(f"Batch frame {frame_idx} failed: {e}")
+            return (frame_idx, None)
+
+    # Fetch frames concurrently
+    results = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(fetch_single_frame, idx): idx for idx in idx_list}
+        for future in as_completed(futures):
+            idx, data = future.result()
+            results[str(idx)] = data
+
+    return JSONResponse(
+        {"sid": sid, "source": source, "frames": results},
+        headers={"Cache-Control": "public, max-age=3600"},
     )
 
 
