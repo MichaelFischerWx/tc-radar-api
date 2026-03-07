@@ -279,20 +279,24 @@ def _get_extracted_frames(sid: str) -> list | None:
 def _parse_datetime_from_filename(filename: str) -> str:
     """
     Extract datetime from HURSAT filename.
-    Common patterns:
-        HURSAT_b1_v06_2005236N23285_d20050823_s181500.nc
+    Actual v06 format:
+        {SID}.{NAME}.{YYYY}.{MM}.{DD}.{HHMM}.{...}.hursat-b1.v06.nc
+        e.g. 1992230N11325.ANDREW.1992.08.16.1800.43.MET-4.022.hursat-b1.v06.nc
     """
-    # Try pattern: d{YYYYMMDD}_s{HHMMSS}
+    # Primary pattern: {SID}.{NAME}.{YYYY}.{MM}.{DD}.{HHMM}
+    m = re.search(r'\.\d{4}\.(\d{2})\.(\d{2})\.(\d{4})\.', filename)
+    if m:
+        # Extract year from the 4-digit sequence before the MM.DD.HHMM
+        ym = re.search(r'\.(\d{4})\.(\d{2})\.(\d{2})\.(\d{4})\.', filename)
+        if ym:
+            yyyy, mm, dd, hhmm = ym.group(1), ym.group(2), ym.group(3), ym.group(4)
+            return f"{yyyy}-{mm}-{dd}T{hhmm[:2]}:{hhmm[2:]}:00"
+
+    # Fallback pattern: d{YYYYMMDD}_s{HHMMSS}
     m = re.search(r'd(\d{8})_s(\d{6})', filename)
     if m:
         d, t = m.group(1), m.group(2)
         return f"{d[:4]}-{d[4:6]}-{d[6:8]}T{t[:2]}:{t[2:4]}:{t[4:6]}"
-
-    # Try pattern: {SID}-{YYYYMMDDHHMM}
-    m = re.search(r'-(\d{12})\.nc', filename)
-    if m:
-        d = m.group(1)
-        return f"{d[:4]}-{d[4:6]}-{d[6:8]}T{d[8:10]}:{d[10:12]}:00"
 
     # Fallback: any 8+ digit sequence that looks like a date
     m = re.search(r'(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})', filename)
@@ -307,7 +311,7 @@ def _load_frame_from_nc(nc_path: str):
     import xarray as xr
 
     try:
-        ds = xr.open_dataset(nc_path, engine="netcdf4")
+        ds = xr.open_dataset(nc_path, engine="h5netcdf")
 
         # Find the IR variable
         var_name = None
@@ -474,7 +478,7 @@ def hursat_inspect(sid: str = Query("1992230N11325", description="IBTrACS storm 
     result = {"sid": sid, "n_frames": len(frames), "first_file": nc_path, "datetime": dt_str}
 
     try:
-        ds = xr.open_dataset(nc_path, engine="netcdf4")
+        ds = xr.open_dataset(nc_path, engine="h5netcdf")
         result["variables"] = {}
         for v in ds.data_vars:
             var = ds[v]
