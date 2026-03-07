@@ -161,39 +161,44 @@ _META_CACHE_MAX = 50
 _data_load_semaphore = threading.Semaphore(3)
 
 
-# ── IR Colormap (NOAA-style enhanced) ────────────────────────
+# ── IR Colormap (matches radar archive: NOAA-style enhanced) ─
 
-IR_COLORMAP = [
-    [0.0,    (8,   8,   8)],
-    [0.15,   (40,  40,  40)],
-    [0.35,   (90,  90,  90)],
-    [0.45,   (20,  90,  200)],
-    [0.55,   (0,   180, 255)],
-    [0.65,   (0,   255, 180)],
-    [0.72,   (255, 255, 0)],
-    [0.80,   (255, 140, 0)],
-    [0.88,   (255, 40,  40)],
-    [0.94,   (200, 0,   200)],
-    [1.0,    (255, 255, 255)],
+IR_COLORMAP_STOPS = [
+    (0.00,   8,   8,   8),
+    (0.15,  40,  40,  40),
+    (0.30,  90,  90,  90),
+    (0.40, 140, 140, 140),
+    (0.50, 200, 200, 200),
+    (0.55,   0, 180, 255),
+    (0.60,   0, 100, 255),
+    (0.65,   0, 255,   0),
+    (0.70, 255, 255,   0),
+    (0.75, 255, 180,   0),
+    (0.80, 255,  80,   0),
+    (0.85, 255,   0,   0),
+    (0.90, 180,   0, 180),
+    (0.95, 255, 180, 255),
+    (1.00, 255, 255, 255),
 ]
 
 
 @lru_cache(maxsize=1)
 def _build_ir_lut():
-    """Build 256-entry RGBA lookup table from IR_COLORMAP."""
+    """Build 256-entry RGBA lookup table from IR_COLORMAP_STOPS."""
+    stops = IR_COLORMAP_STOPS
     lut = np.zeros((256, 4), dtype=np.uint8)
     for i in range(256):
         frac = i / 255.0
-        for j in range(len(IR_COLORMAP) - 1):
-            f0, c0 = IR_COLORMAP[j]
-            f1, c1 = IR_COLORMAP[j + 1]
-            if f0 <= frac <= f1:
-                t = (frac - f0) / (f1 - f0) if f1 != f0 else 0
-                r = int(c0[0] + t * (c1[0] - c0[0]))
-                g = int(c0[1] + t * (c1[1] - c0[1]))
-                b = int(c0[2] + t * (c1[2] - c0[2]))
-                lut[i] = [r, g, b, 255]
+        lo, hi = stops[0], stops[-1]
+        for s in range(len(stops) - 1):
+            if frac >= stops[s][0] and frac <= stops[s + 1][0]:
+                lo, hi = stops[s], stops[s + 1]
                 break
+        t = 0.0 if hi[0] == lo[0] else (frac - lo[0]) / (hi[0] - lo[0])
+        lut[i, 0] = int(lo[1] + t * (hi[1] - lo[1]) + 0.5)
+        lut[i, 1] = int(lo[2] + t * (hi[2] - lo[2]) + 0.5)
+        lut[i, 2] = int(lo[3] + t * (hi[3] - lo[3]) + 0.5)
+        lut[i, 3] = 255
     return lut
 
 
