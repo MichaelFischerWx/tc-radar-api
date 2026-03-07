@@ -28,6 +28,7 @@ import os
 import re
 import tarfile
 import tempfile
+import threading
 from collections import OrderedDict
 from datetime import datetime
 from functools import lru_cache
@@ -141,15 +142,23 @@ _HTTP_HEADERS = {
 # Cache for extracted NetCDF file paths from tar.gz (keyed by SID)
 # Value: list of (datetime_str, tmp_nc_path) tuples, sorted chronologically
 _extracted_cache: OrderedDict = OrderedDict()
-_EXTRACTED_CACHE_MAX = 5  # Max storms extracted at once
+_EXTRACTED_CACHE_MAX = 3  # Max storms extracted at once (each uses disk + memory)
 
 # LRU cache for rendered PNG frames
+# With scale=4 upscaling, each base64 PNG is ~300-500 KB.
+# Browser caches all frames in JS anyway, so server cache is just
+# to avoid re-rendering on rapid replays. Keep small for 2 GB Render.
 _frame_cache: OrderedDict = OrderedDict()
-_FRAME_CACHE_MAX = 200  # ~200 × 250KB ≈ 50 MB max
+_FRAME_CACHE_MAX = 40  # ~40 × 400KB ≈ 16 MB max
 
 # LRU cache for HURSAT metadata (frame lists)
 _meta_cache: OrderedDict = OrderedDict()
-_META_CACHE_MAX = 500
+_META_CACHE_MAX = 50
+
+# Semaphore to limit concurrent data loading (OPeNDAP / HTTP downloads).
+# Each load can consume 50-150 MB transiently; on a 2 GB Render instance
+# we must cap concurrent loads to avoid OOM.
+_data_load_semaphore = threading.Semaphore(3)
 
 
 # ── IR Colormap (NOAA-style enhanced) ────────────────────────
@@ -223,6 +232,7 @@ def _render_ir_png(frame_2d, vmin=170.0, vmax=310.0, scale=2):
     # No flip needed here.
 
     img = Image.fromarray(rgba, "RGBA")
+    del arr, frac, indices, rgba, mask  # Free intermediate arrays
 
     # Upscale for higher resolution when zoomed in on the map.
     # NEAREST preserves crisp pixel boundaries (no false smoothing).
@@ -983,6 +993,18 @@ def _load_mergir_subset(target_dt: datetime, center_lat: float, center_lon: floa
     import xarray as xr
     from datetime import timedelta
 
+    # Acquire semaphore to limit concurrent loads (OOM protection)
+    if not _data_load_semaphore.acquire(timeout=60):
+        logger.warning("MergIR: semaphore timeout — too many concurrent loads")
+        return None, None
+
+    try:
+        return _load_mergir_subset_inner(target_dt, center_lat, center_lon, xr, timedelta)
+    finally:
+        _data_load_semaphore.release()
+
+
+def _load_mergir_subset_inner(target_dt, center_lat, center_lon, xr, timedelta):
     session = _get_earthdata_session()
     if not session:
         logger.warning("MergIR: no Earthdata session available")
@@ -1170,6 +1192,18 @@ def _load_gridsat_subset(target_dt: datetime, center_lat: float, center_lon: flo
     import requests
     import xarray as xr
 
+    # Acquire semaphore to limit concurrent loads (OOM protection)
+    if not _data_load_semaphore.acquire(timeout=60):
+        logger.warning("GridSat: semaphore timeout — too many concurrent loads")
+        return None, None
+
+    try:
+        return _load_gridsat_subset_inner(target_dt, center_lat, center_lon, requests, xr)
+    finally:
+        _data_load_semaphore.release()
+
+
+def _load_gridsat_subset_inner(target_dt, center_lat, center_lon, requests, xr):
     # Round to nearest 3-hour interval
     hour_3 = (target_dt.hour // 3) * 3
     file_dt = target_dt.replace(hour=hour_3, minute=0, second=0, microsecond=0)
@@ -1270,16 +1304,21 @@ def _load_gridsat_subset(target_dt: datetime, center_lat: float, center_lon: flo
     tmp = None
     try:
         logger.info(f"GridSat: downloading full file {direct_url[:100]}...")
-        resp = requests.get(direct_url, timeout=120, headers=_HTTP_HEADERS)
+        resp = requests.get(direct_url, timeout=120, headers=_HTTP_HEADERS, stream=True)
         if resp.status_code != 200:
             logger.info(f"GridSat: HTTP {resp.status_code} for direct download")
+            resp.close()
             return None, None
 
+        # Stream to disk instead of buffering entire file in memory
         tmp = tempfile.NamedTemporaryFile(suffix=".nc", delete=False)
-        tmp.write(resp.content)
+        file_size = 0
+        for chunk in resp.iter_content(chunk_size=256 * 1024):
+            tmp.write(chunk)
+            file_size += len(chunk)
         tmp.close()
-        file_size_mb = len(resp.content) / 1024 / 1024
-        logger.info(f"GridSat: downloaded {file_size_mb:.1f} MB")
+        resp.close()
+        logger.info(f"GridSat: streamed {file_size / 1024 / 1024:.1f} MB to disk")
 
         ds = xr.open_dataset(tmp.name, engine="h5netcdf")
 
@@ -1616,8 +1655,12 @@ def ir_frame(
             )
 
         png = _render_ir_png(frame_2d, vmin=170.0, vmax=310.0, scale=ir_scale)
-        # Use actual bounds from data (not assumed center ± half_domain)
-        bounds = ir_bounds or {
+        # Always use consistent requested bounds (center ± half_domain)
+        # rather than actual data extent, so every frame plots the same
+        # domain size on the map. OPeNDAP subsets can return slightly
+        # truncated extents, causing visible domain jumps between frames.
+        # Any edge pixels outside the data are transparent (NaN).
+        bounds = {
             "south": frame_lat - half_domain,
             "north": frame_lat + half_domain,
             "west": frame_lon - half_domain,
@@ -1749,7 +1792,8 @@ def ir_batch(
                     return (frame_idx, None)
 
                 png = _render_ir_png(frame_2d, vmin=170.0, vmax=310.0, scale=ir_scale)
-                bounds = ir_bounds or {
+                # Consistent bounds (center ± half_domain), not actual data extent
+                bounds = {
                     "south": frame_lat - half_domain,
                     "north": frame_lat + half_domain,
                     "west": frame_lon - half_domain,
