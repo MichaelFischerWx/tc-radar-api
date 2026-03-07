@@ -53,8 +53,72 @@ HURSAT_END_YEAR = 2015
 MERGIR_OPENDAP = "https://disc2.gesdisc.eosdis.nasa.gov/opendap/MERGED_IR/GPM_MERGIR.1"
 MERGIR_START_YEAR = 1998  # Extended back from Feb 2000 in June 2025
 
-# Earthdata token for MergIR access (set via env var on Render)
+# Earthdata credentials for MergIR access (set via env vars on Render)
+# Option 1: Bearer token (EARTHDATA_TOKEN) — preferred
+# Option 2: Username/password (EARTHDATA_USER + EARTHDATA_PASS)
+# Either option requires a ~/.netrc entry for urs.earthdata.nasa.gov
 EARTHDATA_TOKEN = os.environ.get("EARTHDATA_TOKEN", "")
+EARTHDATA_USER = os.environ.get("EARTHDATA_USER", "")
+EARTHDATA_PASS = os.environ.get("EARTHDATA_PASS", "")
+
+
+def _setup_earthdata_netrc():
+    """
+    Create ~/.netrc and ~/.dodsrc for NASA GES DISC OPeNDAP access.
+
+    OPeNDAP (used by xarray) requires ~/.netrc with Earthdata credentials.
+    Also creates ~/.dodsrc to tell the DAP client to follow redirects and
+    check cookies from urs.earthdata.nasa.gov.
+    """
+    home = os.path.expanduser("~")
+    netrc_path = os.path.join(home, ".netrc")
+    dodsrc_path = os.path.join(home, ".dodsrc")
+
+    # Skip if no credentials configured
+    if not EARTHDATA_USER and not EARTHDATA_TOKEN:
+        logger.info("Earthdata: no credentials configured (MergIR disabled)")
+        return
+
+    # Write ~/.netrc
+    if EARTHDATA_USER and EARTHDATA_PASS:
+        netrc_entry = (
+            f"machine urs.earthdata.nasa.gov\n"
+            f"    login {EARTHDATA_USER}\n"
+            f"    password {EARTHDATA_PASS}\n"
+        )
+    elif EARTHDATA_TOKEN:
+        # Use token as password with 'token' as username
+        netrc_entry = (
+            f"machine urs.earthdata.nasa.gov\n"
+            f"    login token\n"
+            f"    password {EARTHDATA_TOKEN}\n"
+        )
+    else:
+        return
+
+    try:
+        with open(netrc_path, "w") as f:
+            f.write(netrc_entry)
+        os.chmod(netrc_path, 0o600)
+        logger.info(f"Earthdata: wrote {netrc_path}")
+    except Exception as e:
+        logger.warning(f"Earthdata: failed to write {netrc_path}: {e}")
+
+    # Write ~/.dodsrc for OPeNDAP cookie/redirect handling
+    dodsrc_content = (
+        "HTTP.COOKIEJAR=~/.urs_cookies\n"
+        "HTTP.NETRC=~/.netrc\n"
+    )
+    try:
+        with open(dodsrc_path, "w") as f:
+            f.write(dodsrc_content)
+        logger.info(f"Earthdata: wrote {dodsrc_path}")
+    except Exception as e:
+        logger.warning(f"Earthdata: failed to write {dodsrc_path}: {e}")
+
+
+# Run netrc setup at import time (before any OPeNDAP requests)
+_setup_earthdata_netrc()
 
 _HTTP_HEADERS = {
     "User-Agent": "TC-RADAR-API/1.0 (NOAA/HRD research; https://michaelfischerwx.github.io/TC-RADAR/)"
@@ -131,8 +195,9 @@ def _render_ir_png(frame_2d, vmin=170.0, vmax=310.0):
     mask = ~np.isfinite(arr) | (arr <= 0)
     rgba[mask] = [0, 0, 0, 0]
 
-    # Flip vertically (NetCDF convention: first row = southernmost)
-    rgba = rgba[::-1]
+    # NOTE: Vertical orientation is handled in _load_frame_from_nc()
+    # which checks actual latitude order and ensures north-at-top.
+    # No flip needed here.
 
     img = Image.fromarray(rgba, "RGBA")
     buf = io.BytesIO()
@@ -482,10 +547,11 @@ def _load_frame_from_nc(nc_path: str):
         else:
             frame = data.values
 
-        # Extract geographic bounds from coordinate variables
+        # Extract geographic bounds and determine latitude orientation
         bounds = None
         lat_var = None
         lon_var = None
+        lat_increasing = True  # default assumption
 
         # HURSAT-B1 v06 uses 'latitude' and 'longitude' (1D or 2D)
         for lat_cand in ["latitude", "lat", "Latitude"]:
@@ -501,6 +567,17 @@ def _load_frame_from_nc(nc_path: str):
             try:
                 lats = ds[lat_var].values
                 lons = ds[lon_var].values
+
+                # Determine latitude order (1D array or first column of 2D)
+                if lats.ndim == 1:
+                    lat_1d = lats
+                else:
+                    lat_1d = lats[:, 0] if lats.shape[0] > 1 else lats[0, :]
+
+                finite_lats = lat_1d[np.isfinite(lat_1d)]
+                if len(finite_lats) >= 2:
+                    lat_increasing = finite_lats[-1] > finite_lats[0]
+
                 # Handle NaN values
                 lats_valid = lats[np.isfinite(lats)]
                 lons_valid = lons[np.isfinite(lons)]
@@ -513,6 +590,13 @@ def _load_frame_from_nc(nc_path: str):
                     }
             except Exception as e:
                 logger.debug(f"Could not extract bounds from {nc_path}: {e}")
+
+        # Ensure frame is oriented with north at top (row 0 = north)
+        # Leaflet imageOverlay expects top-left = NW corner
+        if lat_increasing:
+            # First row = south → flip so first row = north
+            frame = frame[::-1]
+        # If lat is decreasing, first row is already north — no flip needed
 
         ds.close()
         return frame, bounds
@@ -789,7 +873,9 @@ def _load_mergir_subset(target_dt: datetime, center_lat: float, center_lon: floa
                     f"MergIR: got {tb.shape} subset for "
                     f"({center_lat:.1f}, {center_lon:.1f})"
                 )
-                return tb
+                # MergIR lat is ascending (south→north), flip so
+                # row 0 = north (as Leaflet imageOverlay expects)
+                return tb[::-1]
 
         except Exception as e:
             logger.warning(f"MergIR: subset failed for {url}: {e}")
@@ -831,17 +917,18 @@ def ir_meta(
 
     # Determine source
     source = None
-    if year >= MERGIR_START_YEAR and EARTHDATA_TOKEN:
+    _earthdata_configured = bool(EARTHDATA_TOKEN or EARTHDATA_USER)
+    if year >= MERGIR_START_YEAR and _earthdata_configured:
         source = "mergir"
     elif HURSAT_START_YEAR <= year <= HURSAT_END_YEAR:
         source = "hursat"
-    elif year >= MERGIR_START_YEAR and not EARTHDATA_TOKEN:
-        # MergIR available but no token configured
+    elif year >= MERGIR_START_YEAR and not _earthdata_configured:
+        # MergIR available but no credentials configured
         result = {
             "sid": sid,
             "available": False,
             "source": "mergir",
-            "reason": "MergIR requires Earthdata token (not configured)",
+            "reason": "MergIR requires Earthdata credentials (not configured)",
         }
         return JSONResponse(result)
     else:
@@ -1065,8 +1152,9 @@ def global_health():
         "hursat_meta_cache_size": len(_meta_cache),
         "ir_meta_cache_size": len(_mergir_meta_cache),
         "extracted_storms": list(_extracted_cache.keys()),
-        "earthdata_token_set": bool(EARTHDATA_TOKEN),
-        "mergir_available": bool(EARTHDATA_TOKEN),
+        "earthdata_configured": bool(EARTHDATA_TOKEN or EARTHDATA_USER),
+        "earthdata_method": "token" if EARTHDATA_TOKEN else ("user/pass" if EARTHDATA_USER else "none"),
+        "mergir_available": bool(EARTHDATA_TOKEN or EARTHDATA_USER),
     }
 
 
