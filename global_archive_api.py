@@ -571,15 +571,28 @@ def _load_frame_from_nc(nc_path: str):
                 lats = ds[lat_var].values
                 lons = ds[lon_var].values
 
+                logger.info(
+                    f"HURSAT frame: {os.path.basename(nc_path)}, "
+                    f"lat shape={lats.shape}, lon shape={lons.shape}, "
+                    f"frame shape={frame.shape}"
+                )
+
                 # Determine latitude order (1D array or first column of 2D)
                 if lats.ndim == 1:
                     lat_1d = lats
+                elif lats.ndim == 2:
+                    lat_1d = lats[:, lats.shape[1] // 2]  # center column
                 else:
-                    lat_1d = lats[:, 0] if lats.shape[0] > 1 else lats[0, :]
+                    lat_1d = lats.ravel()
 
                 finite_lats = lat_1d[np.isfinite(lat_1d)]
                 if len(finite_lats) >= 2:
                     lat_increasing = finite_lats[-1] > finite_lats[0]
+                    logger.info(
+                        f"  lat[0]={finite_lats[0]:.2f}, "
+                        f"lat[-1]={finite_lats[-1]:.2f}, "
+                        f"increasing={lat_increasing}"
+                    )
 
                 # Handle NaN values
                 lats_valid = lats[np.isfinite(lats)]
@@ -591,15 +604,31 @@ def _load_frame_from_nc(nc_path: str):
                         "west": float(np.min(lons_valid)),
                         "east": float(np.max(lons_valid)),
                     }
+                    logger.info(
+                        f"  bounds: S={bounds['south']:.2f} N={bounds['north']:.2f} "
+                        f"W={bounds['west']:.2f} E={bounds['east']:.2f}"
+                    )
+
+                    # Log frame data stats for sanity check
+                    valid_frame = frame[np.isfinite(frame)]
+                    if len(valid_frame) > 0:
+                        logger.info(
+                            f"  Tb stats: min={np.min(valid_frame):.1f}, "
+                            f"max={np.max(valid_frame):.1f}, "
+                            f"mean={np.mean(valid_frame):.1f}, "
+                            f"NaN%={100*(1 - len(valid_frame)/frame.size):.0f}%"
+                        )
             except Exception as e:
-                logger.debug(f"Could not extract bounds from {nc_path}: {e}")
+                logger.warning(f"Could not extract bounds from {nc_path}: {e}")
 
         # Ensure frame is oriented with north at top (row 0 = north)
         # Leaflet imageOverlay expects top-left = NW corner
         if lat_increasing:
             # First row = south → flip so first row = north
             frame = frame[::-1]
-        # If lat is decreasing, first row is already north — no flip needed
+            logger.info("  → Flipped frame (lat was increasing)")
+        else:
+            logger.info("  → No flip needed (lat already decreasing/north-at-top)")
 
         ds.close()
         return frame, bounds
@@ -697,6 +726,12 @@ def hursat_frame(
     frame_tuple = frames[frame_idx]
     dt_str, nc_path = frame_tuple[0], frame_tuple[1]
     satellite = frame_tuple[2] if len(frame_tuple) > 2 else ""
+    nc_filename = os.path.basename(nc_path)
+
+    logger.info(
+        f"HURSAT frame request: idx={frame_idx}, dt={dt_str}, "
+        f"sat={satellite}, file={nc_filename}"
+    )
 
     frame_2d, bounds = _load_frame_from_nc(nc_path)
     if frame_2d is None:
@@ -710,6 +745,7 @@ def hursat_frame(
         "frame_idx": frame_idx,
         "datetime": dt_str,
         "frame": png,
+        "nc_file": nc_filename,
     }
     if satellite:
         result["satellite"] = satellite
@@ -872,10 +908,12 @@ def _mergir_subset_url(dt: datetime, center_lat: float, center_lon: float) -> st
 
     # Convert lat/lon bounds to grid indices
     # MergIR: lat from -60 to 60 in ~3301 steps, lon from -180 to 180 in ~9896 steps
-    lat_min = center_lat - MERGIR_HALF_DOMAIN
-    lat_max = center_lat + MERGIR_HALF_DOMAIN
-    lon_min = center_lon - MERGIR_HALF_DOMAIN
-    lon_max = center_lon + MERGIR_HALF_DOMAIN
+    # Add 1° margin to avoid edge effects; actual subsetting uses .sel() later
+    margin = 1.0
+    lat_min = center_lat - MERGIR_HALF_DOMAIN - margin
+    lat_max = center_lat + MERGIR_HALF_DOMAIN + margin
+    lon_min = center_lon - MERGIR_HALF_DOMAIN - margin
+    lon_max = center_lon + MERGIR_HALF_DOMAIN + margin
 
     # Clamp to grid bounds
     lat_min = max(lat_min, -60.0)
@@ -885,9 +923,9 @@ def _mergir_subset_url(dt: datetime, center_lat: float, center_lon: float) -> st
 
     # Grid spacing: ~0.036364° for lat, ~0.036378° for lon
     lat_idx_min = int((lat_min + 60.0) / 0.036364)
-    lat_idx_max = int((lat_max + 60.0) / 0.036364)
+    lat_idx_max = min(int((lat_max + 60.0) / 0.036364), 3300)
     lon_idx_min = int((lon_min + 180.0) / 0.036378)
-    lon_idx_max = int((lon_max + 180.0) / 0.036378)
+    lon_idx_max = min(int((lon_max + 180.0) / 0.036378), 9895)
 
     # Build constraint expression for server-side subsetting
     # Request both time steps (usually 2 per file), subset lat/lon
@@ -910,7 +948,8 @@ def _load_mergir_subset(target_dt: datetime, center_lat: float, center_lon: floa
     then opens locally with xarray for subsetting.
     Downloads to temp file, extracts subset, deletes temp file.
 
-    Returns 2D numpy array of brightness temperatures, or None on failure.
+    Returns (2D numpy array of Tb, bounds_dict) or (None, None) on failure.
+    bounds_dict has keys: south, north, west, east — extracted from actual data.
     """
     import xarray as xr
     from datetime import timedelta
@@ -918,17 +957,18 @@ def _load_mergir_subset(target_dt: datetime, center_lat: float, center_lon: floa
     session = _get_earthdata_session()
     if not session:
         logger.warning("MergIR: no Earthdata session available")
-        return None
+        return None, None
 
     file_dt = target_dt.replace(minute=0, second=0, microsecond=0)
 
     for attempt_dt in [file_dt, file_dt + timedelta(hours=1)]:
-        # Try OPeNDAP subset URL first (small ~1-2 MB download)
-        subset_url = _mergir_subset_url(attempt_dt, center_lat, center_lon)
-        # Fall back to full file download if subset fails
+        # Try full file download (more reliable than OPeNDAP subset)
         full_url = _mergir_direct_file_url(attempt_dt)
+        # OPeNDAP subset as fallback
+        subset_url = _mergir_subset_url(attempt_dt, center_lat, center_lon)
 
         for url_label, url in [("subset", subset_url), ("full", full_url)]:
+            tmp = None
             try:
                 logger.info(f"MergIR: downloading {url_label} from {url[:120]}...")
                 resp = session.get(url, timeout=90, allow_redirects=True)
@@ -969,48 +1009,60 @@ def _load_mergir_subset(target_dt: datetime, center_lat: float, center_lon: floa
                     os.unlink(tmp.name)
                     continue
 
-                # For subset download, data is already cropped
-                # For full file, need to subset spatially
-                if url_label == "full":
-                    tb = ds["Tb"].isel(time=tidx).sel(
-                        lat=slice(
-                            center_lat - MERGIR_HALF_DOMAIN,
-                            center_lat + MERGIR_HALF_DOMAIN,
-                        ),
-                        lon=slice(
-                            center_lon - MERGIR_HALF_DOMAIN,
-                            center_lon + MERGIR_HALF_DOMAIN,
-                        ),
-                    ).values
-                else:
-                    # Subset already cropped by OPeNDAP constraint
-                    tb = ds["Tb"].isel(time=tidx).values
+                # Always do spatial subsetting from the dataset to get
+                # correct lat/lon bounds (even for OPeNDAP subsets)
+                lat_min = center_lat - MERGIR_HALF_DOMAIN
+                lat_max = center_lat + MERGIR_HALF_DOMAIN
+                lon_min = center_lon - MERGIR_HALF_DOMAIN
+                lon_max = center_lon + MERGIR_HALF_DOMAIN
+
+                da = ds["Tb"].isel(time=tidx)
+
+                # Subset spatially using coordinate selection
+                da_sub = da.sel(
+                    lat=slice(lat_min, lat_max),
+                    lon=slice(lon_min, lon_max),
+                )
+
+                tb = da_sub.values
+                actual_lats = da_sub.coords["lat"].values
+                actual_lons = da_sub.coords["lon"].values
 
                 ds.close()
                 os.unlink(tmp.name)
+                tmp = None
 
-                if tb is not None and tb.size > 0:
+                if tb is not None and tb.size > 0 and len(actual_lats) > 1 and len(actual_lons) > 1:
+                    # Extract actual bounds from coordinate arrays
+                    actual_bounds = {
+                        "south": float(np.min(actual_lats)),
+                        "north": float(np.max(actual_lats)),
+                        "west": float(np.min(actual_lons)),
+                        "east": float(np.max(actual_lons)),
+                    }
                     logger.info(
                         f"MergIR: got {tb.shape} subset for "
-                        f"({center_lat:.1f}, {center_lon:.1f})"
+                        f"({center_lat:.1f}, {center_lon:.1f}), "
+                        f"actual bounds: S={actual_bounds['south']:.2f} "
+                        f"N={actual_bounds['north']:.2f} "
+                        f"W={actual_bounds['west']:.2f} "
+                        f"E={actual_bounds['east']:.2f}"
                     )
                     # MergIR lat is ascending (south→north), flip so
                     # row 0 = north (as Leaflet imageOverlay expects)
-                    return tb[::-1]
+                    return tb[::-1], actual_bounds
 
             except Exception as e:
                 logger.warning(f"MergIR: {url_label} parse failed: {e}")
-                try:
-                    os.unlink(tmp.name)
-                except OSError:
-                    pass
+                if tmp:
+                    try:
+                        os.unlink(tmp.name)
+                    except OSError:
+                        pass
                 continue
 
-            # If we got here with the subset, no need to try full
-            break
-
     logger.warning(f"MergIR: no data found for {target_dt}")
-    return None
+    return None, None
 
 
 # ── Unified IR Endpoints ──────────────────────────────────────
@@ -1201,7 +1253,7 @@ def ir_frame(
         if frame_lat is None or frame_lon is None:
             raise HTTPException(status_code=400, detail="lat/lon required for MergIR")
 
-        frame_2d = _load_mergir_subset(frame_dt, frame_lat, frame_lon)
+        frame_2d, mergir_bounds = _load_mergir_subset(frame_dt, frame_lat, frame_lon)
 
         if frame_2d is None:
             raise HTTPException(
@@ -1210,16 +1262,18 @@ def ir_frame(
             )
 
         png = _render_ir_png(frame_2d, vmin=170.0, vmax=310.0)
+        # Use actual bounds from data (not assumed center ± half_domain)
+        bounds = mergir_bounds or {
+            "south": frame_lat - MERGIR_HALF_DOMAIN,
+            "north": frame_lat + MERGIR_HALF_DOMAIN,
+            "west": frame_lon - MERGIR_HALF_DOMAIN,
+            "east": frame_lon + MERGIR_HALF_DOMAIN,
+        }
         result = {
             "sid": sid, "frame_idx": frame_idx,
             "datetime": frame_info["datetime"], "source": "mergir",
             "frame": png,
-            "bounds": {
-                "south": frame_lat - MERGIR_HALF_DOMAIN,
-                "north": frame_lat + MERGIR_HALF_DOMAIN,
-                "west": frame_lon - MERGIR_HALF_DOMAIN,
-                "east": frame_lon + MERGIR_HALF_DOMAIN,
-            },
+            "bounds": bounds,
         }
 
     else:
@@ -1291,7 +1345,10 @@ def ir_batch(
         idx_list = idx_list[:MAX_BATCH]
 
     # Look up cached meta to determine source
-    meta = _mergir_meta_cache.get(sid)
+    # The unified /ir/meta endpoint caches with "ir_{sid}" prefix
+    meta = _mergir_meta_cache.get(f"ir_{sid}")
+    if not meta:
+        meta = _mergir_meta_cache.get(sid)
     if not meta:
         meta = _meta_cache.get(sid)
     source = meta.get("source", "hursat") if meta else "hursat"
@@ -1321,21 +1378,24 @@ def ir_batch(
                 if frame_lat is None or frame_lon is None:
                     return (frame_idx, None)
 
-                frame_2d = _load_mergir_subset(frame_dt, frame_lat, frame_lon)
+                frame_2d, mergir_bounds = _load_mergir_subset(
+                    frame_dt, frame_lat, frame_lon
+                )
                 if frame_2d is None:
                     return (frame_idx, None)
 
                 png = _render_ir_png(frame_2d, vmin=170.0, vmax=310.0)
+                bounds = mergir_bounds or {
+                    "south": frame_lat - MERGIR_HALF_DOMAIN,
+                    "north": frame_lat + MERGIR_HALF_DOMAIN,
+                    "west": frame_lon - MERGIR_HALF_DOMAIN,
+                    "east": frame_lon + MERGIR_HALF_DOMAIN,
+                }
                 result = {
                     "sid": sid, "frame_idx": frame_idx,
                     "datetime": frame_info["datetime"], "source": "mergir",
                     "frame": png,
-                    "bounds": {
-                        "south": frame_lat - MERGIR_HALF_DOMAIN,
-                        "north": frame_lat + MERGIR_HALF_DOMAIN,
-                        "west": frame_lon - MERGIR_HALF_DOMAIN,
-                        "east": frame_lon + MERGIR_HALF_DOMAIN,
-                    },
+                    "bounds": bounds,
                 }
             else:
                 # HURSAT path
