@@ -182,8 +182,14 @@ def _build_ir_lut():
 _IR_LUT = _build_ir_lut()
 
 
-def _render_ir_png(frame_2d, vmin=170.0, vmax=310.0):
-    """Render a 2D brightness temperature array to a base64 PNG."""
+def _render_ir_png(frame_2d, vmin=170.0, vmax=310.0, scale=2):
+    """
+    Render a 2D brightness temperature array to a base64 PNG.
+
+    scale: upscale factor for higher resolution when zoomed in on the map.
+           Default 2 gives 2× resolution (e.g. 301→602 px for HURSAT).
+           Uses bilinear interpolation for smooth appearance.
+    """
     arr = np.asarray(frame_2d, dtype=np.float32)
 
     # Cold clouds (low Tb) → high index → bright colors
@@ -203,6 +209,13 @@ def _render_ir_png(frame_2d, vmin=170.0, vmax=310.0):
     # No flip needed here.
 
     img = Image.fromarray(rgba, "RGBA")
+
+    # Upscale for higher resolution when zoomed in on the map
+    if scale and scale > 1:
+        new_w = img.width * scale
+        new_h = img.height * scale
+        img = img.resize((new_w, new_h), Image.BILINEAR)
+
     buf = io.BytesIO()
     img.save(buf, format="PNG", compress_level=1)
     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
@@ -908,8 +921,9 @@ def _mergir_subset_url(dt: datetime, center_lat: float, center_lon: float) -> st
 
     # Convert lat/lon bounds to grid indices
     # MergIR: lat from -60 to 60 in ~3301 steps, lon from -180 to 180 in ~9896 steps
-    # Add 1° margin to avoid edge effects; actual subsetting uses .sel() later
-    margin = 1.0
+    # Add 2° margin to avoid edge effects from grid index rounding;
+    # actual subsetting to exact domain uses .sel() later
+    margin = 2.0
     lat_min = center_lat - MERGIR_HALF_DOMAIN - margin
     lat_max = center_lat + MERGIR_HALF_DOMAIN + margin
     lon_min = center_lon - MERGIR_HALF_DOMAIN - margin
@@ -1048,6 +1062,20 @@ def _load_mergir_subset(target_dt: datetime, center_lat: float, center_lon: floa
                         f"W={actual_bounds['west']:.2f} "
                         f"E={actual_bounds['east']:.2f}"
                     )
+
+                    # Validate subset covers at least ~50% of requested domain.
+                    # OPeNDAP subsets can sometimes return truncated data.
+                    expected_range = 2 * MERGIR_HALF_DOMAIN  # 10°
+                    actual_lat_range = actual_bounds["north"] - actual_bounds["south"]
+                    actual_lon_range = actual_bounds["east"] - actual_bounds["west"]
+                    if actual_lat_range < expected_range * 0.5 or actual_lon_range < expected_range * 0.5:
+                        logger.warning(
+                            f"MergIR: {url_label} subset too small "
+                            f"({actual_lat_range:.1f}° lat × {actual_lon_range:.1f}° lon, "
+                            f"expected ~{expected_range}°), trying next source"
+                        )
+                        continue
+
                     # MergIR lat is ascending (south→north), flip so
                     # row 0 = north (as Leaflet imageOverlay expects)
                     return tb[::-1], actual_bounds
