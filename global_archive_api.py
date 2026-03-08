@@ -1910,6 +1910,7 @@ def ir_batch(
                     "datetime": frame_info["datetime"], "source": source,
                     "frame": png,
                     "bounds": bounds,
+                    "tb_grid": _downsample_tb_grid(frame_2d),
                 }
             else:
                 # HURSAT path
@@ -1930,6 +1931,7 @@ def ir_batch(
                     "sid": sid, "frame_idx": frame_idx,
                     "datetime": dt_str, "source": "hursat",
                     "frame": png,
+                    "tb_grid": _downsample_tb_grid(frame_2d),
                 }
                 if satellite:
                     result["satellite"] = satellite
