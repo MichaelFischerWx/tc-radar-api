@@ -280,6 +280,31 @@ def _render_ir_png(frame_2d, vmin=170.0, vmax=310.0, scale=2):
     return f"data:{mime};base64,{b64}"
 
 
+def _downsample_tb_grid(frame_2d, max_size=50):
+    """
+    Downsample a 2D Tb array to at most max_size × max_size for hover display.
+    Returns a list-of-lists (row-major) with integer Tb values (K),
+    or None for invalid pixels.  Typically 3-5 KB in JSON.
+    """
+    arr = np.asarray(frame_2d, dtype=np.float32)
+    h, w = arr.shape
+    step_y = max(1, h // max_size)
+    step_x = max(1, w // max_size)
+    small = arr[::step_y, ::step_x]
+
+    # Convert to Python list with None for invalid pixels
+    result = []
+    for row in small:
+        out_row = []
+        for val in row:
+            if np.isfinite(val) and val > 0:
+                out_row.append(round(float(val)))
+            else:
+                out_row.append(None)
+        result.append(out_row)
+    return result
+
+
 # ── HURSAT Data Access ───────────────────────────────────────
 
 def _parse_sid_year(sid: str) -> int:
@@ -822,6 +847,9 @@ def hursat_frame(
         result["satellite"] = satellite
     if bounds:
         result["bounds"] = bounds
+
+    # Attach downsampled Tb grid for hover display
+    result["tb_grid"] = _downsample_tb_grid(frame_2d)
 
     # Cache rendered frame
     _frame_cache[cache_key] = result
@@ -1778,6 +1806,10 @@ def ir_frame(
             result["satellite"] = satellite
         if bounds:
             result["bounds"] = bounds
+
+    # Attach downsampled Tb grid for hover display (~3-5 KB)
+    if frame_2d is not None:
+        result["tb_grid"] = _downsample_tb_grid(frame_2d)
 
     # Cache rendered frame
     _frame_cache[cache_key] = result
