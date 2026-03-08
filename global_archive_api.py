@@ -280,11 +280,11 @@ def _render_ir_png(frame_2d, vmin=170.0, vmax=310.0, scale=2):
     return f"data:{mime};base64,{b64}"
 
 
-def _downsample_tb_grid(frame_2d, max_size=50):
+def _downsample_tb_grid(frame_2d, max_size=150):
     """
     Downsample a 2D Tb array to at most max_size × max_size for hover display.
     Returns a list-of-lists (row-major) with integer Tb values (K),
-    or None for invalid pixels.  Typically 3-5 KB in JSON.
+    or None for invalid pixels.  Typically 10-30 KB in JSON.
     """
     arr = np.asarray(frame_2d, dtype=np.float32)
     h, w = arr.shape
