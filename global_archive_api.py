@@ -1961,6 +1961,189 @@ def ir_batch(
     )
 
 
+# ── NHC F-Deck Fix Data ──────────────────────────────────────
+
+# Cache parsed f-deck data: atcf_id -> parsed dict
+_fdeck_cache: OrderedDict = OrderedDict()
+_FDECK_CACHE_MAX = 50
+
+# Dvorak CI number → approximate wind speed (kt) lookup
+_DVORAK_CI_TO_KT = {
+    1.0: 25, 1.5: 25, 2.0: 30, 2.5: 35, 3.0: 45, 3.5: 55,
+    4.0: 65, 4.5: 77, 5.0: 90, 5.5: 102, 6.0: 115, 6.5: 127,
+    7.0: 140, 7.5: 155, 8.0: 170, 8.5: 195,
+}
+
+# Reverse: wind → nearest CI
+_WIND_TO_CI = {v: k for k, v in sorted(_DVORAK_CI_TO_KT.items())}
+
+
+def _parse_fdeck(raw_text: str) -> dict:
+    """Parse NHC f-deck text into structured fix data by type.
+
+    Returns dict with keys DVTS, DVTO, AIRC, each containing a list of fix dicts.
+    """
+    result = {"DVTS": [], "DVTO": [], "AIRC": []}
+
+    for line in raw_text.strip().split("\n"):
+        if not line.strip():
+            continue
+        cols = [c.strip() for c in line.split(",")]
+        if len(cols) < 12:
+            continue
+
+        try:
+            fix_type = cols[4]
+        except (IndexError, ValueError):
+            continue
+
+        if fix_type not in result:
+            continue
+
+        # Parse datetime (column 2): YYYYMMDDHH
+        dt_str = cols[2].strip()
+        if len(dt_str) < 10:
+            continue
+        try:
+            iso_dt = f"{dt_str[:4]}-{dt_str[4:6]}-{dt_str[6:8]}T{dt_str[8:10]}:00"
+        except Exception:
+            continue
+
+        # Parse lat/lon (columns 7-8) — f-deck uses hundredths of degrees
+        # e.g., "1380N" = 13.80°N, "3210W" = 32.10°W
+        try:
+            lat_str = cols[7].strip()
+            lon_str = cols[8].strip()
+            if not lat_str or not lon_str:
+                continue
+            lat = float(lat_str[:-1]) / 100
+            if lat_str[-1] == "S":
+                lat = -lat
+            lon = float(lon_str[:-1]) / 100
+            if lon_str[-1] == "W":
+                lon = -lon
+        except (ValueError, IndexError):
+            continue
+
+        # Parse wind speed (column 11)
+        wind_kt = None
+        try:
+            v = cols[11].strip()
+            if v:
+                wind_kt = float(v)
+        except (ValueError, IndexError):
+            pass
+
+        # For AIRC, fall back to column 39 (flight-level wind) if col 11 is empty
+        if wind_kt is None and fix_type == "AIRC":
+            try:
+                if len(cols) > 39 and cols[39].strip():
+                    wind_kt = float(cols[39].strip())
+            except (ValueError, IndexError):
+                pass
+
+        if wind_kt is None:
+            continue
+
+        fix = {
+            "time": iso_dt,
+            "lat": round(lat, 2),
+            "lon": round(lon, 2),
+            "wind_kt": round(wind_kt),
+        }
+
+        # For Dvorak fixes, compute CI number from wind speed
+        if fix_type in ("DVTS", "DVTO"):
+            ci_keys = sorted(_DVORAK_CI_TO_KT.keys())
+            ci_winds = [_DVORAK_CI_TO_KT[k] for k in ci_keys]
+            nearest_idx = min(range(len(ci_winds)), key=lambda i: abs(ci_winds[i] - wind_kt))
+            fix["ci"] = ci_keys[nearest_idx]
+
+        result[fix_type].append(fix)
+
+    return result
+
+
+def _fetch_fdeck(atcf_id: str) -> dict | None:
+    """Fetch and parse f-deck data for an ATCF storm ID (e.g., 'AL122024').
+
+    Tries current-year fix directory first, then archive (gzipped).
+    Returns parsed fix dict or None on failure.
+    """
+    # Check cache
+    if atcf_id in _fdeck_cache:
+        _fdeck_cache.move_to_end(atcf_id)
+        return _fdeck_cache[atcf_id]
+
+    # Parse ATCF ID: e.g., "AL122024" -> basin="al", num="12", year="2024"
+    atcf_id = atcf_id.upper().strip()
+    if len(atcf_id) < 8:
+        return None
+
+    basin = atcf_id[:2].lower()
+    num = atcf_id[2:4]
+    year = atcf_id[4:]
+
+    import requests as req
+
+    # Try current fix directory first (HTTP, not FTP)
+    urls = [
+        f"https://ftp.nhc.noaa.gov/atcf/fix/f{basin}{num}{year}.dat",
+        f"https://ftp.nhc.noaa.gov/atcf/archive/{year}/f{basin}{num}{year}.dat.gz",
+    ]
+
+    raw_text = None
+    for url in urls:
+        try:
+            logger.info(f"Fetching f-deck: {url}")
+            resp = req.get(url, timeout=15, headers=_HTTP_HEADERS)
+            if resp.status_code == 200:
+                if url.endswith(".gz"):
+                    import gzip
+                    raw_text = gzip.decompress(resp.content).decode("utf-8", errors="replace")
+                else:
+                    raw_text = resp.text
+                logger.info(f"F-deck fetched: {len(raw_text)} bytes from {url}")
+                break
+        except Exception as e:
+            logger.warning(f"F-deck fetch failed for {url}: {e}")
+            continue
+
+    if not raw_text:
+        return None
+
+    parsed = _parse_fdeck(raw_text)
+
+    # Cache result
+    _fdeck_cache[atcf_id] = parsed
+    if len(_fdeck_cache) > _FDECK_CACHE_MAX:
+        _fdeck_cache.popitem(last=False)
+
+    return parsed
+
+
+@router.get("/fdeck")
+def get_fdeck(atcf_id: str = Query(..., description="ATCF storm ID, e.g., AL122024")):
+    """Fetch NHC f-deck intensity fixes for a storm.
+
+    Returns parsed fix data for Subjective Dvorak (DVTS), Objective Dvorak (DVTO),
+    and Aircraft (AIRC) fix types with time, lat, lon, wind speed, and CI number.
+    """
+    result = _fetch_fdeck(atcf_id)
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"F-deck data not found for {atcf_id}. "
+                   f"Data is only available for NHC-monitored storms (Atlantic/East Pacific).",
+        )
+
+    counts = {k: len(v) for k, v in result.items()}
+    return JSONResponse(
+        content={"atcf_id": atcf_id, "fixes": result, "counts": counts},
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
 @router.get("/health")
 def global_health():
     """Health check for global archive endpoints."""
