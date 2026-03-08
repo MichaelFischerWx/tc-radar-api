@@ -1983,9 +1983,15 @@ _WIND_TO_CI = {v: k for k, v in sorted(_DVORAK_CI_TO_KT.items())}
 def _parse_fdeck(raw_text: str) -> dict:
     """Parse NHC f-deck text into structured fix data by type.
 
-    Returns dict with keys DVTS, DVTO, AIRC, each containing a list of fix dicts.
+    Returns dict with keys for each fix category:
+      DVTS, DVTO          — Dvorak fixes (with CI number and agency)
+      SFMR                — SFMR surface wind (column 35)
+      FL_WIND             — Flight-level wind (column 39)
+      DROPSONDE           — Surface estimate from dropsonde (col 11, no SFMR/FL)
+      AIRC_OTHER          — Other aircraft surface estimates
     """
-    result = {"DVTS": [], "DVTO": [], "AIRC": []}
+    FIX_TYPES_WANTED = {"DVTS", "DVTO", "AIRC"}
+    result = {"DVTS": [], "DVTO": [], "SFMR": [], "FL_WIND": [], "DROPSONDE": [], "AIRC_OTHER": []}
 
     for line in raw_text.strip().split("\n"):
         if not line.strip():
@@ -1999,7 +2005,7 @@ def _parse_fdeck(raw_text: str) -> dict:
         except (IndexError, ValueError):
             continue
 
-        if fix_type not in result:
+        if fix_type not in FIX_TYPES_WANTED:
             continue
 
         # Parse datetime (column 2): YYYYMMDDHH
@@ -2027,41 +2033,80 @@ def _parse_fdeck(raw_text: str) -> dict:
         except (ValueError, IndexError):
             continue
 
-        # Parse wind speed (column 11)
-        wind_kt = None
+        # Agency/technique (column 3) — e.g., SAB, TAFB, JTWC for Dvorak
+        agency = cols[3].strip() if len(cols) > 3 else ""
+
+        # Parse wind columns
+        # Column 11: composite surface intensity estimate (kt)
+        wind_11 = None
         try:
             v = cols[11].strip()
             if v:
-                wind_kt = float(v)
+                wind_11 = float(v)
         except (ValueError, IndexError):
             pass
 
-        # For AIRC, fall back to column 39 (flight-level wind) if col 11 is empty
-        if wind_kt is None and fix_type == "AIRC":
-            try:
-                if len(cols) > 39 and cols[39].strip():
-                    wind_kt = float(cols[39].strip())
-            except (ValueError, IndexError):
-                pass
+        # Column 35: SFMR surface wind (kt)
+        sfmr_wind = None
+        try:
+            if len(cols) > 35 and cols[35].strip():
+                sfmr_wind = float(cols[35].strip())
+        except (ValueError, IndexError):
+            pass
 
-        if wind_kt is None:
-            continue
+        # Column 39: flight-level wind (kt)
+        fl_wind = None
+        try:
+            if len(cols) > 39 and cols[39].strip():
+                fl_wind = float(cols[39].strip())
+        except (ValueError, IndexError):
+            pass
 
-        fix = {
-            "time": iso_dt,
-            "lat": round(lat, 2),
-            "lon": round(lon, 2),
-            "wind_kt": round(wind_kt),
-        }
-
-        # For Dvorak fixes, compute CI number from wind speed
+        # ── Dvorak fixes: use column 11 (intensity), tag with agency ──
         if fix_type in ("DVTS", "DVTO"):
+            if wind_11 is None:
+                continue
             ci_keys = sorted(_DVORAK_CI_TO_KT.keys())
             ci_winds = [_DVORAK_CI_TO_KT[k] for k in ci_keys]
-            nearest_idx = min(range(len(ci_winds)), key=lambda i: abs(ci_winds[i] - wind_kt))
-            fix["ci"] = ci_keys[nearest_idx]
+            nearest_idx = min(range(len(ci_winds)), key=lambda i: abs(ci_winds[i] - wind_11))
+            fix = {
+                "time": iso_dt,
+                "lat": round(lat, 2),
+                "lon": round(lon, 2),
+                "wind_kt": round(wind_11),
+                "ci": ci_keys[nearest_idx],
+            }
+            if agency:
+                fix["agency"] = agency
+            result[fix_type].append(fix)
+            continue
 
-        result[fix_type].append(fix)
+        # ── AIRC fixes: split into SFMR / FL_WIND / DROPSONDE / OTHER ──
+        base = {"time": iso_dt, "lat": round(lat, 2), "lon": round(lon, 2)}
+
+        # SFMR surface wind (column 35)
+        if sfmr_wind is not None:
+            fix = dict(base, wind_kt=round(sfmr_wind), source="SFMR")
+            result["SFMR"].append(fix)
+
+        # Flight-level wind (column 39)
+        if fl_wind is not None:
+            # Parse flight-level altitude/pressure from column 40 if available
+            fl_alt = ""
+            try:
+                if len(cols) > 40 and cols[40].strip():
+                    fl_alt = cols[40].strip()
+            except (IndexError, ValueError):
+                pass
+            fix = dict(base, wind_kt=round(fl_wind), source="FL")
+            if fl_alt:
+                fix["level"] = fl_alt
+            result["FL_WIND"].append(fix)
+
+        # Surface estimate (column 11) — only if neither SFMR nor FL present
+        if wind_11 is not None and sfmr_wind is None and fl_wind is None:
+            fix = dict(base, wind_kt=round(wind_11), source="DROPSONDE")
+            result["DROPSONDE"].append(fix)
 
     return result
 
