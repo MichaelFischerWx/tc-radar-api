@@ -157,8 +157,23 @@ _META_CACHE_MAX = 50
 
 # Semaphore to limit concurrent data loading (OPeNDAP / HTTP downloads).
 # Each load can consume 50-150 MB transiently; on a 2 GB Render instance
-# we must cap concurrent loads to avoid OOM.
-_data_load_semaphore = threading.Semaphore(3)
+# we must cap concurrent loads to avoid OOM.  5 slots allows more
+# parallelism while keeping peak memory under ~750 MB (5 × 150 MB).
+_data_load_semaphore = threading.Semaphore(5)
+
+# Persistent HTTP session for NCEI (GridSat) and general downloads.
+# Reusing a session keeps TCP connections alive, avoiding ~200-500ms
+# TCP+TLS handshake overhead per request.
+_ncei_session: requests.Session | None = None
+
+
+def _get_ncei_session() -> requests.Session:
+    """Return a persistent session for NCEI/GridSat/HURSAT downloads."""
+    global _ncei_session
+    if _ncei_session is None:
+        _ncei_session = requests.Session()
+        _ncei_session.headers.update(_HTTP_HEADERS)
+    return _ncei_session
 
 
 # ── IR Colormap (matches radar archive: NOAA-style enhanced) ─
@@ -251,9 +266,18 @@ def _render_ir_png(frame_2d, vmin=170.0, vmax=310.0, scale=2):
         img = img.resize((new_w, new_h), Image.NEAREST)
 
     buf = io.BytesIO()
-    img.save(buf, format="PNG", compress_level=1)
+    # WebP q=75: ~60% smaller than PNG for spatially-coherent IR data,
+    # which means faster JSON serialization and network transfer.
+    # method=0 = fastest encoding. Lossy artifacts invisible at NEAREST upscale.
+    try:
+        img.save(buf, format="WEBP", quality=75, method=0)
+        mime = "image/webp"
+    except Exception:
+        # Fallback to PNG if WebP not available on this platform
+        img.save(buf, format="PNG", compress_level=1)
+        mime = "image/png"
     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-    return f"data:image/png;base64,{b64}"
+    return f"data:{mime};base64,{b64}"
 
 
 # ── HURSAT Data Access ───────────────────────────────────────
@@ -1031,13 +1055,14 @@ def _load_mergir_subset_inner(target_dt, center_lat, center_lon, xr, timedelta):
             tmp = None
             try:
                 logger.info(f"MergIR: downloading {url_label} from {url[:120]}...")
-                resp = session.get(url, timeout=90, allow_redirects=True)
+                resp = session.get(url, timeout=90, allow_redirects=True, stream=True)
 
                 if resp.status_code in (401, 403):
                     logger.warning(
                         f"MergIR: auth failed ({resp.status_code}), "
                         f"resetting session"
                     )
+                    resp.close()
                     global _earthdata_session
                     _earthdata_session = None
                     session = _get_earthdata_session()
@@ -1045,13 +1070,18 @@ def _load_mergir_subset_inner(target_dt, center_lat, center_lon, xr, timedelta):
 
                 if resp.status_code != 200:
                     logger.info(f"MergIR: HTTP {resp.status_code} for {url_label}")
+                    resp.close()
                     continue
 
-                # Write to temp file
+                # Stream to temp file (avoid buffering 130 MB in memory)
                 tmp = tempfile.NamedTemporaryFile(suffix=".nc4", delete=False)
-                tmp.write(resp.content)
+                file_size = 0
+                for chunk in resp.iter_content(chunk_size=256 * 1024):
+                    tmp.write(chunk)
+                    file_size += len(chunk)
                 tmp.close()
-                file_size_mb = len(resp.content) / 1024 / 1024
+                resp.close()
+                file_size_mb = file_size / 1024 / 1024
                 logger.info(f"MergIR: downloaded {url_label} {file_size_mb:.1f} MB")
 
             except Exception as e:
@@ -1212,7 +1242,7 @@ def _load_gridsat_subset(target_dt: datetime, center_lat: float, center_lon: flo
         _data_load_semaphore.release()
 
 
-def _load_gridsat_subset_inner(target_dt, center_lat, center_lon, requests, xr):
+def _load_gridsat_subset_inner(target_dt, center_lat, center_lon, requests_mod, xr):
     # Round to nearest 3-hour interval
     hour_3 = (target_dt.hour // 3) * 3
     file_dt = target_dt.replace(hour=hour_3, minute=0, second=0, microsecond=0)
@@ -1313,7 +1343,8 @@ def _load_gridsat_subset_inner(target_dt, center_lat, center_lon, requests, xr):
     tmp = None
     try:
         logger.info(f"GridSat: downloading full file {direct_url[:100]}...")
-        resp = requests.get(direct_url, timeout=120, headers=_HTTP_HEADERS, stream=True)
+        ncei = _get_ncei_session()
+        resp = ncei.get(direct_url, timeout=120, stream=True)
         if resp.status_code != 200:
             logger.info(f"GridSat: HTTP {resp.status_code} for direct download")
             resp.close()
@@ -1329,7 +1360,8 @@ def _load_gridsat_subset_inner(target_dt, center_lat, center_lon, requests, xr):
         resp.close()
         logger.info(f"GridSat: streamed {file_size / 1024 / 1024:.1f} MB to disk")
 
-        ds = xr.open_dataset(tmp.name, engine="h5netcdf")
+        ds = xr.open_dataset(tmp.name, engine="h5netcdf",
+                             decode_times=False)
 
         var_name = None
         for candidate in ["irwin_cdr", "irwin", "Tb", "IRWIN"]:
