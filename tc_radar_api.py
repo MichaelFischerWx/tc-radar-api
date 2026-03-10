@@ -221,6 +221,18 @@ DERIVED_VARIABLES = {
 
 DEFAULT_VARIABLE = "recentered_tangential_wind"
 
+# Wind-barb U/V component mapping: wind-speed variable → (u_varname, v_varname) in netCDF
+# These provide the vector components for overlaying meteorological wind barbs.
+WIND_BARB_COMPONENTS = {
+    "recentered_wind_speed":                        ("recentered_eastward_wind",                        "recentered_northward_wind"),
+    "recentered_earth_relative_wind_speed":         ("recentered_earth_relative_eastward_wind",         "recentered_earth_relative_northward_wind"),
+    "total_recentered_wind_speed":                  ("total_recentered_eastward_wind",                  "total_recentered_northward_wind"),
+    "total_recentered_earth_relative_wind_speed":   ("total_recentered_earth_relative_eastward_wind",   "total_recentered_earth_relative_northward_wind"),
+    "swath_wind_speed":                             ("swath_eastward_wind",                             "swath_northward_wind"),
+    "swath_earth_relative_wind_speed":              ("swath_earth_relative_eastward_wind",              "swath_earth_relative_northward_wind"),
+    "merged_wind_speed":                            ("merged_eastward_wind",                            "merged_northward_wind"),
+}
+
 # Mapping: any variable key → its merged climatology equivalent.
 # The climatology was computed only for merged_* variables, so we map
 # recentered, total_recentered, and swath variants to their merged counterpart.
@@ -842,6 +854,7 @@ def get_data(
     level_km:   float = Query(2.0,              ge=0.0, le=18, description="Altitude in km"),
     data_type:  str   = Query("swath",                         description="'swath' or 'merge'"),
     overlay:    str   = Query("",                              description="Optional overlay variable key"),
+    wind_barbs: bool  = Query(False,                           description="Include subsampled U/V for wind barbs"),
 ):
     """Return the raw 2D data slice as JSON for client-side Plotly rendering."""
     if variable not in VARIABLES:
@@ -852,7 +865,7 @@ def get_data(
         raise HTTPException(status_code=400, detail=f"Unknown overlay variable '{overlay}'. See /variables.")
 
     # Serve from cache if available (instant — no S3 read or computation)
-    cache_key = (case_index, variable, round(level_km, 1), data_type, overlay)
+    cache_key = (case_index, variable, round(level_km, 1), data_type, overlay, wind_barbs)
     if cache_key in _data_cache:
         _data_cache.move_to_end(cache_key)
         return JSONResponse(_data_cache[cache_key], headers={"X-Cache": "HIT"})
@@ -917,6 +930,36 @@ def get_data(
             }
         except Exception:
             pass  # silently skip overlay if variable unavailable
+
+    # Optional wind barbs: return subsampled U/V component arrays
+    if wind_barbs and variable in WIND_BARB_COMPONENTS:
+        u_name, v_name = WIND_BARB_COMPONENTS[variable]
+        try:
+            if u_name in ds and v_name in ds:
+                u_full = ds[u_name].isel(num_cases=local_idx, height=z_idx).values
+                v_full = ds[v_name].isel(num_cases=local_idx, height=z_idx).values
+                # Subsample to ~20 barbs per axis
+                ny, nx = u_full.shape
+                stride = max(1, min(nx, ny) // 20)
+                u_sub = u_full[::stride, ::stride]
+                v_sub = v_full[::stride, ::stride]
+                x_arr = np.array(x)
+                y_arr = np.array(y)
+                x_sub = x_arr[::stride].tolist()
+                y_sub = y_arr[::stride].tolist()
+                # Determine if earth-relative or storm-relative
+                barb_type = "earth_relative" if "earth_relative" in variable else "storm_relative"
+                result["wind_barbs"] = {
+                    "u": _clean_2d(u_sub),
+                    "v": _clean_2d(v_sub),
+                    "x": x_sub,
+                    "y": y_sub,
+                    "units": "m/s",
+                    "type": barb_type,
+                }
+        except Exception as e:
+            print(f"Wind barb extraction failed for {variable}: {e}")
+            pass  # silently skip if U/V components unavailable
 
     # Store in cache
     _data_cache[cache_key] = result
