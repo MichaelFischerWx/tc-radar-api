@@ -847,6 +847,80 @@ def _clean_2d(data):
     return [[None if np.isnan(v) else round(float(v), 4) for v in row] for row in data]
 
 
+def _compute_tilt_profile(ds, local_idx, data_type):
+    """
+    Extract the pre-computed vortex tilt profile from TC-RADAR.
+
+    TC-RADAR stores tilt as vertical profiles (num_cases, height):
+      - tc_eastward_tilt   : eastward displacement of vortex center from 2-km ref (km)
+      - tc_northward_tilt  : northward displacement from 2-km ref (km)
+      - tc_tilt_magnitude  : total tilt magnitude (km)
+      - tc_tilt_direction  : tilt direction (degrees)
+      - tc_rmw             : radius of maximum wind profile (km)
+
+    Returns dict with x_km, y_km, height_km, tilt_magnitude_km, rmw_km arrays,
+    or None if the required variables are not available.
+    """
+    # Check that the tilt variables exist in the dataset
+    if "tc_eastward_tilt" not in ds or "tc_northward_tilt" not in ds:
+        print("Tilt profile: tc_eastward_tilt / tc_northward_tilt not found in dataset")
+        return None
+
+    height_vals = ds["height"].values
+    ref_z_idx = int(np.argmin(np.abs(height_vals - 2.0)))
+
+    # Extract 1-D profiles for this case (height,)
+    east_tilt = ds["tc_eastward_tilt"].isel(num_cases=local_idx).values
+    north_tilt = ds["tc_northward_tilt"].isel(num_cases=local_idx).values
+
+    # Tilt magnitude — read stored or compute from components
+    if "tc_tilt_magnitude" in ds:
+        tilt_mag_arr = ds["tc_tilt_magnitude"].isel(num_cases=local_idx).values
+    else:
+        tilt_mag_arr = np.sqrt(east_tilt**2 + north_tilt**2)
+
+    # RMW profile (optional)
+    rmw_arr = None
+    if "tc_rmw" in ds:
+        rmw_arr = ds["tc_rmw"].isel(num_cases=local_idx).values
+
+    # Build output lists (NaN → None for JSON serialisation)
+    centers_x = []
+    centers_y = []
+    tilt_mag = []
+    heights = []
+    rmw_profile = []
+
+    for zi in range(len(height_vals)):
+        h = round(float(height_vals[zi]), 1)
+        heights.append(h)
+
+        ex = float(east_tilt[zi]) if np.isfinite(east_tilt[zi]) else None
+        ny_ = float(north_tilt[zi]) if np.isfinite(north_tilt[zi]) else None
+        tm = float(tilt_mag_arr[zi]) if np.isfinite(tilt_mag_arr[zi]) else None
+
+        centers_x.append(round(ex, 2) if ex is not None else None)
+        centers_y.append(round(ny_, 2) if ny_ is not None else None)
+        tilt_mag.append(round(tm, 2) if tm is not None else None)
+
+        if rmw_arr is not None:
+            rv = float(rmw_arr[zi]) if np.isfinite(rmw_arr[zi]) else None
+            rmw_profile.append(round(rv, 1) if rv is not None else None)
+
+    result = {
+        "x_km": centers_x,
+        "y_km": centers_y,
+        "height_km": heights,
+        "tilt_magnitude_km": tilt_mag,
+        "ref_height_km": round(float(height_vals[ref_z_idx]), 1),
+        "method": "stored",
+    }
+    if rmw_profile:
+        result["rmw_km"] = rmw_profile
+
+    return result
+
+
 @app.get("/data")
 def get_data(
     case_index: int   = Query(...,              ge=0,          description="0-based case index"),
@@ -855,6 +929,7 @@ def get_data(
     data_type:  str   = Query("swath",                         description="'swath' or 'merge'"),
     overlay:    str   = Query("",                              description="Optional overlay variable key"),
     wind_barbs: bool  = Query(False,                           description="Include subsampled U/V for wind barbs"),
+    tilt_profile: bool = Query(False,                          description="Include vortex tilt profile (center at each height)"),
 ):
     """Return the raw 2D data slice as JSON for client-side Plotly rendering."""
     if variable not in VARIABLES:
@@ -865,7 +940,7 @@ def get_data(
         raise HTTPException(status_code=400, detail=f"Unknown overlay variable '{overlay}'. See /variables.")
 
     # Serve from cache if available (instant — no S3 read or computation)
-    cache_key = (case_index, variable, round(level_km, 1), data_type, overlay, wind_barbs)
+    cache_key = (case_index, variable, round(level_km, 1), data_type, overlay, wind_barbs, tilt_profile)
     if cache_key in _data_cache:
         _data_cache.move_to_end(cache_key)
         return JSONResponse(_data_cache[cache_key], headers={"X-Cache": "HIT"})
@@ -960,6 +1035,15 @@ def get_data(
         except Exception as e:
             print(f"Wind barb extraction failed for {variable}: {e}")
             pass  # silently skip if U/V components unavailable
+
+    # Optional tilt profile: compute vortex center at each height level
+    if tilt_profile:
+        try:
+            tilt_data = _compute_tilt_profile(ds, local_idx, data_type)
+            if tilt_data:
+                result["tilt_profile"] = tilt_data
+        except Exception as e:
+            print(f"Tilt profile extraction failed: {e}")
 
     # Store in cache
     _data_cache[cache_key] = result
