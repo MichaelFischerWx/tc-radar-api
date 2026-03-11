@@ -5522,6 +5522,10 @@ def _parse_frd_file(text: str) -> Optional[dict]:
     splash = meta.get("splash_pr", -999.0)
     hyd_anchor = meta.get("hyd_anchor", "MSG").upper()
     meta["hit_surface"] = splash > 0 and hyd_anchor == "SFC"
+    # NOTE: For ASPEN PQC .frd files (V4+), hyd_anchor and splash_pr are
+    # left blank in the header — so hit_surface will be False here.
+    # A fallback check using min profile altitude is applied after profile
+    # parsing (see below).
 
     # Parse launch datetime
     launch_dt = None
@@ -5606,6 +5610,15 @@ def _parse_frd_file(text: str) -> Optional[dict]:
 
     if not profile["time_s"]:
         return None
+
+    # Fallback surface detection for ASPEN PQC files that lack hyd_anchor /
+    # splash_pr in the header: if the minimum valid altitude in the profile
+    # is 0 m, the sonde reached the surface.
+    if not meta["hit_surface"]:
+        valid_alts = [a for a in profile["alt"] if a is not None]
+        if valid_alts and min(valid_alts) == 0:
+            meta["hit_surface"] = True
+            meta["_sfc_inferred"] = True  # flag that this was inferred
 
     return {"meta": meta, "profile": profile}
 
