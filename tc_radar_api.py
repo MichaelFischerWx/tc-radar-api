@@ -5889,22 +5889,26 @@ def get_archive_dropsondes(
     mission_id = case_meta.get("mission_id", "").strip()
     dt_str = case_meta.get("datetime", "")
 
-    # Get storm center
+    # Get storm center — from TDR Zarr center_lat/center_lon variables
     center_lat = None
     center_lon = None
+    _resolve_err = None
     try:
         _tdr_ds, _tdr_li = resolve_case(case_index, data_type)
         if "center_lat" in _tdr_ds and "center_lon" in _tdr_ds:
             center_lat = float(_tdr_ds["center_lat"].values[_tdr_li])
             center_lon = float(_tdr_ds["center_lon"].values[_tdr_li])
-    except Exception:
-        pass
+    except Exception as e:
+        _resolve_err = str(e)
 
     if center_lat is None or center_lon is None:
+        # The plan-view already rendered a center, so this shouldn't normally fail.
+        # Return a helpful debug message if it does.
         result = {
             "success": False,
             "reason": "no_center",
-            "message": "No storm center available for this case",
+            "message": f"Could not resolve storm center for case {case_index} ({data_type})"
+                       + (f": {_resolve_err}" if _resolve_err else ""),
             "dropsondes": [],
         }
         return JSONResponse(result)
