@@ -5447,52 +5447,55 @@ def _parse_frd_file(text: str) -> Optional[dict]:
 
     meta = {}
 
-    # --- Parse header (lines 1-20 of the .frd format) ---
-    # Line 2: sonde ID
-    for line in lines[:13]:
+    # --- Parse header (scan all lines up to data start) ---
+    # Search broadly — different .frd format versions place fields at different lines
+    header_lines = lines[:25]  # generous: scan up to 25 lines for header info
+    for line in header_lines:
         stripped = line.strip()
-        if "Sonde:" in stripped:
-            parts = stripped.split("Sonde:")
+        upper = stripped.upper()
+        if "SONDE:" in upper:
+            parts = re.split(r"[Ss]onde:", stripped)
             if len(parts) > 1:
                 meta["sonde_id"] = parts[1].strip()
-        if "Format:" in stripped:
-            parts = stripped.split("Format:")
+        if "FORMAT:" in upper:
+            parts = re.split(r"[Ff]ormat:", stripped)
             if len(parts) > 1:
                 meta["format_version"] = parts[1].strip()
-        if "Aircraft:" in stripped:
-            # Aircraft: N49RF                             Date: 030914   Time: 205329 UTC
-            m_ac = re.search(r"Aircraft:\s*(\S+)", stripped)
+        if "AIRCRAFT:" in upper:
+            m_ac = re.search(r"[Aa]ircraft:\s*(\S+)", stripped)
             if m_ac:
                 meta["aircraft"] = m_ac.group(1)
-            m_dt = re.search(r"Date:\s*(\d{6})", stripped)
+            m_dt = re.search(r"[Dd]ate:\s*(\d{6,8})", stripped)
             if m_dt:
-                meta["date_str"] = m_dt.group(1)
-            m_tm = re.search(r"Time:\s*(\d{6})", stripped)
+                ds = m_dt.group(1)
+                # Handle both YYMMDD and YYYYMMDD
+                meta["date_str"] = ds[-6:] if len(ds) > 6 else ds
+            m_tm = re.search(r"[Tt]ime:\s*(\d{6})", stripped)
             if m_tm:
                 meta["time_str"] = m_tm.group(1)
-        if "Splash PR" in stripped:
-            m = re.search(r"Splash PR\s*=\s*([\d.\-]+)", stripped)
+        if "SPLASH" in upper and "PR" in upper:
+            m = re.search(r"[Ss]plash\s*PR\s*=\s*([\d.\-]+)", stripped)
             if m:
                 meta["splash_pr"] = float(m.group(1))
-        if "HYD SFCP" in stripped:
-            m = re.search(r"HYD SFCP\s*=\s*([\d.\-]+)", stripped)
+        if "HYD" in upper and "SFCP" in upper:
+            m = re.search(r"HYD\s*SFCP\s*=\s*([\d.\-]+)", stripped, re.IGNORECASE)
             if m:
                 meta["hyd_sfcp"] = float(m.group(1))
-        if "GPS VERR" in stripped:
-            m = re.search(r"GPS VERR\s*=\s*([\d.\-]+)", stripped)
+        if "GPS" in upper and "VERR" in upper:
+            m = re.search(r"GPS\s*VERR\s*=\s*([\d.\-]+)", stripped, re.IGNORECASE)
             if m:
                 meta["gps_verr"] = float(m.group(1))
-        if "Estimated PR used" in stripped:
-            m = re.search(r"Estimated PR used\s*=\s*(\S)", stripped)
+        if "ESTIMATED" in upper and "PR" in upper:
+            m = re.search(r"[Ee]stimated\s*PR\s*used\s*=\s*(\S)", stripped)
             if m:
                 meta["estimated_pr_used"] = m.group(1).upper() == "Y"
-        if "Hyd anchor" in stripped:
-            m = re.search(r"Hyd anchor\s*=\s*(\S+)", stripped)
+        if "HYD" in upper and "ANCHOR" in upper:
+            m = re.search(r"[Hh]yd\s*[Aa]nchor\s*=\s*(\S+)", stripped)
             if m:
-                meta["hyd_anchor"] = m.group(1)
+                meta["hyd_anchor"] = m.group(1).upper()
 
-    # Parse the second metadata block (Date/Lat/Lon/etc.)
-    for line in lines[14:20]:
+    # Parse the second metadata block (Date/Lat/Lon/etc.) — scan broader range
+    for line in lines[10:25]:
         stripped = line.strip()
         if "SID:" in stripped:
             m = re.search(r"SID:\s*(\S+)", stripped)
@@ -5517,7 +5520,7 @@ def _parse_frd_file(text: str) -> Optional[dict]:
 
     # Determine if sonde hit the surface
     splash = meta.get("splash_pr", -999.0)
-    hyd_anchor = meta.get("hyd_anchor", "MSG")
+    hyd_anchor = meta.get("hyd_anchor", "MSG").upper()
     meta["hit_surface"] = splash > 0 and hyd_anchor == "SFC"
 
     # Parse launch datetime
