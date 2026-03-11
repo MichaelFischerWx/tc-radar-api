@@ -5782,6 +5782,7 @@ def _find_frd_tarball(
 
     Archive naming conventions (varies by year):
       Old:  {YYYYMMDD}{aircraft_lower}.frd.tar.gz   e.g. 20030914n.frd.tar.gz
+      Mid:  {YYYYMMDD}{Aircraft}{Flight#}_FRD.tar.gz  e.g. 20170905H1_FRD.tar.gz
       New:  {YYYYMMDD}{Aircraft}{Flight#}_DFRD.tar.gz  e.g. 20201006I1_DFRD.tar.gz
 
     Returns the full URL to the tarball, or None.
@@ -5805,15 +5806,17 @@ def _find_frd_tarball(
     date_8 = century + short_date  # "20201006"
 
     # Build candidate prefixes to match (case-insensitive), ordered by priority:
-    #  1) New format: "20201006I1_DFRD.tar"   (YYYYMMDD + Aircraft + Flight# + _DFRD)
-    #  2) Old format: "20201006i.frd.tar"     (YYYYMMDD + aircraft_lower + .frd)
-    #  3) Old short:  "201006i.frd.tar"       (YYMMDD + aircraft_lower + .frd)
+    #  1) _FRD format:   "20170905H1_FRD.tar"   (most common 2010s+)
+    #  2) _DFRD format:  "20201006I1_DFRD.tar"   (some newer years)
+    #  3) .frd format:   "20030914n.frd.tar"     (old, no flight#, lowercase)
+    #  4) Short .frd:    "030914n.frd.tar"        (old 6-digit date)
+    date_aircraft_flight = f"{date_8}{aircraft.upper()}{flight_num}"
     candidates = [
-        f"{date_8}{aircraft.upper()}{flight_num}_dfrd.tar",   # new DFRD format
-        f"{date_8}{aircraft.lower()}{flight_num}_dfrd.tar",   # new DFRD, lowercase
-        f"{date_8}{aircraft.upper()}{flight_num}.frd.tar",    # hybrid
-        f"{date_8}{aircraft.lower()}.frd.tar",                # old format (no flight#)
-        f"{short_date}{aircraft.lower()}.frd.tar",            # old short format
+        f"{date_aircraft_flight}_frd.tar",      # _FRD format (HURR17 Irma etc.)
+        f"{date_aircraft_flight}_dfrd.tar",     # _DFRD format (some newer)
+        f"{date_aircraft_flight}.frd.tar",      # hybrid (flight# + .frd)
+        f"{date_8}{aircraft.lower()}.frd.tar",  # old format (no flight#)
+        f"{short_date}{aircraft.lower()}.frd.tar",  # old short format
     ]
 
     for entry in entries:
