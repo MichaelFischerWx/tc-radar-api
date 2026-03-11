@@ -5775,11 +5775,14 @@ def _find_frd_tarball(
     base_url: str, mission_id: str, year: int
 ) -> Optional[str]:
     """
-    Find the .frd.tar.gz file for a given mission_id in the operproc directory.
+    Find the dropsonde tarball for a given mission_id in the operproc directory.
 
-    mission_id format: "20030914N1" or "030914N1"
-    Tarball naming: "{YYYYMMDD}{aircraft_lower}.frd.tar.gz" or
-                    "{YYMMDD}{aircraft_lower}.frd.tar.gz"
+    mission_id format from TC-RADAR metadata: "201006I1" (YYMMDD + aircraft + flight#)
+    or "030914N1" (same, earlier format).
+
+    Archive naming conventions (varies by year):
+      Old:  {YYYYMMDD}{aircraft_lower}.frd.tar.gz   e.g. 20030914n.frd.tar.gz
+      New:  {YYYYMMDD}{Aircraft}{Flight#}_DFRD.tar.gz  e.g. 20201006I1_DFRD.tar.gz
 
     Returns the full URL to the tarball, or None.
     """
@@ -5789,31 +5792,35 @@ def _find_frd_tarball(
     except Exception:
         return None
 
-    # Parse mission_id to extract date + aircraft letter
-    m = re.match(r"(\d{8})([A-Za-z])(\d+)", mission_id)
+    # Parse mission_id to extract date + aircraft letter + flight number
+    # Format: YYMMDD + aircraft_letter + flight_number (e.g. "201006I1")
+    m = re.match(r"(\d{6})([A-Za-z])(\d+)", mission_id)
     if not m:
-        m = re.match(r"(\d{6})([A-Za-z])(\d+)", mission_id)
-        if not m:
-            return None
-        short_date = m.group(1)
-        century = str(year)[:2]
-        date_8 = century + short_date
-        date_6 = short_date
-        aircraft = m.group(2).lower()
-    else:
-        date_8 = m.group(1)
-        date_6 = date_8[2:]  # strip century
-        aircraft = m.group(2).lower()
+        return None
 
-    # Look for matching tarball. Try several naming patterns:
-    # e.g., "20030914n.frd.tar.gz", "030914n.frd.tar.gz"
-    candidates_8 = f"{date_8}{aircraft}.frd.tar"  # may have .gz suffix
-    candidates_6 = f"{date_6}{aircraft}.frd.tar"
+    short_date = m.group(1)       # "201006"
+    aircraft = m.group(2)          # "I"
+    flight_num = m.group(3)        # "1"
+    century = str(year)[:2]        # "20"
+    date_8 = century + short_date  # "20201006"
+
+    # Build candidate prefixes to match (case-insensitive), ordered by priority:
+    #  1) New format: "20201006I1_DFRD.tar"   (YYYYMMDD + Aircraft + Flight# + _DFRD)
+    #  2) Old format: "20201006i.frd.tar"     (YYYYMMDD + aircraft_lower + .frd)
+    #  3) Old short:  "201006i.frd.tar"       (YYMMDD + aircraft_lower + .frd)
+    candidates = [
+        f"{date_8}{aircraft.upper()}{flight_num}_dfrd.tar",   # new DFRD format
+        f"{date_8}{aircraft.lower()}{flight_num}_dfrd.tar",   # new DFRD, lowercase
+        f"{date_8}{aircraft.upper()}{flight_num}.frd.tar",    # hybrid
+        f"{date_8}{aircraft.lower()}.frd.tar",                # old format (no flight#)
+        f"{short_date}{aircraft.lower()}.frd.tar",            # old short format
+    ]
 
     for entry in entries:
         el = entry.lower().rstrip("/")
-        if el.startswith(candidates_8.lower()) or el.startswith(candidates_6.lower()):
-            return f"{operproc_url}{entry}"
+        for cand in candidates:
+            if el.startswith(cand.lower()):
+                return f"{operproc_url}{entry}"
 
     return None
 
@@ -5977,8 +5984,12 @@ def get_archive_dropsondes(
 
     year = scan_dt.year
 
+    # --- Diagnostic tracking ---
+    _diag = {"center_source": _center_source, "mission_id": mission_id}
+
     # Resolve HURR season directory
     season_dir = _resolve_hurr_season(year)
+    _diag["season_dir"] = season_dir
     if not season_dir:
         result = {
             "success": False,
@@ -5986,19 +5997,31 @@ def get_archive_dropsondes(
             "message": f"No HRD dropsonde season directory found for {year}",
             "dropsondes": [],
             "analysis_time": scan_dt.strftime("%Y-%m-%d %H:%M:%SZ"),
+            "_diag": _diag,
         }
         _hrd_sonde_cache[cache_key] = (result, now)
         return JSONResponse(result)
 
     # Resolve storm or base directory (some years have storm subdirs, some don't)
     base_url = _resolve_sonde_storm_dir(season_dir, storm_name)
+    _diag["storm_dir_resolved"] = base_url
     if not base_url:
         # Fallback: try season dir directly
         base_url = f"{HRD_SONDE_BASE}/{season_dir}"
+        _diag["storm_dir_resolved"] = f"{base_url} (fallback)"
 
     # Find the tarball for this mission
     tarball_url = _find_frd_tarball(base_url, mission_id, year)
+    _diag["tarball_url"] = tarball_url
+    _diag["operproc_url"] = f"{base_url}/operproc/"
     if not tarball_url:
+        # List what's actually in operproc for debugging
+        try:
+            _op_entries = _hrd_parse_directory(f"{base_url}/operproc/")
+            _diag["operproc_sample"] = _op_entries[:20] if _op_entries else []
+            _diag["operproc_count"] = len(_op_entries) if _op_entries else 0
+        except Exception as e:
+            _diag["operproc_error"] = str(e)
         result = {
             "success": False,
             "reason": "no_tarball",
@@ -6007,21 +6030,25 @@ def get_archive_dropsondes(
             "analysis_time": scan_dt.strftime("%Y-%m-%d %H:%M:%SZ"),
             "center_lat": center_lat,
             "center_lon": center_lon,
+            "_diag": _diag,
         }
         _hrd_sonde_cache[cache_key] = (result, now)
         return JSONResponse(result)
 
     # Fetch and extract .frd files
     frd_files = _fetch_and_extract_frd_tarball(tarball_url)
+    _diag["n_frd_extracted"] = len(frd_files)
+    _diag["frd_filenames"] = [fn for fn, _ in frd_files[:5]]  # first 5 for debug
     if not frd_files:
         result = {
             "success": False,
             "reason": "empty_tarball",
-            "message": f"Could not extract .frd files from {tarball_url}",
+            "message": f"Could not extract .frd files from archive",
             "dropsondes": [],
             "analysis_time": scan_dt.strftime("%Y-%m-%d %H:%M:%SZ"),
             "center_lat": center_lat,
             "center_lon": center_lon,
+            "_diag": _diag,
         }
         _hrd_sonde_cache[cache_key] = (result, now)
         return JSONResponse(result)
