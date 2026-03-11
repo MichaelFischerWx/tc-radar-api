@@ -5095,6 +5095,17 @@ def get_archive_flight_level(
             _center_source = "tdr_zarr"
     except Exception:
         pass
+    # --- Priority 1b: Metadata cache latitude/longitude (always available) ---
+    if center_lat is None:
+        clat = case_meta.get("latitude")
+        clon = case_meta.get("longitude")
+        if clat is not None and clon is not None:
+            try:
+                center_lat = float(clat)
+                center_lon = float(clon)
+                _center_source = "metadata"
+            except (ValueError, TypeError):
+                pass
     # Priorities 2-4 (.trak, ERA5, IR) are applied after the HRD
     # directory is resolved, since the .trak file lives in that directory
     # and we need scan_dt to find the closest entry.
@@ -5889,26 +5900,57 @@ def get_archive_dropsondes(
     mission_id = case_meta.get("mission_id", "").strip()
     dt_str = case_meta.get("datetime", "")
 
-    # Get storm center — from TDR Zarr center_lat/center_lon variables
+    # Get storm center — same priority chain as FL endpoint
     center_lat = None
     center_lon = None
-    _resolve_err = None
+    _center_source = None
+    # Priority 1: TDR Zarr center_lat/center_lon (if present)
     try:
         _tdr_ds, _tdr_li = resolve_case(case_index, data_type)
         if "center_lat" in _tdr_ds and "center_lon" in _tdr_ds:
             center_lat = float(_tdr_ds["center_lat"].values[_tdr_li])
             center_lon = float(_tdr_ds["center_lon"].values[_tdr_li])
-    except Exception as e:
-        _resolve_err = str(e)
+            _center_source = "tdr_zarr"
+    except Exception:
+        pass
+    # Priority 2: Metadata cache latitude/longitude (TC-RADAR best-track center)
+    if center_lat is None or center_lon is None:
+        clat = case_meta.get("latitude")
+        clon = case_meta.get("longitude")
+        if clat is not None and clon is not None:
+            try:
+                center_lat = float(clat)
+                center_lon = float(clon)
+                _center_source = "metadata"
+            except (ValueError, TypeError):
+                pass
+    # Priority 3: ERA5 best-track center
+    _swath_idx = _merge_to_swath_index.get(case_index, case_index) if data_type == "merge" else case_index
+    if center_lat is None or center_lon is None:
+        try:
+            era5 = get_era5_dataset()
+            if era5 is not None and "center_lat" in era5:
+                center_lat = float(era5["center_lat"][_swath_idx])
+                center_lon = float(era5["center_lon"][_swath_idx])
+                _center_source = "era5"
+        except Exception:
+            pass
+    # Priority 4: IR Zarr best-track center
+    if center_lat is None or center_lon is None:
+        try:
+            ir_store = get_ir_dataset()
+            if ir_store is not None and "center_lat" in ir_store:
+                center_lat = float(ir_store["center_lat"][_swath_idx])
+                center_lon = float(ir_store["center_lon"][_swath_idx])
+                _center_source = "ir_zarr"
+        except Exception:
+            pass
 
     if center_lat is None or center_lon is None:
-        # The plan-view already rendered a center, so this shouldn't normally fail.
-        # Return a helpful debug message if it does.
         result = {
             "success": False,
             "reason": "no_center",
-            "message": f"Could not resolve storm center for case {case_index} ({data_type})"
-                       + (f": {_resolve_err}" if _resolve_err else ""),
+            "message": "No storm center available for this case",
             "dropsondes": [],
         }
         return JSONResponse(result)
