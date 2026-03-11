@@ -5647,6 +5647,13 @@ def _build_archive_sonde_response(
     x_km_arr = []
     y_km_arr = []
     alt_km_arr = []
+
+    # Use the sonde's actual surface pressure for altitude estimation fallback
+    # instead of standard 1013.25 hPa — critical for TCs with low surface pressure
+    sfc_pres_ref = meta.get("hyd_sfcp") or meta.get("splash_pr") or 1013.25
+    if sfc_pres_ref <= 0:
+        sfc_pres_ref = 1013.25
+
     for i in range(len(profile["lat"])):
         x, y = _latlon_to_storm_km_archive(
             profile["lat"][i], profile["lon"][i], center_lat, center_lon
@@ -5654,11 +5661,17 @@ def _build_archive_sonde_response(
         x_km_arr.append(round(x, 3))
         y_km_arr.append(round(y, 3))
         alt_m = profile["alt"][i]
-        # If altitude is missing, estimate from pressure using standard atmo
+        # If altitude is missing, estimate from pressure using hypsometric approx
+        # relative to the sonde's actual surface pressure (so surface ≈ 0m AGL)
         if alt_m is None and profile["pres"][i] is not None:
             p = profile["pres"][i]
-            if p > 0:
-                alt_m = 44330.0 * (1.0 - (p / 1013.25) ** 0.190284)
+            if p > 0 and p < sfc_pres_ref:
+                # Hypsometric: height above surface ≈ (Rd*Tv/g) * ln(Psfc/P)
+                # Using Tv ≈ 288K as a tropical mean virtual temperature
+                alt_m = (287.04 * 288.0 / 9.81) * math.log(sfc_pres_ref / p)
+            elif p > 0:
+                # At or below surface pressure — altitude near 0
+                alt_m = 0.0
         alt_km_arr.append(round(alt_m / 1000.0, 4) if alt_m is not None else None)
 
     launch = {
