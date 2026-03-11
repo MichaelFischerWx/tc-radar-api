@@ -7,8 +7,8 @@ Data backend: Zarr stores on S3 — case-level chunks mean each plot
 request is a handful of small S3 GETs, typically completing in <1 s
 (vs 5–15 s for HTTP range requests against AOML).
 
-Deploy on Render (free tier is fine), co-located in the same AWS region
-as your S3 bucket (us-east-1 recommended) for zero-latency data access.
+Deploy on Cloud Run or Render, co-located in the same AWS region
+as your S3 bucket (us-east-1 recommended) for low-latency data access.
 
 Environment variables
 ---------------------
@@ -253,9 +253,14 @@ for _base in _MERGED_BASES:
 # ---------------------------------------------------------------------------
 app = FastAPI(title="TC-RADAR API", version="2.0.0")
 
+_cors_origins = os.environ.get(
+    "CORS_ORIGINS",
+    "https://michaelfischerwx.github.io,http://localhost:8000",
+).split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://michaelfischerwx.github.io", "http://localhost:8000"],
+    allow_origins=[o.strip() for o in _cors_origins],
     allow_methods=["GET"],
     allow_headers=["*"],
 )
@@ -5394,6 +5399,635 @@ def get_archive_flight_level(
 
 
 # ---------------------------------------------------------------------------
+# Archive Dropsonde Data (HRD .frd format)
+# ---------------------------------------------------------------------------
+
+HRD_SONDE_BASE = "https://www.aoml.noaa.gov/ftp/pub/hrd/data/dropsonde"
+
+# Cache for archive dropsonde responses (keyed by "{data_type}_{case_index}")
+_hrd_sonde_cache: OrderedDict = OrderedDict()
+_HRD_SONDE_CACHE_MAX = 30
+_HRD_SONDE_CACHE_TTL = 600  # 10 minutes
+
+SONDE_ARCHIVE_TIME_WINDOW_MIN = 45  # ±45 min for swath matching
+
+# Mapping: 2-digit year → HURR season directory name
+# e.g. 2003 → "HURR03", 2014 → "HURR14", 1997 → "HURR97"
+def _hurr_season_dir(year: int) -> str:
+    """Return the HURR directory name for a given year."""
+    return f"HURR{year % 100:02d}"
+
+
+def _parse_frd_file(text: str) -> Optional[dict]:
+    """
+    Parse an HRD operationally-processed .frd dropsonde file.
+
+    Returns a dict with:
+        meta: dict of header metadata (sonde_id, aircraft, date, time,
+              lat, lon, alt, splash_pr, hyd_sfcp, hit_surface,
+              estimated_pr_used, gps_verr, format_version)
+        profile: dict of arrays (time_s, pres, temp, rh, alt, wspd, wdir,
+                                 uwnd, vwnd, lat, lon, theta_e)
+    or None if parsing fails.
+    """
+    lines = text.splitlines()
+    if len(lines) < 22:
+        return None
+
+    meta = {}
+
+    # --- Parse header (lines 1-20 of the .frd format) ---
+    # Line 2: sonde ID
+    for line in lines[:13]:
+        stripped = line.strip()
+        if "Sonde:" in stripped:
+            parts = stripped.split("Sonde:")
+            if len(parts) > 1:
+                meta["sonde_id"] = parts[1].strip()
+        if "Format:" in stripped:
+            parts = stripped.split("Format:")
+            if len(parts) > 1:
+                meta["format_version"] = parts[1].strip()
+        if "Aircraft:" in stripped:
+            # Aircraft: N49RF                             Date: 030914   Time: 205329 UTC
+            m_ac = re.search(r"Aircraft:\s*(\S+)", stripped)
+            if m_ac:
+                meta["aircraft"] = m_ac.group(1)
+            m_dt = re.search(r"Date:\s*(\d{6})", stripped)
+            if m_dt:
+                meta["date_str"] = m_dt.group(1)
+            m_tm = re.search(r"Time:\s*(\d{6})", stripped)
+            if m_tm:
+                meta["time_str"] = m_tm.group(1)
+        if "Splash PR" in stripped:
+            m = re.search(r"Splash PR\s*=\s*([\d.\-]+)", stripped)
+            if m:
+                meta["splash_pr"] = float(m.group(1))
+        if "HYD SFCP" in stripped:
+            m = re.search(r"HYD SFCP\s*=\s*([\d.\-]+)", stripped)
+            if m:
+                meta["hyd_sfcp"] = float(m.group(1))
+        if "GPS VERR" in stripped:
+            m = re.search(r"GPS VERR\s*=\s*([\d.\-]+)", stripped)
+            if m:
+                meta["gps_verr"] = float(m.group(1))
+        if "Estimated PR used" in stripped:
+            m = re.search(r"Estimated PR used\s*=\s*(\S)", stripped)
+            if m:
+                meta["estimated_pr_used"] = m.group(1).upper() == "Y"
+        if "Hyd anchor" in stripped:
+            m = re.search(r"Hyd anchor\s*=\s*(\S+)", stripped)
+            if m:
+                meta["hyd_anchor"] = m.group(1)
+
+    # Parse the second metadata block (Date/Lat/Lon/etc.)
+    for line in lines[14:20]:
+        stripped = line.strip()
+        if "SID:" in stripped:
+            m = re.search(r"SID:\s*(\S+)", stripped)
+            if m:
+                meta["sonde_id"] = m.group(1)
+        if "Lat:" in stripped and "Lon:" in stripped:
+            m_lat = re.search(r"Lat:\s*([\d.]+)\s*([NS])", stripped)
+            m_lon = re.search(r"Lon:\s*([\d.]+)\s*([EW])", stripped)
+            if m_lat:
+                lat = float(m_lat.group(1))
+                if m_lat.group(2) == "S":
+                    lat = -lat
+                meta["launch_lat"] = lat
+            if m_lon:
+                lon = float(m_lon.group(1))
+                if m_lon.group(2) == "W":
+                    lon = -lon
+                meta["launch_lon"] = lon
+            m_ga = re.search(r"GA:\s*([\d.]+)\s*m", stripped)
+            if m_ga:
+                meta["launch_alt_m"] = float(m_ga.group(1))
+
+    # Determine if sonde hit the surface
+    splash = meta.get("splash_pr", -999.0)
+    hyd_anchor = meta.get("hyd_anchor", "MSG")
+    meta["hit_surface"] = splash > 0 and hyd_anchor == "SFC"
+
+    # Parse launch datetime
+    launch_dt = None
+    if "date_str" in meta and "time_str" in meta:
+        try:
+            ds = meta["date_str"]  # YYMMDD
+            ts = meta["time_str"]  # HHMMSS
+            yy, mm, dd = int(ds[:2]), int(ds[2:4]), int(ds[4:6])
+            year = 1900 + yy if yy >= 70 else 2000 + yy
+            hh, mi, ss = int(ts[:2]), int(ts[2:4]), int(ts[4:6])
+            launch_dt = datetime(year, mm, dd, hh, mi, ss, tzinfo=timezone.utc)
+            meta["launch_dt"] = launch_dt
+        except (ValueError, IndexError):
+            pass
+
+    # --- Find the column header line ---
+    data_start = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("IX") and "t (s)" in line:
+            data_start = i + 1
+            break
+
+    if data_start is None:
+        return None
+
+    # --- Parse data columns (fixed-width, but we use split) ---
+    MISSING = -999.0
+    profile = {
+        "time_s": [], "pres": [], "temp": [], "rh": [],
+        "alt": [], "wspd": [], "wdir": [], "uwnd": [], "vwnd": [],
+        "lat": [], "lon": [], "theta_e": [],
+    }
+
+    for i in range(data_start, len(lines)):
+        stripped = lines[i].strip()
+        if not stripped:
+            continue
+        parts = stripped.split()
+        if len(parts) < 18:
+            continue
+
+        try:
+            t_s   = float(parts[1])
+            pres  = float(parts[2])
+            temp  = float(parts[3])
+            rh    = float(parts[4])
+            alt   = float(parts[5])
+            wdir  = float(parts[6])
+            wspd  = float(parts[7])
+            uwnd  = float(parts[8])
+            vwnd  = float(parts[9])
+            lat   = float(parts[17])
+            lon   = float(parts[18])
+        except (ValueError, IndexError):
+            continue
+
+        # Parse theta_e if present (column index 21 in the extended format)
+        theta_e = None
+        if len(parts) > 21:
+            try:
+                te = float(parts[21])
+                if te != MISSING:
+                    theta_e = te
+            except (ValueError, IndexError):
+                pass
+
+        def _v(x):
+            return None if x == MISSING or x <= MISSING else x
+
+        profile["time_s"].append(round(t_s, 1))
+        profile["pres"].append(_v(pres))
+        profile["temp"].append(_v(temp))
+        profile["rh"].append(_v(rh))
+        profile["alt"].append(_v(alt))
+        profile["wdir"].append(_v(wdir))
+        profile["wspd"].append(_v(wspd))
+        profile["uwnd"].append(_v(uwnd))
+        profile["vwnd"].append(_v(vwnd))
+        profile["lat"].append(_v(lat))
+        profile["lon"].append(_v(lon))
+        profile["theta_e"].append(theta_e)
+
+    if not profile["time_s"]:
+        return None
+
+    return {"meta": meta, "profile": profile}
+
+
+def _filter_valid_frd_profile(profile: dict) -> dict:
+    """
+    Filter .frd profile to rows with valid lat, lon, and either alt or pressure.
+
+    Altitude may be entirely missing for sondes that didn't reach the surface
+    (Hyd anchor = MSG), so we accept pressure as the vertical coordinate.
+    """
+    n = len(profile["time_s"])
+    mask = []
+    for i in range(n):
+        lat_ok = profile["lat"][i] is not None
+        lon_ok = profile["lon"][i] is not None
+        vert_ok = (profile["alt"][i] is not None) or (profile["pres"][i] is not None)
+        mask.append(lat_ok and lon_ok and vert_ok)
+
+    filtered = {}
+    for key in profile:
+        filtered[key] = [profile[key][i] for i in range(n) if mask[i]]
+    return filtered
+
+
+def _build_archive_sonde_response(
+    parsed: dict,
+    center_lat: float,
+    center_lon: float,
+    analysis_dt: Optional[datetime],
+) -> Optional[dict]:
+    """Build a single archive dropsonde entry for the API response."""
+    meta = parsed["meta"]
+    profile = _filter_valid_frd_profile(parsed["profile"])
+
+    if not profile["lat"]:
+        return None
+
+    x_km_arr = []
+    y_km_arr = []
+    alt_km_arr = []
+    for i in range(len(profile["lat"])):
+        x, y = _latlon_to_storm_km_archive(
+            profile["lat"][i], profile["lon"][i], center_lat, center_lon
+        )
+        x_km_arr.append(round(x, 3))
+        y_km_arr.append(round(y, 3))
+        alt_m = profile["alt"][i]
+        # If altitude is missing, estimate from pressure using standard atmo
+        if alt_m is None and profile["pres"][i] is not None:
+            p = profile["pres"][i]
+            if p > 0:
+                alt_m = 44330.0 * (1.0 - (p / 1013.25) ** 0.190284)
+        alt_km_arr.append(round(alt_m / 1000.0, 4) if alt_m is not None else None)
+
+    launch = {
+        "lat": profile["lat"][0],
+        "lon": profile["lon"][0],
+        "alt_m": profile["alt"][0] or (alt_km_arr[0] * 1000.0 if alt_km_arr[0] else None),
+        "x_km": x_km_arr[0],
+        "y_km": y_km_arr[0],
+    }
+
+    surface = {
+        "lat": profile["lat"][-1],
+        "lon": profile["lon"][-1],
+        "alt_m": profile["alt"][-1] or (alt_km_arr[-1] * 1000.0 if alt_km_arr[-1] else None),
+        "x_km": x_km_arr[-1],
+        "y_km": y_km_arr[-1],
+    }
+
+    time_offset_min = None
+    launch_time_str = ""
+    launch_dt = meta.get("launch_dt")
+    if launch_dt:
+        launch_time_str = launch_dt.strftime("%Y-%m-%d %H:%M:%SZ")
+        if analysis_dt:
+            delta = (launch_dt - analysis_dt).total_seconds() / 60.0
+            time_offset_min = round(delta, 1)
+
+    def _round_list(arr, decimals=3):
+        return [round(v, decimals) if v is not None else None for v in arr]
+
+    return {
+        "sonde_id": meta.get("sonde_id", ""),
+        "launch_time": launch_time_str,
+        "time_offset_min": time_offset_min,
+        "aircraft": meta.get("aircraft", ""),
+        "hit_surface": meta.get("hit_surface", False),
+        "splash_pr": meta.get("splash_pr"),
+        "hyd_sfcp": meta.get("hyd_sfcp"),
+        "estimated_pr_used": meta.get("estimated_pr_used", False),
+        "gps_verr": meta.get("gps_verr"),
+        "launch": launch,
+        "surface": surface,
+        "profile": {
+            "time_s": _round_list(profile["time_s"], 1),
+            "lat": _round_list(profile["lat"], 5),
+            "lon": _round_list(profile["lon"], 5),
+            "x_km": x_km_arr,
+            "y_km": y_km_arr,
+            "alt_km": alt_km_arr,
+            "wspd": _round_list(profile["wspd"], 2),
+            "wdir": _round_list(profile["wdir"], 1),
+            "temp": _round_list(profile["temp"], 2),
+            "pres": _round_list(profile["pres"], 2),
+            "rh": _round_list(profile["rh"], 1),
+            "dewpoint": [],  # .frd doesn't include dewpoint directly
+            "uwnd": _round_list(profile["uwnd"], 2),
+            "vwnd": _round_list(profile["vwnd"], 2),
+            "theta_e": _round_list(profile.get("theta_e", []), 2),
+        },
+    }
+
+
+def _resolve_hurr_season(year: int) -> Optional[str]:
+    """
+    Resolve the HURR season directory from the AOML dropsonde archive.
+
+    Checks that the directory actually exists on the server.
+    Returns the directory name (e.g., "HURR03") or None.
+    """
+    season_dir = _hurr_season_dir(year)
+    season_url = f"{HRD_SONDE_BASE}/{season_dir}/"
+    try:
+        entries = _hrd_parse_directory(season_url)
+        # If we get any entries, the directory exists
+        if entries:
+            return season_dir
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_sonde_storm_dir(season_dir: str, storm_name: str) -> Optional[str]:
+    """
+    Resolve the storm subdirectory within a HURR season for dropsonde data.
+
+    The dropsonde archive may have storm-level subdirectories (e.g.,
+    "isabel/operproc/") or place operproc directly in the season dir.
+    Returns the resolved base URL path or None.
+    """
+    season_url = f"{HRD_SONDE_BASE}/{season_dir}/"
+    try:
+        entries = _hrd_parse_directory(season_url)
+    except Exception:
+        return None
+
+    dirs = [e.rstrip("/") for e in entries if not e.startswith("?")]
+
+    # Check if "operproc" is directly in the season directory
+    if "operproc" in [d.lower() for d in dirs]:
+        return f"{HRD_SONDE_BASE}/{season_dir}"
+
+    # Look for storm subdirectory
+    target = storm_name.lower().strip()
+    for d in dirs:
+        if d.lower() == target:
+            return f"{HRD_SONDE_BASE}/{season_dir}/{d}"
+
+    # Fuzzy match
+    for d in dirs:
+        if target.startswith(d.lower()) or d.lower().startswith(target):
+            return f"{HRD_SONDE_BASE}/{season_dir}/{d}"
+
+    return None
+
+
+def _find_frd_tarball(
+    base_url: str, mission_id: str, year: int
+) -> Optional[str]:
+    """
+    Find the .frd.tar.gz file for a given mission_id in the operproc directory.
+
+    mission_id format: "20030914N1" or "030914N1"
+    Tarball naming: "{YYYYMMDD}{aircraft_lower}.frd.tar.gz" or
+                    "{YYMMDD}{aircraft_lower}.frd.tar.gz"
+
+    Returns the full URL to the tarball, or None.
+    """
+    operproc_url = f"{base_url}/operproc/"
+    try:
+        entries = _hrd_parse_directory(operproc_url)
+    except Exception:
+        return None
+
+    # Parse mission_id to extract date + aircraft letter
+    m = re.match(r"(\d{8})([A-Za-z])(\d+)", mission_id)
+    if not m:
+        m = re.match(r"(\d{6})([A-Za-z])(\d+)", mission_id)
+        if not m:
+            return None
+        short_date = m.group(1)
+        century = str(year)[:2]
+        date_8 = century + short_date
+        date_6 = short_date
+        aircraft = m.group(2).lower()
+    else:
+        date_8 = m.group(1)
+        date_6 = date_8[2:]  # strip century
+        aircraft = m.group(2).lower()
+
+    # Look for matching tarball. Try several naming patterns:
+    # e.g., "20030914n.frd.tar.gz", "030914n.frd.tar.gz"
+    candidates_8 = f"{date_8}{aircraft}.frd.tar"  # may have .gz suffix
+    candidates_6 = f"{date_6}{aircraft}.frd.tar"
+
+    for entry in entries:
+        el = entry.lower().rstrip("/")
+        if el.startswith(candidates_8.lower()) or el.startswith(candidates_6.lower()):
+            return f"{operproc_url}{entry}"
+
+    return None
+
+
+def _fetch_and_extract_frd_tarball(
+    tarball_url: str,
+) -> list[tuple[str, str]]:
+    """
+    Fetch a .frd.tar.gz from AOML and extract all .frd files.
+
+    Returns a list of (filename, file_text) tuples.
+    """
+    import tarfile
+
+    try:
+        import requests as _req
+        resp = _req.get(tarball_url, timeout=60)
+        resp.raise_for_status()
+        data = resp.content
+    except ImportError:
+        import urllib.request as _urllib
+        req = _urllib.Request(tarball_url)
+        with _urllib.urlopen(req, timeout=60) as resp:
+            data = resp.read()
+    except Exception:
+        return []
+
+    frd_files = []
+    try:
+        buf = io.BytesIO(data)
+        with tarfile.open(fileobj=buf, mode="r:gz") as tar:
+            for member in tar.getmembers():
+                if member.name.endswith(".frd") and member.isfile():
+                    f = tar.extractfile(member)
+                    if f:
+                        text = f.read().decode("utf-8", errors="replace")
+                        frd_files.append((member.name, text))
+    except Exception:
+        # Try without gzip (some may be just .tar)
+        try:
+            buf = io.BytesIO(data)
+            with tarfile.open(fileobj=buf, mode="r:") as tar:
+                for member in tar.getmembers():
+                    if member.name.endswith(".frd") and member.isfile():
+                        f = tar.extractfile(member)
+                        if f:
+                            text = f.read().decode("utf-8", errors="replace")
+                            frd_files.append((member.name, text))
+        except Exception:
+            pass
+
+    return frd_files
+
+
+@app.get("/dropsondes/archive")
+def get_archive_dropsondes(
+    case_index: int = Query(..., ge=0, description="0-based case index"),
+    data_type: str = Query("swath", description="'swath' or 'merge'"),
+):
+    """
+    Return dropsonde profiles from the HRD .frd archive for an archive case.
+
+    For swath: returns sondes within ±45 min of the TDR analysis time.
+    For merge: returns all sondes from the matching flight/mission.
+
+    Fetches operationally-processed .frd files from the AOML HRD archive,
+    converts to storm-relative coordinates, and returns profiles.
+    """
+    now = time.time()
+    cache_key = f"sonde_{data_type}_{case_index}"
+    if cache_key in _hrd_sonde_cache:
+        cached, ts = _hrd_sonde_cache[cache_key]
+        if now - ts < _HRD_SONDE_CACHE_TTL:
+            _hrd_sonde_cache.move_to_end(cache_key)
+            return JSONResponse(cached)
+
+    # Look up case metadata
+    cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
+    case_meta = cache.get(case_index)
+    if not case_meta:
+        raise HTTPException(status_code=404, detail=f"case_index {case_index} not found")
+
+    storm_name = case_meta.get("storm_name", "").strip()
+    mission_id = case_meta.get("mission_id", "").strip()
+    dt_str = case_meta.get("datetime", "")
+
+    # Get storm center
+    center_lat = None
+    center_lon = None
+    try:
+        _tdr_ds, _tdr_li = resolve_case(case_index, data_type)
+        if "center_lat" in _tdr_ds and "center_lon" in _tdr_ds:
+            center_lat = float(_tdr_ds["center_lat"].values[_tdr_li])
+            center_lon = float(_tdr_ds["center_lon"].values[_tdr_li])
+    except Exception:
+        pass
+
+    if center_lat is None or center_lon is None:
+        result = {
+            "success": False,
+            "reason": "no_center",
+            "message": "No storm center available for this case",
+            "dropsondes": [],
+        }
+        return JSONResponse(result)
+
+    if not mission_id:
+        result = {
+            "success": False,
+            "reason": "no_mission_id",
+            "message": "No mission ID in metadata for this case",
+            "dropsondes": [],
+        }
+        return JSONResponse(result)
+
+    # Parse scan datetime
+    scan_dt = _parse_tdr_scan_time(dt_str)
+    if scan_dt is None:
+        result = {
+            "success": False,
+            "reason": "bad_datetime",
+            "message": f"Could not parse datetime: {dt_str}",
+            "dropsondes": [],
+        }
+        return JSONResponse(result)
+
+    year = scan_dt.year
+
+    # Resolve HURR season directory
+    season_dir = _resolve_hurr_season(year)
+    if not season_dir:
+        result = {
+            "success": False,
+            "reason": "no_season_dir",
+            "message": f"No HRD dropsonde season directory found for {year}",
+            "dropsondes": [],
+            "analysis_time": scan_dt.strftime("%Y-%m-%d %H:%M:%SZ"),
+        }
+        _hrd_sonde_cache[cache_key] = (result, now)
+        return JSONResponse(result)
+
+    # Resolve storm or base directory (some years have storm subdirs, some don't)
+    base_url = _resolve_sonde_storm_dir(season_dir, storm_name)
+    if not base_url:
+        # Fallback: try season dir directly
+        base_url = f"{HRD_SONDE_BASE}/{season_dir}"
+
+    # Find the tarball for this mission
+    tarball_url = _find_frd_tarball(base_url, mission_id, year)
+    if not tarball_url:
+        result = {
+            "success": False,
+            "reason": "no_tarball",
+            "message": f"No dropsonde .frd archive found for mission {mission_id}",
+            "dropsondes": [],
+            "analysis_time": scan_dt.strftime("%Y-%m-%d %H:%M:%SZ"),
+            "center_lat": center_lat,
+            "center_lon": center_lon,
+        }
+        _hrd_sonde_cache[cache_key] = (result, now)
+        return JSONResponse(result)
+
+    # Fetch and extract .frd files
+    frd_files = _fetch_and_extract_frd_tarball(tarball_url)
+    if not frd_files:
+        result = {
+            "success": False,
+            "reason": "empty_tarball",
+            "message": f"Could not extract .frd files from {tarball_url}",
+            "dropsondes": [],
+            "analysis_time": scan_dt.strftime("%Y-%m-%d %H:%M:%SZ"),
+            "center_lat": center_lat,
+            "center_lon": center_lon,
+        }
+        _hrd_sonde_cache[cache_key] = (result, now)
+        return JSONResponse(result)
+
+    # Parse all .frd files
+    dropsondes = []
+    for fname, text in frd_files:
+        parsed = _parse_frd_file(text)
+        if parsed is None:
+            continue
+
+        sonde_resp = _build_archive_sonde_response(
+            parsed, center_lat, center_lon, scan_dt
+        )
+        if sonde_resp is None:
+            continue
+
+        # Apply time filtering for swath data
+        if data_type == "swath" and sonde_resp["time_offset_min"] is not None:
+            if abs(sonde_resp["time_offset_min"]) > SONDE_ARCHIVE_TIME_WINDOW_MIN:
+                continue
+
+        dropsondes.append(sonde_resp)
+
+    # Sort by time offset
+    dropsondes.sort(
+        key=lambda s: abs(s["time_offset_min"]) if s["time_offset_min"] is not None else 999
+    )
+
+    result = {
+        "success": True,
+        "dropsondes": dropsondes,
+        "analysis_time": scan_dt.strftime("%Y-%m-%d %H:%M:%SZ"),
+        "center_lat": center_lat,
+        "center_lon": center_lon,
+        "mission_id": mission_id,
+        "storm_name": storm_name,
+        "data_type": data_type,
+        "time_window_min": SONDE_ARCHIVE_TIME_WINDOW_MIN if data_type == "swath" else None,
+        "n_sondes": len(dropsondes),
+        "n_frd_files": len(frd_files),
+        "source_url": tarball_url,
+    }
+
+    _hrd_sonde_cache[cache_key] = (result, now)
+    if len(_hrd_sonde_cache) > _HRD_SONDE_CACHE_MAX:
+        _hrd_sonde_cache.popitem(last=False)
+
+    return JSONResponse(result)
+
+
+# ---------------------------------------------------------------------------
 # Anomaly diagnostics — Fischer et al. (2025, MWR)
 # ---------------------------------------------------------------------------
 
@@ -6048,4 +6682,4 @@ app.include_router(global_router, prefix="/global")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
