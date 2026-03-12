@@ -1609,43 +1609,29 @@ def _build_sonde_response(
     center_lat: float,
     center_lon: float,
     analysis_dt: _dt,
+    storm_u: float = -999,
+    storm_v: float = -999,
 ) -> Optional[dict]:
-    """Build a single dropsonde entry for the API response."""
+    """Build a single dropsonde entry for the API response.
+
+    If storm_u/storm_v are valid (not -999), each profile point is
+    storm-motion-corrected to the analysis time, using the same convention
+    as flight-level data:
+        x_adj = x_static + storm_u * (-dt_s) / 1000
+        y_adj = y_static + storm_v * (-dt_s) / 1000
+    where dt_s is the time offset *of each individual data point* from the
+    analysis time.
+    """
     meta = parsed["meta"]
     profile = _filter_valid_profile(parsed["profile"])
 
     if not profile["lat"]:
         return None
 
-    x_km_arr = []
-    y_km_arr = []
-    alt_km_arr = []
-    for i in range(len(profile["lat"])):
-        x, y = _latlon_to_storm_km(
-            profile["lat"][i], profile["lon"][i], center_lat, center_lon
-        )
-        x_km_arr.append(round(x, 3))
-        y_km_arr.append(round(y, 3))
-        alt_m = profile["gps_alt"][i] if profile["gps_alt"][i] is not None else profile["alt"][i]
-        alt_km_arr.append(round(alt_m / 1000.0, 4) if alt_m is not None else None)
+    has_motion = (storm_u != -999 and storm_v != -999
+                  and storm_u is not None and storm_v is not None)
 
-    launch = {
-        "lat": profile["lat"][0],
-        "lon": profile["lon"][0],
-        "alt_m": (profile["gps_alt"][0] or profile["alt"][0]),
-        "x_km": x_km_arr[0],
-        "y_km": y_km_arr[0],
-    }
-
-    surface = {
-        "lat": profile["lat"][-1],
-        "lon": profile["lon"][-1],
-        "alt_m": (profile["gps_alt"][-1] or profile["alt"][-1]),
-        "x_km": x_km_arr[-1],
-        "y_km": y_km_arr[-1],
-    }
-
-    # Launch time for time offset computation (handle hour >= 24)
+    # ── Parse launch time first (needed for storm-motion correction) ──
     launch_dt = None
     try:
         yr = int(meta.get("Year", 0))
@@ -1669,6 +1655,54 @@ def _build_sonde_response(
         launch_time_str = launch_dt.strftime("%Y-%m-%d %H:%M:%SZ")
         delta = (launch_dt - analysis_dt).total_seconds() / 60.0
         time_offset_min = round(delta, 1)
+
+    # ── Build profile arrays with storm-motion correction ──────────
+    # For each profile point, compute the point's time relative to the
+    # analysis time, then shift (x,y) so that the sonde trajectory is
+    # plotted as if the storm were stationary at the analysis position.
+    #
+    # dt_s for point i = (launch_dt + time_s[i]) - analysis_dt
+    # x_adj = x_static + storm_u * (-dt_s) / 1000
+    # y_adj = y_static + storm_v * (-dt_s) / 1000
+
+    # Pre-compute launch offset in seconds from analysis time
+    launch_offset_s = None
+    if launch_dt and analysis_dt:
+        launch_offset_s = (launch_dt - analysis_dt).total_seconds()
+
+    x_km_arr = []
+    y_km_arr = []
+    alt_km_arr = []
+    for i in range(len(profile["lat"])):
+        x, y = _latlon_to_storm_km(
+            profile["lat"][i], profile["lon"][i], center_lat, center_lon
+        )
+        # Storm-motion correction: shift each point to analysis time
+        if has_motion and launch_offset_s is not None:
+            time_s_i = profile["time_s"][i] if profile["time_s"][i] is not None else 0
+            dt_s = launch_offset_s + time_s_i  # seconds from analysis
+            x += storm_u * (-dt_s) / 1000.0
+            y += storm_v * (-dt_s) / 1000.0
+        x_km_arr.append(round(x, 3))
+        y_km_arr.append(round(y, 3))
+        alt_m = profile["gps_alt"][i] if profile["gps_alt"][i] is not None else profile["alt"][i]
+        alt_km_arr.append(round(alt_m / 1000.0, 4) if alt_m is not None else None)
+
+    launch = {
+        "lat": profile["lat"][0],
+        "lon": profile["lon"][0],
+        "alt_m": (profile["gps_alt"][0] or profile["alt"][0]),
+        "x_km": x_km_arr[0],
+        "y_km": y_km_arr[0],
+    }
+
+    surface = {
+        "lat": profile["lat"][-1],
+        "lon": profile["lon"][-1],
+        "alt_m": (profile["gps_alt"][-1] or profile["alt"][-1]),
+        "x_km": x_km_arr[-1],
+        "y_km": y_km_arr[-1],
+    }
 
     def _round_list(arr, decimals=3):
         return [round(v, decimals) if v is not None else None for v in arr]
@@ -1793,7 +1827,11 @@ def get_dropsondes(
             parsed = _parse_dropsonde_csv(csv_text)
             if parsed is None:
                 return None
-            return _build_sonde_response(parsed, center_lat, center_lon, analysis_dt)
+            return _build_sonde_response(
+                parsed, center_lat, center_lon, analysis_dt,
+                storm_u=case_meta.get("storm_motion_east_ms", -999),
+                storm_v=case_meta.get("storm_motion_north_ms", -999),
+            )
         except Exception:
             return None
 
@@ -1811,6 +1849,10 @@ def get_dropsondes(
         key=lambda s: abs(s["time_offset_min"]) if s["time_offset_min"] is not None else 999
     )
 
+    _su = case_meta.get("storm_motion_east_ms", -999)
+    _sv = case_meta.get("storm_motion_north_ms", -999)
+    _has_sm = (_su != -999 and _sv != -999 and _su is not None and _sv is not None)
+
     result = {
         "dropsondes": dropsondes,
         "analysis_time": analysis_dt.strftime("%Y-%m-%d %H:%M:%SZ"),
@@ -1818,6 +1860,9 @@ def get_dropsondes(
         "center_lon": center_lon,
         "time_window_min": SONDE_TIME_WINDOW_MIN,
         "n_sondes": len(dropsondes),
+        "storm_motion_corrected": _has_sm,
+        "storm_motion_east_ms": round(_su, 2) if _has_sm else None,
+        "storm_motion_north_ms": round(_sv, 2) if _has_sm else None,
     }
 
     _rt_sonde_cache[file_url] = (result, now)

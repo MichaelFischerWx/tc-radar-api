@@ -5649,17 +5649,34 @@ def _build_archive_sonde_response(
     center_lat: float,
     center_lon: float,
     analysis_dt: Optional[datetime],
+    storm_u: float = -999,
+    storm_v: float = -999,
 ) -> Optional[dict]:
-    """Build a single archive dropsonde entry for the API response."""
+    """Build a single archive dropsonde entry for the API response.
+
+    If storm_u/storm_v are valid (not -999), each profile point is
+    storm-motion-corrected to the analysis time using the same convention
+    as flight-level data and real-time dropsondes.
+    """
     meta = parsed["meta"]
     profile = _filter_valid_frd_profile(parsed["profile"])
 
     if not profile["lat"]:
         return None
 
-    x_km_arr = []
-    y_km_arr = []
-    alt_km_arr = []
+    has_motion = (storm_u != -999 and storm_v != -999
+                  and storm_u is not None and storm_v is not None)
+
+    # ── Parse launch time first (needed for storm-motion correction) ──
+    launch_dt = meta.get("launch_dt")
+    time_offset_min = None
+    launch_time_str = ""
+    launch_offset_s = None
+    if launch_dt:
+        launch_time_str = launch_dt.strftime("%Y-%m-%d %H:%M:%SZ")
+        if analysis_dt:
+            launch_offset_s = (launch_dt - analysis_dt).total_seconds()
+            time_offset_min = round(launch_offset_s / 60.0, 1)
 
     # Use the sonde's actual surface pressure for altitude estimation fallback
     # instead of standard 1013.25 hPa — critical for TCs with low surface pressure
@@ -5667,10 +5684,22 @@ def _build_archive_sonde_response(
     if sfc_pres_ref <= 0:
         sfc_pres_ref = 1013.25
 
+    x_km_arr = []
+    y_km_arr = []
+    alt_km_arr = []
+
     for i in range(len(profile["lat"])):
         x, y = _latlon_to_storm_km_archive(
             profile["lat"][i], profile["lon"][i], center_lat, center_lon
         )
+        # Storm-motion correction: shift each point to analysis time
+        # dt_s = (launch_time + elapsed_time) - analysis_time
+        # x_adj = x + storm_u * (-dt_s) / 1000
+        if has_motion and launch_offset_s is not None:
+            time_s_i = profile["time_s"][i] if profile["time_s"][i] is not None else 0
+            dt_s = launch_offset_s + time_s_i
+            x += storm_u * (-dt_s) / 1000.0
+            y += storm_v * (-dt_s) / 1000.0
         x_km_arr.append(round(x, 3))
         y_km_arr.append(round(y, 3))
         alt_m = profile["alt"][i]
@@ -5702,15 +5731,6 @@ def _build_archive_sonde_response(
         "x_km": x_km_arr[-1],
         "y_km": y_km_arr[-1],
     }
-
-    time_offset_min = None
-    launch_time_str = ""
-    launch_dt = meta.get("launch_dt")
-    if launch_dt:
-        launch_time_str = launch_dt.strftime("%Y-%m-%d %H:%M:%SZ")
-        if analysis_dt:
-            delta = (launch_dt - analysis_dt).total_seconds() / 60.0
-            time_offset_min = round(delta, 1)
 
     def _round_list(arr, decimals=3):
         return [round(v, decimals) if v is not None else None for v in arr]
@@ -5944,14 +5964,38 @@ def get_archive_dropsondes(
     center_lon = None
     _center_source = None
     # Priority 1: TDR Zarr center_lat/center_lon (if present)
+    # Also try to extract storm motion from the Zarr for sonde position correction
+    _sonde_storm_u = -999.0
+    _sonde_storm_v = -999.0
     try:
         _tdr_ds, _tdr_li = resolve_case(case_index, data_type)
         if "center_lat" in _tdr_ds and "center_lon" in _tdr_ds:
             center_lat = float(_tdr_ds["center_lat"].values[_tdr_li])
             center_lon = float(_tdr_ds["center_lon"].values[_tdr_li])
             _center_source = "tdr_zarr"
+        # Storm motion: try per-case variables first, then global attrs
+        for _u_key in ("storm_u_ms", "storm_motion_east_ms"):
+            if _u_key in _tdr_ds:
+                _sonde_storm_u = float(_tdr_ds[_u_key].values[_tdr_li])
+                break
+        for _v_key in ("storm_v_ms", "storm_motion_north_ms"):
+            if _v_key in _tdr_ds:
+                _sonde_storm_v = float(_tdr_ds[_v_key].values[_tdr_li])
+                break
+        # Fallback: global attrs (single-case files or older format)
+        if _sonde_storm_u == -999.0 and hasattr(_tdr_ds, "attrs"):
+            _sonde_storm_u = float(_tdr_ds.attrs.get(
+                "EASTWARD STORM MOTION (METERS PER SECOND)",
+                _tdr_ds.attrs.get("storm_motion_east_ms", -999)))
+            _sonde_storm_v = float(_tdr_ds.attrs.get(
+                "NORTHWARD STORM MOTION (METERS PER SECOND)",
+                _tdr_ds.attrs.get("storm_motion_north_ms", -999)))
     except Exception:
         pass
+    # Also check case_meta (may have been enriched by FL endpoint)
+    if _sonde_storm_u == -999.0:
+        _sonde_storm_u = case_meta.get("storm_motion_east_ms", -999.0)
+        _sonde_storm_v = case_meta.get("storm_motion_north_ms", -999.0)
     # Priority 2: Metadata cache latitude/longitude (TC-RADAR best-track center)
     if center_lat is None or center_lon is None:
         clat = case_meta.get("latitude")
@@ -6093,7 +6137,8 @@ def get_archive_dropsondes(
             continue
 
         sonde_resp = _build_archive_sonde_response(
-            parsed, center_lat, center_lon, scan_dt
+            parsed, center_lat, center_lon, scan_dt,
+            storm_u=_sonde_storm_u, storm_v=_sonde_storm_v,
         )
         if sonde_resp is None:
             continue
@@ -6110,6 +6155,8 @@ def get_archive_dropsondes(
         key=lambda s: abs(s["time_offset_min"]) if s["time_offset_min"] is not None else 999
     )
 
+    _has_sm = (_sonde_storm_u != -999 and _sonde_storm_v != -999
+               and _sonde_storm_u is not None and _sonde_storm_v is not None)
     result = {
         "success": True,
         "dropsondes": dropsondes,
@@ -6123,6 +6170,9 @@ def get_archive_dropsondes(
         "n_sondes": len(dropsondes),
         "n_frd_files": len(frd_files),
         "source_url": tarball_url,
+        "storm_motion_corrected": _has_sm,
+        "storm_motion_east_ms": round(_sonde_storm_u, 2) if _has_sm else None,
+        "storm_motion_north_ms": round(_sonde_storm_v, 2) if _has_sm else None,
     }
 
     _hrd_sonde_cache[cache_key] = (result, now)
