@@ -6829,6 +6829,150 @@ def climatology_info():
     })
 
 
+# ---------------------------------------------------------------------------
+# Hovmöller — time × radius at a single height level
+# ---------------------------------------------------------------------------
+
+@app.get("/hovmoller")
+def hovmoller(
+    storm_name: str   = Query(...,                        description="Storm name (e.g. IRMA)"),
+    year:       int   = Query(...,   ge=1997, le=2030,    description="Storm year"),
+    variable:   str   = Query(DEFAULT_VARIABLE,           description="Variable key — see /variables"),
+    data_type:  str   = Query("swath",                    description="'swath' or 'merge'"),
+    height_km:  float = Query(2.0,   ge=0.0, le=18.0,    description="Height level in km"),
+    max_radius_km: float = Query(200.0, ge=10, le=500,   description="Maximum radius in km"),
+    dr_km:      float = Query(2.0,   ge=0.5, le=20,      description="Radial bin width in km"),
+    coverage_min: float = Query(0.5, ge=0.0, le=1.0,     description="Min fraction of valid data per bin"),
+):
+    """
+    Compute azimuthal-mean radial profiles at a fixed height for ALL cases
+    of a given storm.  Returns discrete per-case profiles (no interpolation),
+    suitable for a scatter-style Hovmöller plot.
+    """
+    if variable not in VARIABLES:
+        raise HTTPException(status_code=400, detail=f"Unknown variable '{variable}'.")
+    if data_type not in ("swath", "merge"):
+        raise HTTPException(status_code=400, detail="data_type must be 'swath' or 'merge'")
+
+    # Find all cases for this storm
+    cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
+    storm_cases = []
+    for ci, meta in cache.items():
+        if meta.get("storm_name", "").upper() == storm_name.upper() and meta.get("year") == year:
+            storm_cases.append((ci, meta))
+
+    if not storm_cases:
+        raise HTTPException(status_code=404, detail=f"No cases found for {storm_name} ({year})")
+
+    # Sort by datetime
+    storm_cases.sort(key=lambda x: x[1].get("datetime", ""))
+
+    display_name, varname, cmap, units, vmin, vmax = VARIABLES[variable]
+
+    # Compute radial profile for each case at the specified height
+    profiles = []
+    r_centers = None
+
+    for ci, meta in storm_cases:
+        try:
+            ds, local_idx = resolve_case(ci, data_type)
+            vol, ref_var = _extract_3d_volume(ds, local_idx, variable)
+
+            height_vals = ds["height"].values
+            z_idx = int(np.argmin(np.abs(height_vals - height_km)))
+            actual_height = float(height_vals[z_idx])
+
+            # Determine spatial grid
+            if variable in DERIVED_VARIABLES:
+                ref_varname = DERIVED_VARIABLES[variable][0]
+            else:
+                ref_varname = varname
+            var_dims = set(ds[ref_varname].dims)
+            if "eastward_distance" in var_dims:
+                x_coords = ds["eastward_distance"].values
+                y_coords = ds["northward_distance"].values
+            elif "latitude" in var_dims:
+                nx = ds.sizes["longitude"]
+                ny = ds.sizes["latitude"]
+                x_coords = np.linspace(-(nx - 1), (nx - 1), nx)
+                y_coords = np.linspace(-(ny - 1), (ny - 1), ny)
+            else:
+                continue
+
+            dim_list = [d for d in ds[ref_varname].dims if d != "num_cases"]
+            h_axis = dim_list.index("height")
+
+            # Extract 2D slab at height
+            if h_axis == 0:
+                slab = vol[z_idx, :, :]
+            elif h_axis == 2:
+                slab = vol[:, :, z_idx]
+            else:
+                slab = vol[:, z_idx, :]
+
+            # Compute azimuthal mean at this single height
+            xx, yy = np.meshgrid(x_coords, y_coords)
+            rr = np.sqrt(xx**2 + yy**2)
+            r_edges = np.arange(0, max_radius_km + dr_km, dr_km)
+            r_ctrs = (r_edges[:-1] + r_edges[1:]) / 2.0
+            bin_idx = np.digitize(rr, r_edges) - 1
+            valid = ~np.isnan(slab)
+
+            profile = []
+            for r in range(len(r_ctrs)):
+                mask = (bin_idx == r)
+                n_total = np.count_nonzero(mask)
+                if n_total == 0:
+                    profile.append(None)
+                    continue
+                in_bin = mask & valid
+                n_valid = np.count_nonzero(in_bin)
+                frac = n_valid / n_total
+                if frac >= coverage_min:
+                    profile.append(round(float(np.nanmean(slab[in_bin])), 4))
+                else:
+                    profile.append(None)
+
+            if r_centers is None:
+                r_centers = [round(float(r), 2) for r in r_ctrs]
+
+            profiles.append({
+                "case_index": ci,
+                "datetime": meta.get("datetime", ""),
+                "mission_id": meta.get("mission_id", ""),
+                "vmax_kt": meta.get("vmax_kt"),
+                "rmw_km": meta.get("rmw_km"),
+                "profile": profile,
+            })
+
+        except Exception as e:
+            print(f"Hovmöller: skip case {ci}: {e}")
+            continue
+
+    if not profiles:
+        raise HTTPException(status_code=500, detail="No valid profiles computed")
+
+    return JSONResponse(
+        content={
+            "storm_name": storm_name.upper(),
+            "year": year,
+            "height_km": round(height_km, 1),
+            "radius_km": r_centers,
+            "variable": {
+                "key": variable,
+                "display_name": display_name,
+                "units": units,
+                "vmin": vmin,
+                "vmax": vmax,
+                "colorscale": _cmap_to_plotly(cmap),
+            },
+            "profiles": profiles,
+            "n_cases": len(profiles),
+        },
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
 from realtime_tdr_api import router as realtime_router
 app.include_router(realtime_router, prefix="/realtime")
 
