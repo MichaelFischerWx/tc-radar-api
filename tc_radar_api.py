@@ -1012,8 +1012,14 @@ def get_data(
             pass  # silently skip overlay if variable unavailable
 
     # Optional wind barbs: return subsampled U/V component arrays
-    if wind_barbs and variable in WIND_BARB_COMPONENTS:
-        u_name, v_name = WIND_BARB_COMPONENTS[variable]
+    # If the variable is a wind speed type, use its matched U/V components;
+    # otherwise fall back to storm-relative recentered winds.
+    if wind_barbs:
+        if variable in WIND_BARB_COMPONENTS:
+            u_name, v_name = WIND_BARB_COMPONENTS[variable]
+        else:
+            # Default: use storm-relative recentered winds for any variable
+            u_name, v_name = ("recentered_eastward_wind", "recentered_northward_wind")
         try:
             if u_name in ds and v_name in ds:
                 u_full = ds[u_name].isel(num_cases=local_idx, height=z_idx).values
@@ -6936,12 +6942,21 @@ def hovmoller(
             if r_centers is None:
                 r_centers = [round(float(r), 2) for r in r_ctrs]
 
+            # Use metadata RMW if available; otherwise estimate from profile peak
+            rmw = meta.get("rmw_km")
+            if rmw is None or (isinstance(rmw, float) and np.isnan(rmw)):
+                # Estimate RMW as radius of maximum azimuthal-mean value
+                valid_vals = [(i, v) for i, v in enumerate(profile) if v is not None]
+                if valid_vals:
+                    peak_idx, peak_val = max(valid_vals, key=lambda x: x[1])
+                    rmw = round(float(r_ctrs[peak_idx]), 1)
+
             profiles.append({
                 "case_index": ci,
                 "datetime": meta.get("datetime", ""),
                 "mission_id": meta.get("mission_id", ""),
                 "vmax_kt": meta.get("vmax_kt"),
-                "rmw_km": meta.get("rmw_km"),
+                "rmw_km": rmw,
                 "profile": profile,
             })
 
