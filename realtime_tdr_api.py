@@ -2619,6 +2619,153 @@ def _parse_ships_text(text: str) -> dict:
     return result
 
 
+def _guess_basin_from_coords(lat: float, lon: float) -> list[str]:
+    """
+    Guess likely ATCF basin codes from storm center lat/lon.
+
+    Returns a priority-ordered list of basin codes to try.
+    """
+    # Normalize longitude to -180..180
+    if lon > 180:
+        lon = lon - 360
+
+    # Atlantic basin: roughly -100 to 0, lat > 0
+    # East Pacific: roughly -180 to -100, lat > 0
+    # Central Pacific: roughly -180 to -140, lat > 0
+    # West Pacific: roughly 100 to 180, lat > 0
+
+    if lat >= 0:
+        if -100 <= lon <= 0:
+            return ["AL", "EP"]
+        elif -140 <= lon < -100:
+            return ["EP", "CP", "AL"]
+        elif lon < -140 or lon > 100:
+            return ["EP", "CP", "WP"]
+        else:
+            return ["AL", "EP"]
+    else:
+        # Southern hemisphere — less common for SHIPS, but try
+        return ["AL", "EP", "WP"]
+
+
+def _fetch_ships_by_name(
+    storm_name: str,
+    analysis_dt: _dt,
+    lat: float = 0.0,
+    lon: float = 0.0,
+) -> Optional[tuple[dict, str]]:
+    """
+    Search SHIPS files by storm name and analysis date.
+
+    Scans NHC SHIPS directories for files near the analysis time, reads
+    each candidate's header to find the matching storm name.
+
+    Parameters
+    ----------
+    storm_name : str
+        Storm name (e.g. "MELISSA")
+    analysis_dt : datetime
+        Analysis datetime (UTC)
+    lat, lon : float
+        Storm center coordinates (used to prioritize basin search)
+
+    Returns
+    -------
+    (dict, str) or None
+        Tuple of (parsed SHIPS data, discovered ATCF ID) or None
+    """
+    year = analysis_dt.year
+    name_upper = storm_name.upper().strip()
+
+    base_urls = [
+        "https://ftp.nhc.noaa.gov/atcf/stext/",
+        f"https://ftp.nhc.noaa.gov/atcf/archive/MESSAGES/{year}/stext/",
+    ]
+
+    # Use lat/lon to guess likely basins — prioritize search
+    likely_basins = _guess_basin_from_coords(lat, lon) if (lat != 0 or lon != 0) else ["AL", "EP", "CP", "WP"]
+
+    for base_url in base_urls:
+        try:
+            links = _parse_directory(base_url)
+        except Exception:
+            continue
+
+        # Collect candidate files: within ±24h of analysis time, not future
+        candidate_files = []
+        for link in links:
+            if '_ships.txt' not in link:
+                continue
+            parts = link.split('_ships')[0]
+            if len(parts) < 8:
+                continue
+            try:
+                yy = int(parts[0:2])
+                mm = int(parts[2:4])
+                dd = int(parts[4:6])
+                hh = int(parts[6:8])
+                bb_nnnn = parts[8:]  # e.g., "AL1325"
+
+                file_dt = _dt(2000 + yy, mm, dd, hh, tzinfo=timezone.utc)
+
+                # Must not be in the future
+                if file_dt > analysis_dt:
+                    continue
+
+                # Within 24 hours before analysis
+                delta_h = (analysis_dt - file_dt).total_seconds() / 3600
+                if delta_h > 24:
+                    continue
+
+                # Extract basin from filename
+                file_basin = bb_nnnn[:2] if len(bb_nnnn) >= 2 else ""
+
+                candidate_files.append((file_dt, link, file_basin, bb_nnnn))
+            except (ValueError, IndexError):
+                continue
+
+        if not candidate_files:
+            continue
+
+        # Sort: prioritize likely basins, then by recency
+        def _sort_key(item):
+            file_dt, _, file_basin, _ = item
+            basin_priority = likely_basins.index(file_basin) if file_basin in likely_basins else 99
+            return (basin_priority, -file_dt.timestamp())
+
+        candidate_files.sort(key=_sort_key)
+
+        # Check each candidate (fetch header and look for storm name)
+        checked = 0
+        for file_dt, link, file_basin, bb_nnnn in candidate_files:
+            if checked >= 8:  # Don't fetch too many files
+                break
+            checked += 1
+
+            file_url = base_url.rstrip('/') + '/' + link
+            try:
+                text = _fetch_text(file_url, timeout=15)
+            except Exception:
+                continue
+
+            # Check if storm name appears in the header (first ~10 lines)
+            header_lines = text.split('\n')[:10]
+            name_found = False
+            for hline in header_lines:
+                if name_upper in hline.upper():
+                    name_found = True
+                    break
+
+            if name_found:
+                ships_data = _parse_ships_text(text)
+                # Reconstruct full ATCF ID: bb_nnnn is like "AL1325"
+                # We need it as "AL1325" for the endpoint response
+                discovered_atcf = bb_nnnn
+                return (ships_data, discovered_atcf)
+
+    return None
+
+
 def _fetch_ships_from_nhc(atcf_id: str, analysis_dt: _dt) -> Optional[dict]:
     """
     Fetch SHIPS text file from NHC FTP and parse it.
@@ -2696,16 +2843,58 @@ def _fetch_ships_from_nhc(atcf_id: str, analysis_dt: _dt) -> Optional[dict]:
     return None
 
 
+def _build_ships_result(ships_data: dict, atcf_id: str, analysis_datetime: _dt,
+                        storm_name: str, year: int, basin: str, storm_number: int) -> dict:
+    """Build the standard SHIPS response dict with VP computation and shear conversion."""
+    vp = None
+    vp_components = {}
+    if 'shear_adj_kt' in ships_data and 'rhmd' in ships_data and 'pot_int_kt' in ships_data:
+        shear_adj = ships_data['shear_adj_kt']
+        rhmd = ships_data['rhmd']
+        pot_int = ships_data['pot_int_kt']
+        if pot_int > 0:
+            vp = shear_adj * (100 - rhmd) / pot_int
+            vp_components = {
+                "shear_adj_kt": round(float(shear_adj), 2),
+                "rhmd": round(float(rhmd), 2),
+                "pot_int_kt": round(float(pot_int), 2),
+            }
+
+    # Shear direction conversion: SHIPS gives direction shear comes FROM
+    # Convert to shear HEADING (direction shear points TO) by adding 180°
+    if 'shear_dir' in ships_data:
+        ships_data['sddc'] = (ships_data['shear_dir'] + 180) % 360
+
+    return {
+        "status": "success",
+        "atcf_id": atcf_id,
+        "analysis_dt": analysis_datetime.isoformat(),
+        "storm_name": storm_name,
+        "year": year,
+        "basin": basin,
+        "storm_number": storm_number,
+        "ships_data": {k: round(float(v), 2) if isinstance(v, (int, float)) else v
+                       for k, v in ships_data.items()},
+        "ventilation_proxy": round(float(vp), 2) if vp is not None else None,
+        "vp_components": vp_components,
+    }
+
+
 @router.get("/ships")
 def get_rt_ships(
     storm_name: str = Query(..., description="Storm name (e.g. BERYL)"),
     year: int = Query(..., ge=2000, le=2030),
-    basin: str = Query("AL", description="Basin code: AL, EP, CP, WP"),
-    storm_number: int = Query(..., ge=1, le=50, description="Storm number in basin"),
+    basin: str = Query(None, description="Basin code: AL, EP, CP, WP (optional — auto-detected if omitted)"),
+    storm_number: int = Query(None, ge=1, le=50, description="Storm number in basin (optional — auto-detected if omitted)"),
     analysis_dt: str = Query(..., description="TDR analysis datetime ISO format YYYY-MM-DDTHH:MM"),
+    lat: float = Query(0.0, description="Storm center latitude (for basin auto-detection)"),
+    lon: float = Query(0.0, description="Storm center longitude (for basin auto-detection)"),
 ):
     """
     Fetch SHIPS text file from NHC FTP and return environmental parameters at t=0.
+
+    If basin and storm_number are provided, searches by exact ATCF ID.
+    If omitted, auto-detects by scanning SHIPS files and matching storm name.
 
     Returns computed ventilation proxy (VP) if possible.
     """
@@ -2714,12 +2903,45 @@ def get_rt_ships(
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="Invalid analysis_dt format. Use ISO 8601 (YYYY-MM-DDTHH:MM)")
 
-    # Construct ATCF ID
-    atcf_id = f"{basin}{storm_number:02d}{year % 100:02d}"
-
-    # Check cache
     now = time.time()
-    cache_key = (atcf_id, analysis_datetime.isoformat())
+
+    # ── Mode 1: Exact ATCF ID search (basin + storm_number provided) ──
+    if basin is not None and storm_number is not None:
+        atcf_id = f"{basin}{storm_number:02d}{year % 100:02d}"
+
+        cache_key = (atcf_id, analysis_datetime.isoformat())
+        if cache_key in _rt_ships_cache:
+            cached_result, ts = _rt_ships_cache[cache_key]
+            if now - ts < _RT_SHIPS_CACHE_TTL:
+                _rt_ships_cache.move_to_end(cache_key)
+                return JSONResponse(cached_result)
+
+        try:
+            ships_data = _fetch_ships_from_nhc(atcf_id, analysis_datetime)
+
+            if ships_data is None:
+                result = {
+                    "status": "not_found",
+                    "atcf_id": atcf_id,
+                    "analysis_dt": analysis_datetime.isoformat(),
+                    "message": f"SHIPS file not found for {atcf_id} at {analysis_datetime.isoformat()}",
+                }
+            else:
+                result = _build_ships_result(
+                    ships_data, atcf_id, analysis_datetime,
+                    storm_name, year, basin, storm_number
+                )
+
+            _rt_ships_cache[cache_key] = (result, now)
+            if len(_rt_ships_cache) > 50:
+                _rt_ships_cache.popitem(last=False)
+            return JSONResponse(result)
+
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error fetching SHIPS data: {str(e)}")
+
+    # ── Mode 2: Auto-detect by storm name ──
+    cache_key = (storm_name.upper(), analysis_datetime.isoformat())
     if cache_key in _rt_ships_cache:
         cached_result, ts = _rt_ships_cache[cache_key]
         if now - ts < _RT_SHIPS_CACHE_TTL:
@@ -2727,55 +2949,33 @@ def get_rt_ships(
             return JSONResponse(cached_result)
 
     try:
-        ships_data = _fetch_ships_from_nhc(atcf_id, analysis_datetime)
+        found = _fetch_ships_by_name(storm_name, analysis_datetime, lat, lon)
 
-        if ships_data is None:
+        if found is None:
             result = {
                 "status": "not_found",
-                "atcf_id": atcf_id,
+                "atcf_id": None,
                 "analysis_dt": analysis_datetime.isoformat(),
-                "message": f"SHIPS file not found for {atcf_id} at {analysis_datetime.isoformat()}",
+                "message": f"SHIPS file not found for {storm_name} near {analysis_datetime.isoformat()}",
             }
         else:
-            # Compute ventilation proxy if data available
-            vp = None
-            vp_components = {}
-            if 'shear_adj_kt' in ships_data and 'rhmd' in ships_data and 'pot_int_kt' in ships_data:
-                shear_adj = ships_data['shear_adj_kt']
-                rhmd = ships_data['rhmd']
-                pot_int = ships_data['pot_int_kt']
-                if pot_int > 0:
-                    vp = shear_adj * (100 - rhmd) / pot_int
-                    vp_components = {
-                        "shear_adj_kt": round(float(shear_adj), 2),
-                        "rhmd": round(float(rhmd), 2),
-                        "pot_int_kt": round(float(pot_int), 2),
-                    }
+            ships_data, discovered_atcf = found
+            # Parse discovered ATCF ID (e.g., "AL1325") into basin + storm_number
+            d_basin = discovered_atcf[:2] if len(discovered_atcf) >= 2 else "??"
+            try:
+                d_stnum = int(discovered_atcf[2:4]) if len(discovered_atcf) >= 4 else 0
+            except ValueError:
+                d_stnum = 0
 
-            # Shear direction conversion: SHIPS gives direction shear comes FROM
-            # Convert to shear HEADING (direction shear points TO) by adding 180°
-            if 'shear_dir' in ships_data:
-                ships_data['sddc'] = (ships_data['shear_dir'] + 180) % 360
+            result = _build_ships_result(
+                ships_data, discovered_atcf, analysis_datetime,
+                storm_name, year, d_basin, d_stnum
+            )
+            result["auto_detected"] = True
 
-            result = {
-                "status": "success",
-                "atcf_id": atcf_id,
-                "analysis_dt": analysis_datetime.isoformat(),
-                "storm_name": storm_name,
-                "year": year,
-                "basin": basin,
-                "storm_number": storm_number,
-                "ships_data": {k: round(float(v), 2) if isinstance(v, (int, float)) else v
-                               for k, v in ships_data.items()},
-                "ventilation_proxy": round(float(vp), 2) if vp is not None else None,
-                "vp_components": vp_components,
-            }
-
-        # Cache result
         _rt_ships_cache[cache_key] = (result, now)
         if len(_rt_ships_cache) > 50:
             _rt_ships_cache.popitem(last=False)
-
         return JSONResponse(result)
 
     except Exception as e:
