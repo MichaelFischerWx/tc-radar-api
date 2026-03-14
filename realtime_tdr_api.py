@@ -2331,6 +2331,637 @@ def get_flight_level(
 
 
 # ---------------------------------------------------------------------------
+# SHIPS Text File Parser and Climatology Functions
+# ---------------------------------------------------------------------------
+
+# Cache for SHIPS data: (atcf_id, analysis_dt) → (result_dict, timestamp)
+_rt_ships_cache = OrderedDict()
+_RT_SHIPS_CACHE_TTL = 600  # 10 minutes
+
+# Variable mapping: RT variable names → climatology variable names
+_RT_TO_CLIMO_MAP = {
+    "TANGENTIAL_WIND": "merged_tangential_wind",
+    "RADIAL_WIND": "merged_radial_wind",
+    "W": "merged_upward_air_velocity",
+    "REFLECTIVITY": "merged_reflectivity",
+    "WIND_SPEED": "merged_wind_speed",
+    "VORT": "merged_relative_vorticity",
+}
+
+# Hybrid R_H coordinate parameters (match tc_radar_api.py)
+HYBRID_DR_INNER = 0.05          # R/RMW spacing inward of RMW
+HYBRID_DR_OUTER_KM = 2.0        # km spacing outward of RMW
+HYBRID_MAX_OUTER_KM = 100.0     # max distance beyond RMW
+
+# Shear-relative quadrant definitions (from tc_radar_api.py)
+QUADRANT_DEFS = {
+    "DSR": (0,   90),      # downshear-right
+    "USR": (90,  180),     # upshear-right
+    "USL": (180, 270),     # upshear-left
+    "DSL": (270, 360),     # downshear-left
+}
+
+# Import climatology from tc_radar_api
+try:
+    from tc_radar_api import _climatology, _get_climatology_for_intensity, _CLIMO_VAR_MAP
+except ImportError:
+    _climatology = {}
+    def _get_climatology_for_intensity(varname, vmax_kt):
+        return (None, None, 0, None)
+    _CLIMO_VAR_MAP = {}
+
+
+def _build_hybrid_r_axis():
+    """
+    Build the hybrid R_H radial axis (bin edges and centres).
+
+    Inward of RMW:  normalised by RMW (0 to 1, spacing = HYBRID_DR_INNER)
+    Outward of RMW: physical distance beyond RMW (0 to HYBRID_MAX_OUTER_KM km,
+                    spacing = HYBRID_DR_OUTER_KM)
+
+    Returns
+    -------
+    inner_edges : 1D array  — bin edges from 0 to 1 (R/RMW, inward regime)
+    outer_edges : 1D array  — bin edges from 0 to HYBRID_MAX_OUTER_KM (km, outward regime)
+    r_labels    : list[str] — human-readable labels for each bin centre
+    n_inner     : int       — number of inward bins
+    n_outer     : int       — number of outward bins
+    """
+    inner_edges = np.arange(0, 1.0 + HYBRID_DR_INNER / 2, HYBRID_DR_INNER)
+    outer_edges = np.arange(0, HYBRID_MAX_OUTER_KM + HYBRID_DR_OUTER_KM / 2,
+                            HYBRID_DR_OUTER_KM)
+    n_inner = len(inner_edges) - 1
+    n_outer = len(outer_edges) - 1
+
+    # Build labels: inner bins as fractional R/RMW, outer as "RMW + X km"
+    r_labels = []
+    for i in range(n_inner):
+        c = (inner_edges[i] + inner_edges[i + 1]) / 2.0
+        r_labels.append(round(float(c), 2))
+    for i in range(n_outer):
+        c = (outer_edges[i] + outer_edges[i + 1]) / 2.0
+        r_labels.append(round(float(c), 2))
+
+    return inner_edges, outer_edges, r_labels, n_inner, n_outer
+
+
+def _compute_azimuthal_mean_hybrid(vol, x_coords, y_coords, height_vals,
+                                    h_axis, rmw, coverage_min=0.5):
+    """
+    Compute azimuthal mean on the hybrid R_H coordinate of Fischer et al. (2025).
+
+    Parameters
+    ----------
+    vol         : 3D array — (height, y, x) or other axis order per h_axis
+    x_coords    : 1D array — x (eastward_distance) in km
+    y_coords    : 1D array — y (northward_distance) in km
+    height_vals : 1D array — heights in km
+    h_axis      : int      — position of the height axis in vol
+    rmw         : float    — radius of maximum wind in km (must be > 0)
+    coverage_min: float    — minimum fraction of valid data per bin
+
+    Returns
+    -------
+    az_mean  : 2D array (n_heights × n_total_bins)
+    coverage : 2D array (n_heights × n_total_bins)
+    r_h_axis : 1D list of bin-centre values (for plotting)
+    n_inner  : int — number of inner (RMW-normalised) bins
+    """
+    if rmw is None or rmw <= 0:
+        raise ValueError("rmw must be positive for hybrid coordinate")
+
+    inner_edges, outer_edges, r_labels, n_inner, n_outer = _build_hybrid_r_axis()
+    n_total = n_inner + n_outer
+    n_heights = len(height_vals)
+
+    # Build 2D radius grid
+    xx, yy = np.meshgrid(x_coords, y_coords)
+    rr = np.sqrt(xx**2 + yy**2)  # physical radius in km
+
+    # Classify each grid point as inner or outer
+    is_inner = rr < rmw
+    is_outer = ~is_inner
+
+    # Map to bin index:
+    # Inner: normalise by RMW, digitise into inner_edges
+    rr_norm = np.where(is_inner, rr / rmw, np.nan)
+    inner_bin_idx = np.digitize(np.nan_to_num(rr_norm, nan=-1), inner_edges) - 1
+
+    # Outer: distance beyond RMW in km, digitise into outer_edges
+    rr_beyond = np.where(is_outer, rr - rmw, np.nan)
+    outer_bin_idx = np.digitize(np.nan_to_num(rr_beyond, nan=-1), outer_edges) - 1
+
+    az_mean  = np.full((n_heights, n_total), np.nan)
+    coverage = np.full((n_heights, n_total), 0.0)
+
+    for h in range(n_heights):
+        if h_axis == 0:
+            slab = vol[h, :, :]
+        elif h_axis == 2:
+            slab = vol[:, :, h]
+        else:
+            slab = vol[:, h, :]
+
+        valid = ~np.isnan(slab)
+
+        # Inner bins
+        for r in range(n_inner):
+            mask = is_inner & (inner_bin_idx == r)
+            n_total_pts = np.count_nonzero(mask)
+            if n_total_pts == 0:
+                continue
+            in_bin = mask & valid
+            n_valid = np.count_nonzero(in_bin)
+            frac = n_valid / n_total_pts
+            coverage[h, r] = frac
+            if frac >= coverage_min:
+                az_mean[h, r] = float(np.nanmean(slab[in_bin]))
+
+        # Outer bins
+        for r in range(n_outer):
+            mask = is_outer & (outer_bin_idx == r)
+            n_total_pts = np.count_nonzero(mask)
+            if n_total_pts == 0:
+                continue
+            in_bin = mask & valid
+            n_valid = np.count_nonzero(in_bin)
+            frac = n_valid / n_total_pts
+            coverage[h, n_inner + r] = frac
+            if frac >= coverage_min:
+                az_mean[h, n_inner + r] = float(np.nanmean(slab[in_bin]))
+
+    return az_mean, coverage, r_labels, n_inner
+
+
+def _compute_quadrant_means_rt(vol, x_coords, y_coords, height_vals, h_axis,
+                               sddc, max_radius, dr, coverage_min, rmw=None):
+    """
+    Compute shear-relative quadrant means from a 3D Cartesian volume.
+
+    If rmw is provided, radii are normalised by RMW (output bins in R/RMW).
+
+    Parameters
+    ----------
+    vol : 3D array — full volume with axes depending on h_axis
+    sddc : float — deep-layer shear heading (met deg, 0=N, 90=E, CW)
+    rmw : float or None — if provided, normalise radius by RMW
+
+    Returns
+    -------
+    quad_means : dict[str, 2D array] — {DSL, DSR, USL, USR} each (n_heights × n_rbins)
+    r_centers  : 1D array of radial bin centres (km or R/RMW)
+    """
+    # Build 2D radius and azimuth grids
+    xx, yy = np.meshgrid(x_coords, y_coords)
+    rr = np.sqrt(xx**2 + yy**2)
+
+    # If RMW-normalising, convert radius grid to R/RMW
+    if rmw is not None and rmw > 0:
+        rr = rr / rmw
+
+    # Math angle → meteorological heading
+    azimuth_math_deg = np.degrees(np.arctan2(yy, xx))        # -180..180, CCW from +x
+    azimuth_met = (90.0 - azimuth_math_deg) % 360.0          # met heading, CW from N
+
+    # Shear-relative azimuth: 0° = downshear, 90° = right-of-shear (CW)
+    shear_rel_az = (azimuth_met - sddc) % 360.0
+
+    # Radial bins
+    r_edges = np.arange(0, max_radius + dr, dr)
+    r_centers = (r_edges[:-1] + r_edges[1:]) / 2.0
+    n_rbins = len(r_centers)
+    n_heights = len(height_vals)
+
+    bin_idx = np.digitize(rr, r_edges) - 1   # (ny, nx)
+
+    # Pre-compute quadrant masks (ny, nx) for each quadrant
+    q_masks = {}
+    for qname, (az_start, az_end) in QUADRANT_DEFS.items():
+        q_masks[qname] = (shear_rel_az >= az_start) & (shear_rel_az < az_end)
+
+    quad_means = {q: np.full((n_heights, n_rbins), np.nan) for q in QUADRANT_DEFS}
+
+    for h in range(n_heights):
+        # Extract 2D slab at this height
+        if h_axis == 0:
+            slab = vol[h, :, :]
+        elif h_axis == 2:
+            slab = vol[:, :, h]
+        else:
+            slab = vol[:, h, :]
+
+        valid = ~np.isnan(slab)
+
+        for r in range(n_rbins):
+            r_mask = (bin_idx == r)
+            for qname, q_mask in q_masks.items():
+                mask = r_mask & q_mask
+                n_total = np.count_nonzero(mask)
+                if n_total == 0:
+                    continue
+                in_bin = mask & valid
+                n_valid = np.count_nonzero(in_bin)
+                frac = n_valid / n_total
+                if frac >= coverage_min:
+                    quad_means[qname][h, r] = float(np.nanmean(slab[in_bin]))
+
+    return quad_means, r_centers
+
+
+def _parse_ships_text(text: str) -> dict:
+    """
+    Parse SHIPS text file format to extract environmental parameters at t=0.
+
+    Returns dict with keys: vmax_kt, shear_kt, shear_adj_kt, shear_dir,
+                            sst_c, pot_int_kt, rhmd, stm_speed_kt,
+                            200mb_div, heat_content, lat, lon
+    """
+    result = {}
+    lines = text.strip().split('\n')
+
+    # Dictionary to map row headers to field names
+    row_map = {
+        'V (KT) NO LAND': 'vmax_kt',
+        'SHEAR (KT)': 'shear_kt',
+        'SHEAR ADJ (KT)': 'shear_adj_kt',
+        'SHEAR DIR': 'shear_dir',
+        'SST (C)': 'sst_c',
+        'POT. INT. (KT)': 'pot_int_kt',
+        '700-500 MB RH': 'rhmd',
+        'STM SPEED (KT)': 'stm_speed_kt',
+        '200 MB DIV': '200mb_div',
+        'HEAT CONTENT': 'heat_content',
+        'LAT (DEG N)': 'lat',
+        'LONG(DEG W)': 'lon',
+    }
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        # Try to match row headers
+        matched = False
+        for header, field_name in row_map.items():
+            if line.startswith(header):
+                matched = True
+                # Extract the data part (after the header)
+                data_str = line[len(header):].strip()
+                # Split by whitespace and take first value (t=0 column)
+                parts = data_str.split()
+                if parts:
+                    try:
+                        result[field_name] = float(parts[0])
+                    except (ValueError, IndexError):
+                        pass
+                break
+
+    return result
+
+
+def _fetch_ships_from_nhc(atcf_id: str, analysis_dt: _dt) -> Optional[dict]:
+    """
+    Fetch SHIPS text file from NHC FTP and parse it.
+
+    Parameters
+    ----------
+    atcf_id : str
+        ATCF ID like "AL132025" (basin + storm number + year)
+    analysis_dt : datetime
+        Analysis time (UTC)
+
+    Returns
+    -------
+    dict or None
+        Parsed SHIPS data or None if not found
+    """
+    year = analysis_dt.year
+
+    # Try real-time directory first
+    base_urls = [
+        "https://ftp.nhc.noaa.gov/atcf/stext/",
+        f"https://ftp.nhc.noaa.gov/atcf/archive/MESSAGES/{year}/stext/",
+    ]
+
+    # Scan directory listings for matching SHIPS files
+    for base_url in base_urls:
+        try:
+            links = _parse_directory(base_url)
+
+            # Find SHIPS files matching atcf_id pattern
+            candidate_files = []
+            for link in links:
+                if '_ships.txt' not in link:
+                    continue
+                # Extract date from filename: YYMMDDHHBBNNNN_ships.txt
+                parts = link.split('_ships')[0]  # e.g., "2502041200AL1325"
+                if len(parts) < 8:
+                    continue
+                try:
+                    yy = int(parts[0:2])
+                    mm = int(parts[2:4])
+                    dd = int(parts[4:6])
+                    hh = int(parts[6:8])
+                    bb_nnnn = parts[8:]  # e.g., "AL1325"
+
+                    # Check if this file matches our ATCF ID (basin + storm# + 2-digit year)
+                    if bb_nnnn != atcf_id:
+                        continue
+
+                    file_dt = _dt(2000 + yy, mm, dd, hh, tzinfo=timezone.utc)
+
+                    # Only include files not in future relative to analysis time
+                    if file_dt <= analysis_dt:
+                        candidate_files.append((file_dt, link))
+                except (ValueError, IndexError):
+                    continue
+
+            if candidate_files:
+                # Pick the closest (most recent) file before analysis time
+                candidate_files.sort(key=lambda x: x[0], reverse=True)
+                best_dt, best_link = candidate_files[0]
+
+                # Fetch and parse
+                file_url = base_url.rstrip('/') + '/' + best_link
+                try:
+                    text = _fetch_text(file_url, timeout=30)
+                    ships_data = _parse_ships_text(text)
+                    return ships_data
+                except Exception:
+                    continue
+
+        except Exception:
+            continue
+
+    return None
+
+
+@router.get("/ships")
+def get_rt_ships(
+    storm_name: str = Query(..., description="Storm name (e.g. BERYL)"),
+    year: int = Query(..., ge=2000, le=2030),
+    basin: str = Query("AL", description="Basin code: AL, EP, CP, WP"),
+    storm_number: int = Query(..., ge=1, le=50, description="Storm number in basin"),
+    analysis_dt: str = Query(..., description="TDR analysis datetime ISO format YYYY-MM-DDTHH:MM"),
+):
+    """
+    Fetch SHIPS text file from NHC FTP and return environmental parameters at t=0.
+
+    Returns computed ventilation proxy (VP) if possible.
+    """
+    try:
+        analysis_datetime = _dt.fromisoformat(analysis_dt.replace('Z', '+00:00'))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid analysis_dt format. Use ISO 8601 (YYYY-MM-DDTHH:MM)")
+
+    # Construct ATCF ID
+    atcf_id = f"{basin}{storm_number:02d}{year % 100:02d}"
+
+    # Check cache
+    now = time.time()
+    cache_key = (atcf_id, analysis_datetime.isoformat())
+    if cache_key in _rt_ships_cache:
+        cached_result, ts = _rt_ships_cache[cache_key]
+        if now - ts < _RT_SHIPS_CACHE_TTL:
+            _rt_ships_cache.move_to_end(cache_key)
+            return JSONResponse(cached_result)
+
+    try:
+        ships_data = _fetch_ships_from_nhc(atcf_id, analysis_datetime)
+
+        if ships_data is None:
+            result = {
+                "status": "not_found",
+                "atcf_id": atcf_id,
+                "analysis_dt": analysis_datetime.isoformat(),
+                "message": f"SHIPS file not found for {atcf_id} at {analysis_datetime.isoformat()}",
+            }
+        else:
+            # Compute ventilation proxy if data available
+            vp = None
+            vp_components = {}
+            if 'shear_adj_kt' in ships_data and 'rhmd' in ships_data and 'pot_int_kt' in ships_data:
+                shear_adj = ships_data['shear_adj_kt']
+                rhmd = ships_data['rhmd']
+                pot_int = ships_data['pot_int_kt']
+                if pot_int > 0:
+                    vp = shear_adj * (100 - rhmd) / pot_int
+                    vp_components = {
+                        "shear_adj_kt": round(float(shear_adj), 2),
+                        "rhmd": round(float(rhmd), 2),
+                        "pot_int_kt": round(float(pot_int), 2),
+                    }
+
+            # Shear direction conversion: SHIPS gives direction shear comes FROM
+            # Convert to shear HEADING (direction shear points TO) by adding 180°
+            if 'shear_dir' in ships_data:
+                ships_data['sddc'] = (ships_data['shear_dir'] + 180) % 360
+
+            result = {
+                "status": "success",
+                "atcf_id": atcf_id,
+                "analysis_dt": analysis_datetime.isoformat(),
+                "storm_name": storm_name,
+                "year": year,
+                "basin": basin,
+                "storm_number": storm_number,
+                "ships_data": {k: round(float(v), 2) if isinstance(v, (int, float)) else v
+                               for k, v in ships_data.items()},
+                "ventilation_proxy": round(float(vp), 2) if vp is not None else None,
+                "vp_components": vp_components,
+            }
+
+        # Cache result
+        _rt_ships_cache[cache_key] = (result, now)
+        if len(_rt_ships_cache) > 50:
+            _rt_ships_cache.popitem(last=False)
+
+        return JSONResponse(result)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching SHIPS data: {str(e)}")
+
+
+@router.get("/quadrant_mean")
+def get_rt_quadrant_mean(
+    file_url: str = Query(...),
+    variable: str = Query("TANGENTIAL_WIND"),
+    sddc: float = Query(..., description="Shear HEADING in met degrees (0=N, 90=E, CW)"),
+    max_radius_km: float = Query(200.0, ge=10, le=500),
+    dr_km: float = Query(2.0, ge=0.5, le=20),
+    coverage_min: float = Query(0.5, ge=0.0, le=1.0),
+    overlay: str = Query(""),
+):
+    """
+    Compute shear-relative quadrant means for a real-time TDR file.
+
+    Returns quadrant means (DSR, USR, USL, DSL) as 2D arrays.
+    """
+    if variable not in RT_VARIABLES and variable not in RT_DERIVED:
+        raise HTTPException(status_code=400, detail=f"Unknown variable '{variable}'")
+
+    try:
+        ds = _open_rt_dataset(file_url)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not open file: {str(e)}")
+
+    try:
+        # Extract 3D volume
+        vol, heights = _extract_3d(ds, variable)
+        x_km, y_km = _get_xy_coords(ds)
+
+        # Compute quadrant means
+        quad_means, r_centers = _compute_quadrant_means_rt(
+            vol, x_km, y_km, heights, h_axis=0,
+            sddc=sddc,
+            max_radius=max_radius_km,
+            dr=dr_km,
+            coverage_min=coverage_min
+        )
+
+        case_meta = _build_case_meta(ds)
+
+        result = {
+            "quadrant_means": {q: {"data": _clean_2d(quad_means[q])} for q in QUADRANT_DEFS},
+            "radius_km": [round(float(r), 2) for r in r_centers],
+            "height_km": [round(float(h), 2) for h in heights],
+            "sddc": round(float(sddc), 1),
+            "coverage_min": coverage_min,
+            "variable": variable,
+            **case_meta,
+        }
+
+        # Optional overlay
+        if overlay and overlay in RT_VARIABLES or overlay in RT_DERIVED:
+            try:
+                ov_vol, _ = _extract_3d(ds, overlay)
+                ov_quads, _ = _compute_quadrant_means_rt(
+                    ov_vol, x_km, y_km, heights, h_axis=0,
+                    sddc=sddc,
+                    max_radius=max_radius_km,
+                    dr=dr_km,
+                    coverage_min=coverage_min
+                )
+                ov_info = _get_variable_info(overlay)
+                result["overlay"] = {
+                    "quadrant_means": {q: {"data": _clean_2d(ov_quads[q])} for q in QUADRANT_DEFS},
+                    "key": overlay,
+                    "display_name": ov_info["display_name"],
+                    "units": ov_info["units"],
+                    "vmin": ov_info["vmin"],
+                    "vmax": ov_info["vmax"],
+                }
+            except Exception:
+                pass
+
+        return JSONResponse(result)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error computing quadrant means: {str(e)}")
+
+
+@router.get("/anomaly_azimuthal_mean")
+def get_rt_anomaly_azimuthal_mean(
+    file_url: str = Query(...),
+    variable: str = Query("TANGENTIAL_WIND"),
+    vmax_kt: float = Query(..., ge=0, le=200, description="Current Vmax in kt (from SHIPS)"),
+    rmw_km: Optional[float] = Query(None, ge=1, le=200, description="RMW in km (auto-estimated if omitted)"),
+):
+    """
+    Compute Z* anomaly azimuthal mean on hybrid R_H coordinate.
+
+    If rmw_km is not provided, auto-estimate from tangential wind azimuthal mean.
+    """
+    if variable not in RT_VARIABLES and variable not in RT_DERIVED:
+        raise HTTPException(status_code=400, detail=f"Unknown variable '{variable}'")
+
+    try:
+        ds = _open_rt_dataset(file_url)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not open file: {str(e)}")
+
+    try:
+        # Extract 3D volume
+        vol, heights = _extract_3d(ds, variable)
+        x_km, y_km = _get_xy_coords(ds)
+
+        # Auto-estimate RMW if not provided
+        if rmw_km is None or rmw_km <= 0:
+            # Use tangential wind to estimate RMW at z=2km
+            try:
+                tv_vol, _ = _extract_3d(ds, "TANGENTIAL_WIND")
+                # Find 2 km level
+                z_idx = np.argmin(np.abs(heights - 2.0))
+                tv_2km = tv_vol[z_idx, :, :]
+
+                # Compute radius profile
+                xx, yy = np.meshgrid(x_km, y_km)
+                rr = np.sqrt(xx**2 + yy**2)
+
+                # Bin by radius and find peak
+                r_max = np.nanmax(rr)
+                r_edges = np.arange(0, r_max + 5, 5)
+                r_centers = (r_edges[:-1] + r_edges[1:]) / 2.0
+                r_means = []
+
+                for i in range(len(r_centers)):
+                    mask = (rr >= r_edges[i]) & (rr < r_edges[i+1])
+                    vals = tv_2km[mask]
+                    r_means.append(np.nanmean(vals) if np.any(~np.isnan(vals)) else np.nan)
+
+                # Find peak (use nanargmax on the full array to preserve index alignment)
+                r_means_arr = np.array(r_means)
+                if np.any(~np.isnan(r_means_arr)):
+                    peak_idx = int(np.nanargmax(r_means_arr))
+                    rmw_km = float(r_centers[peak_idx])
+                else:
+                    rmw_km = 20.0  # default fallback
+            except Exception:
+                rmw_km = 20.0  # default fallback
+
+        # Compute azimuthal mean on hybrid R_H
+        az_mean, coverage, r_h_labels, n_inner = _compute_azimuthal_mean_hybrid(
+            vol, x_km, y_km, heights, h_axis=0, rmw=rmw_km, coverage_min=0.5
+        )
+
+        # Look up intensity-matched climatology
+        climo_varname = _RT_TO_CLIMO_MAP.get(variable, variable)
+        climo_mean, climo_std, climo_count, bin_centre = _get_climatology_for_intensity(
+            climo_varname, vmax_kt
+        )
+
+        # Compute Z* anomaly
+        z_anomaly = np.full_like(az_mean, np.nan)
+        if climo_mean is not None and climo_std is not None:
+            # climo_mean and climo_std are on same R_H grid
+            valid_climo = ~np.isnan(climo_mean)
+            z_anomaly[valid_climo] = (az_mean[valid_climo] - climo_mean[valid_climo]) / (climo_std[valid_climo] + 1e-6)
+
+        case_meta = _build_case_meta(ds)
+
+        result = {
+            "anomaly": _clean_2d(z_anomaly),
+            "azimuthal_mean": _clean_2d(az_mean),
+            "coverage": _clean_2d(coverage),
+            "r_h_axis": r_h_labels,
+            "n_inner": n_inner,
+            "height_km": [round(float(h), 2) for h in heights],
+            "rmw_km": round(float(rmw_km), 2),
+            "vmax_kt": float(vmax_kt),
+            "variable": variable,
+            "climatology_available": climo_mean is not None,
+            "climatology_intensity_bin": float(bin_centre) if bin_centre is not None else None,
+            "climatology_count": int(climo_count) if climo_count is not None else 0,
+            **case_meta,
+        }
+
+        return JSONResponse(result)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error computing anomaly azimuthal mean: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
 # Memory monitoring & cache management
 # ---------------------------------------------------------------------------
 
@@ -2360,6 +2991,7 @@ def _cache_summary() -> dict:
         "rt_ir_cache": {"count": len(_rt_ir_cache), "max": _RT_IR_CACHE_MAX},
         "rt_sonde_cache": {"count": len(_rt_sonde_cache), "max": _RT_SONDE_CACHE_MAX},
         "rt_fl_cache": {"count": len(_rt_fl_cache), "max": _RT_FL_CACHE_MAX},
+        "rt_ships_cache": {"count": len(_rt_ships_cache)},
     }
 
 
@@ -2381,5 +3013,6 @@ def clear_all_rt_caches():
     _rt_ir_cache.clear()
     _rt_sonde_cache.clear()
     _rt_fl_cache.clear()
+    _rt_ships_cache.clear()
     gc.collect()
     return JSONResponse({"status": "ok", **_cache_summary()})
