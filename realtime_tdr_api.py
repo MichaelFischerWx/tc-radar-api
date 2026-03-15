@@ -2815,14 +2815,27 @@ def _build_ships_result(ships_data: dict, atcf_id: str, analysis_datetime: _dt,
     """Build the standard SHIPS response dict with VP computation and shear conversion."""
     vp = None
     vp_components = {}
-    if 'shear_adj_kt' in ships_data and 'rhmd' in ships_data and 'pot_int_kt' in ships_data:
-        shear_adj = ships_data['shear_adj_kt']
+    # Archive VP uses: SHGC × (100 - RHLO) / VMPI  where SHGC is the
+    # "generalized shear" (all levels 1000-100 hPa, vortex removed, 0-500 km).
+    # The SHIPS text file provides SHEAR (KT) ≈ SHDC (standard 850-200 hPa,
+    # vortex removed, 0-500 km).  Empirical analysis of 388 archive cases
+    # shows SHGC/SHDC median ratio = 1.75 (IQR 1.45-2.21).
+    # We scale the raw shear by this factor to approximate SHGC.
+    # RHMD (700-500 hPa) is used in place of RHLO (850-700 hPa) since the
+    # text file doesn't provide RHLO; archive median RHLO ≈ 68% which is
+    # comparable to typical RHMD in TC environments.
+    SHGC_SHDC_RATIO = 1.75  # empirical median from 388 TC-RADAR archive cases
+    if 'shear_kt' in ships_data and 'rhmd' in ships_data and 'pot_int_kt' in ships_data:
+        shear_raw = ships_data['shear_kt']      # ≈ SHDC
+        shgc_est = shear_raw * SHGC_SHDC_RATIO  # estimated SHGC
         rhmd = ships_data['rhmd']
         pot_int = ships_data['pot_int_kt']
         if pot_int > 0:
-            vp = shear_adj * (100 - rhmd) / pot_int
+            vp = shgc_est * (100 - rhmd) / pot_int
             vp_components = {
-                "shear_adj_kt": round(float(shear_adj), 2),
+                "shear_kt": round(float(shear_raw), 2),
+                "shgc_est_kt": round(float(shgc_est), 2),
+                "shgc_shdc_ratio": SHGC_SHDC_RATIO,
                 "rhmd": round(float(rhmd), 2),
                 "pot_int_kt": round(float(pot_int), 2),
             }
