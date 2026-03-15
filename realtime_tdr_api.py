@@ -3183,3 +3183,177 @@ def clear_all_rt_caches():
     _rt_ships_cache.clear()
     gc.collect()
     return JSONResponse({"status": "ok", **_cache_summary()})
+
+
+@router.get("/vortex_raw")
+def get_rt_vortex_raw(
+    file_url: str = Query(...),
+    vmax_kt: float = Query(..., ge=0, le=200, description="Current Vmax in kt"),
+    rmw_km: Optional[float] = Query(None, ge=1, le=200, description="RMW in km (auto-estimated if omitted)"),
+):
+    """
+    Compute raw (un-centred) vortex metrics for a real-time TDR file.
+
+    Returns raw_h1_max and raw_width_diff which must be centred using
+    database means from /scatter/vp_favorability to get vortex_height,
+    vortex_width, and vortex_favorability.
+    """
+    try:
+        ds = _open_rt_dataset(file_url)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not open file: {str(e)}")
+
+    try:
+        # Extract Vt and vorticity volumes
+        vt_vol, heights = _extract_3d(ds, "TANGENTIAL_WIND")
+        vort_vol, _ = _extract_3d(ds, "VORT")
+        x_km, y_km = _get_xy_coords(ds)
+
+        # Auto-estimate RMW if not provided
+        if rmw_km is None or rmw_km <= 0:
+            try:
+                z_idx = int(np.argmin(np.abs(heights - 2.0)))
+                tv_2km = vt_vol[z_idx, :, :]
+                xx, yy = np.meshgrid(x_km, y_km)
+                rr = np.sqrt(xx**2 + yy**2)
+                r_edges = np.arange(0, float(np.nanmax(rr)) + 5, 5)
+                r_centers = (r_edges[:-1] + r_edges[1:]) / 2.0
+                r_means = []
+                for i in range(len(r_centers)):
+                    mask = (rr >= r_edges[i]) & (rr < r_edges[i+1])
+                    vals = tv_2km[mask]
+                    r_means.append(float(np.nanmean(vals)) if np.any(~np.isnan(vals)) else np.nan)
+                r_means_arr = np.array(r_means)
+                if np.any(~np.isnan(r_means_arr)):
+                    rmw_km = float(r_centers[int(np.nanargmax(r_means_arr))])
+                else:
+                    rmw_km = 20.0
+            except Exception:
+                rmw_km = 20.0
+
+        # Compute azimuthal mean Vt on hybrid R_H
+        vt_az, _, r_h_labels, n_inner = _compute_azimuthal_mean_hybrid(
+            vt_vol, x_km, y_km, heights, h_axis=0, rmw=rmw_km, coverage_min=0.3
+        )
+
+        # Compute azimuthal mean vorticity on hybrid R_H
+        zeta_az, _, _, _ = _compute_azimuthal_mean_hybrid(
+            vort_vol, x_km, y_km, heights, h_axis=0, rmw=rmw_km, coverage_min=0.3
+        )
+
+        # Get climatology
+        vt_climo_mean, vt_climo_std, _, _ = _get_climatology_for_intensity(
+            "merged_tangential_wind", vmax_kt
+        )
+        zeta_climo_mean, zeta_climo_std, _, _ = _get_climatology_for_intensity(
+            "merged_relative_vorticity", vmax_kt
+        )
+
+        if vt_climo_mean is None or zeta_climo_mean is None:
+            return JSONResponse({
+                "status": "no_climatology",
+                "message": "Climatology not available for this intensity",
+                "vmax_kt": vmax_kt,
+                "rmw_km": round(float(rmw_km), 2),
+            })
+
+        # Compute Z* anomalies
+        vt_anom = np.where(
+            np.isnan(vt_az) | np.isnan(vt_climo_mean) | (vt_climo_std < 1e-6),
+            np.nan, (vt_az - vt_climo_mean) / (vt_climo_std + 1e-6)
+        )
+        zeta_anom = np.where(
+            np.isnan(zeta_az) | np.isnan(zeta_climo_mean) | (zeta_climo_std < 1e-6),
+            np.nan, (zeta_az - zeta_climo_mean) / (zeta_climo_std + 1e-6)
+        )
+
+        r_arr = np.array([float(r) if isinstance(r, (int, float)) else float(r) for r in r_h_labels])
+
+        # H1 domain: 0.8×RMW to RMW+20km, Z=10–14 km
+        h1_z = (heights >= 10.0) & (heights <= 14.0)
+        h1_r = np.zeros(len(r_arr), dtype=bool)
+        for i, rv in enumerate(r_arr):
+            if i < n_inner:
+                if rv >= 0.8 and rv <= 1.0:
+                    h1_r[i] = True
+            else:
+                if rv >= 0.0 and rv <= 20.0:
+                    h1_r[i] = True
+
+        # W1 domain: 0.9×RMW to RMW+10km, Z=2–5 km
+        w1_z = (heights >= 2.0) & (heights <= 5.0)
+        w1_r = np.zeros(len(r_arr), dtype=bool)
+        for i, rv in enumerate(r_arr):
+            if i < n_inner:
+                if rv >= 0.9 and rv <= 1.0:
+                    w1_r[i] = True
+            else:
+                if rv >= 0.0 and rv <= 10.0:
+                    w1_r[i] = True
+
+        # W2 domain: RMW+30 to RMW+70km, Z=2–5 km
+        w2_z = (heights >= 2.0) & (heights <= 5.0)
+        w2_r = np.zeros(len(r_arr), dtype=bool)
+        for i, rv in enumerate(r_arr):
+            if i >= n_inner:
+                if rv >= 30.0 and rv <= 70.0:
+                    w2_r[i] = True
+
+        # Extract metrics
+        h1_vt = vt_anom[np.ix_(h1_z, h1_r)]
+        w1_zeta = zeta_anom[np.ix_(w1_z, w1_r)]
+        w2_zeta = zeta_anom[np.ix_(w2_z, w2_r)]
+
+        if np.all(np.isnan(h1_vt)):
+            return JSONResponse({
+                "status": "insufficient_data",
+                "message": "H1 domain (upper-level Vt anomaly) is all NaN",
+                "rmw_km": round(float(rmw_km), 2),
+                "h1_z_levels": int(h1_z.sum()),
+                "h1_r_bins": int(h1_r.sum()),
+            })
+
+        raw_h1_max = float(np.nanmax(h1_vt))
+
+        if np.all(np.isnan(w1_zeta)) or np.all(np.isnan(w2_zeta)):
+            return JSONResponse({
+                "status": "insufficient_data",
+                "message": "W1 or W2 vorticity domain is all NaN",
+                "rmw_km": round(float(rmw_km), 2),
+                "raw_h1_max": round(raw_h1_max, 4),
+            })
+
+        raw_w1_mean = float(np.nanmean(w1_zeta))
+        raw_w2_mean = float(np.nanmean(w2_zeta))
+        raw_width_diff = raw_w2_mean - raw_w1_mean
+
+        # Try to get database means from tc_radar_api
+        try:
+            from tc_radar_api import _vortex_db_means
+            db_means = _vortex_db_means if _vortex_db_means else None
+        except ImportError:
+            db_means = None
+
+        result = {
+            "status": "ok",
+            "raw_h1_max": round(raw_h1_max, 4),
+            "raw_width_diff": round(raw_width_diff, 4),
+            "rmw_km": round(float(rmw_km), 2),
+            "vmax_kt": float(vmax_kt),
+        }
+
+        # If database means are available, compute centred metrics directly
+        if db_means:
+            vh = raw_h1_max - db_means["h1"]
+            vw = raw_width_diff - db_means["wd"]
+            result.update({
+                "vortex_height": round(vh, 3),
+                "vortex_width": round(vw, 3),
+                "vortex_favorability": round(vh - vw, 3),
+                "db_means": db_means,
+            })
+
+        return JSONResponse(result)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error computing vortex metrics: {str(e)}")

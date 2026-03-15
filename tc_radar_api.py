@@ -488,6 +488,7 @@ _merge_metadata_cache: dict[int, dict] = {}
 # Staging area for two-pass vortex metrics (raw values before DB mean subtraction)
 _vortex_raw: dict[int, dict] = {}       # case_index -> {raw_h1_max, raw_width_diff}
 _vortex_eras_done = 0                    # how many merge eras have finished pass 1
+_vortex_db_means: dict = {}              # {"h1": float, "wd": float} after finalize
 _vortex_lock = threading.Lock()          # guard the counter + finalize
 _plot_cache: OrderedDict = OrderedDict()
 _PLOT_CACHE_MAX = 40   # ~40 plots × ~150 KB ≈ 6 MB max (was 150)
@@ -1532,8 +1533,10 @@ def _finalize_vortex_metrics():
 
     all_h1 = [r["raw_h1_max"] for r in _vortex_raw.values()]
     all_wd = [r["raw_width_diff"] for r in _vortex_raw.values()]
+    global _vortex_db_means
     db_mean_h1 = float(np.nanmean(all_h1))
     db_mean_wd = float(np.nanmean(all_wd))
+    _vortex_db_means = {"h1": db_mean_h1, "wd": db_mean_wd}
 
     computed = 0
     for case_index, raw in _vortex_raw.items():
@@ -6800,6 +6803,7 @@ def scatter_vp_favorability(
             "n_total": len(points),
             "n_with_vf": sum(1 for p in points if p["vortex_favorability"] is not None),
             "vortex_ready": vortex_ready,
+            "db_means": _vortex_db_means if _vortex_db_means else None,
         },
         headers={"Cache-Control": "no-store"},
     )
