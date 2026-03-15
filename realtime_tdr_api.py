@@ -2773,77 +2773,39 @@ def _fetch_ships_by_name(
 
 def _fetch_ships_from_nhc(atcf_id: str, analysis_dt: _dt) -> Optional[dict]:
     """
-    Fetch SHIPS text file from NHC FTP and parse it.
+    Fetch SHIPS text file from NHC FTP by constructing the URL directly.
 
-    Parameters
-    ----------
-    atcf_id : str
-        ATCF ID like "AL132025" (basin + storm number + year)
-    analysis_dt : datetime
-        Analysis time (UTC)
-
-    Returns
-    -------
-    dict or None
-        Parsed SHIPS data or None if not found
+    Filename format: YYMMDDHHBBNNNN_ships.txt
+      e.g. 25102812AL1325_ships.txt
+    Tries the closest synoptic times (00/06/12/18Z) before analysis_dt.
     """
     year = analysis_dt.year
+    yy = year % 100
 
-    # Try real-time directory first
     base_urls = [
-        "https://ftp.nhc.noaa.gov/atcf/stext/",
-        f"https://ftp.nhc.noaa.gov/atcf/archive/MESSAGES/{year}/stext/",
+        "https://ftp.nhc.noaa.gov/atcf/stext",
+        f"https://ftp.nhc.noaa.gov/atcf/archive/MESSAGES/{year}/stext",
     ]
 
-    # Scan directory listings for matching SHIPS files
-    for base_url in base_urls:
-        try:
-            links = _parse_directory(base_url)
+    # Build candidate synoptic times: round down to nearest 6h, then try
+    # the previous 4 synoptic cycles (covers 24h before analysis)
+    hour_floor = (analysis_dt.hour // 6) * 6
+    base_dt = analysis_dt.replace(hour=hour_floor, minute=0, second=0, microsecond=0)
+    from datetime import timedelta
+    synoptic_times = [base_dt - timedelta(hours=6 * i) for i in range(4)]
 
-            # Find SHIPS files matching atcf_id pattern
-            candidate_files = []
-            for link in links:
-                if '_ships.txt' not in link:
-                    continue
-                # Extract date from filename: YYMMDDHHBBNNNN_ships.txt
-                parts = link.split('_ships')[0]  # e.g., "25102812AL1325"
-                if len(parts) < 14:
-                    continue
-                try:
-                    yy = int(parts[0:2])
-                    mm = int(parts[2:4])
-                    dd = int(parts[4:6])
-                    hh = int(parts[6:8])
-                    bb_nnnn = parts[8:]  # e.g., "AL1325"
-
-                    # Check if this file matches our ATCF ID (basin + storm# + 2-digit year)
-                    if bb_nnnn != atcf_id:
-                        continue
-
-                    file_dt = _dt(2000 + yy, mm, dd, hh, tzinfo=timezone.utc)
-
-                    # Only include files not in future relative to analysis time
-                    if file_dt <= analysis_dt:
-                        candidate_files.append((file_dt, link))
-                except (ValueError, IndexError):
-                    continue
-
-            if candidate_files:
-                # Pick the closest (most recent) file before analysis time
-                candidate_files.sort(key=lambda x: x[0], reverse=True)
-                best_dt, best_link = candidate_files[0]
-
-                # Fetch and parse
-                file_url = base_url.rstrip('/') + '/' + best_link
-                try:
-                    text = _fetch_text(file_url, timeout=30)
-                    ships_data = _parse_ships_text(text)
-                    return ships_data
-                except Exception:
-                    continue
-
-        except Exception:
-            continue
+    errors = []
+    for syn_dt in synoptic_times:
+        fname = f"{syn_dt.strftime('%y%m%d%H')}{atcf_id}_ships.txt"
+        for base_url in base_urls:
+            file_url = f"{base_url}/{fname}"
+            try:
+                text = _fetch_text(file_url, timeout=20)
+                ships_data = _parse_ships_text(text)
+                return ships_data
+            except Exception as e:
+                errors.append(f"{fname} from {base_url}: {e}")
+                continue
 
     return None
 
