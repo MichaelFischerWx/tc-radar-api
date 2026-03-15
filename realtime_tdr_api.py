@@ -2612,7 +2612,7 @@ def _parse_ships_text(text: str) -> dict:
                 data_str = line[len(header):].strip()
                 # Split by whitespace and take first value (t=0 column)
                 parts = data_str.split()
-                if parts:
+                if parts and field_name not in result:
                     try:
                         result[field_name] = float(parts[0])
                     except (ValueError, IndexError):
