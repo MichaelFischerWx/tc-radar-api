@@ -238,14 +238,17 @@ def _fetch_bytes(url: str, timeout: int = 60, max_mb: float = _MAX_DOWNLOAD_MB) 
             return resp.read()
 
 
+_HTTP_HEADERS = {"User-Agent": "TC-RADAR/1.0 (research; michaelfischerwx@gmail.com)"}
+
+
 def _fetch_text(url: str, timeout: int = 30) -> str:
     """Fetch text content from a URL."""
     if _requests:
-        resp = _requests.get(url, timeout=timeout)
+        resp = _requests.get(url, timeout=timeout, headers=_HTTP_HEADERS)
         resp.raise_for_status()
         return resp.text
     else:
-        req = _urllib.Request(url)
+        req = _urllib.Request(url, headers=_HTTP_HEADERS)
         with _urllib.urlopen(req, timeout=timeout) as resp:
             return resp.read().decode("utf-8")
 
@@ -2843,41 +2846,6 @@ def _fetch_ships_from_nhc(atcf_id: str, analysis_dt: _dt) -> Optional[dict]:
             continue
 
     return None
-
-
-@router.get("/ships_debug")
-def ships_debug(atcf_id: str = "AL1325", year: int = 2025):
-    """Temporary debug endpoint to diagnose SHIPS directory listing issues."""
-    import traceback
-    results = {}
-    base_urls = [
-        "https://ftp.nhc.noaa.gov/atcf/stext/",
-        f"https://ftp.nhc.noaa.gov/atcf/archive/MESSAGES/{year}/stext/",
-    ]
-    for base_url in base_urls:
-        try:
-            # Fetch raw HTML first for debugging
-            raw_html = _fetch_text(base_url, timeout=30)
-            raw_snippet = raw_html[:500] if raw_html else "EMPTY"
-
-            links = _parse_directory(base_url)
-            ships_links = [l for l in links if '_ships.txt' in l]
-            matching = [l for l in ships_links if atcf_id in l]
-            results[base_url] = {
-                "total_links": len(links),
-                "ships_links": len(ships_links),
-                "matching_atcf": len(matching),
-                "matching_files": matching[:10],
-                "sample_ships_links": ships_links[:5],
-                "raw_html_snippet": raw_snippet,
-                "html_length": len(raw_html),
-            }
-        except Exception as e:
-            results[base_url] = {
-                "error": str(e),
-                "traceback": traceback.format_exc()[-500:],
-            }
-    return results
 
 
 def _build_ships_result(ships_data: dict, atcf_id: str, analysis_datetime: _dt,
