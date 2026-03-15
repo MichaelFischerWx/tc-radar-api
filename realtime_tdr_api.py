@@ -2697,14 +2697,17 @@ def _fetch_ships_by_name(
             if '_ships.txt' not in link:
                 continue
             parts = link.split('_ships')[0]
-            if len(parts) < 8:
+            if len(parts) < 10:
                 continue
             try:
+                # Filename format: YYMMDDHHMMBBNNNN_ships.txt
+                # e.g., 2510281200AL1325_ships.txt
                 yy = int(parts[0:2])
                 mm = int(parts[2:4])
                 dd = int(parts[4:6])
                 hh = int(parts[6:8])
-                bb_nnnn = parts[8:]  # e.g., "AL1325"
+                # parts[8:10] = minutes (e.g., "00")
+                bb_nnnn = parts[10:]  # e.g., "AL1325"
 
                 file_dt = _dt(2000 + yy, mm, dd, hh, tzinfo=timezone.utc)
 
@@ -2800,16 +2803,17 @@ def _fetch_ships_from_nhc(atcf_id: str, analysis_dt: _dt) -> Optional[dict]:
             for link in links:
                 if '_ships.txt' not in link:
                     continue
-                # Extract date from filename: YYMMDDHHBBNNNN_ships.txt
-                parts = link.split('_ships')[0]  # e.g., "2502041200AL1325"
-                if len(parts) < 8:
+                # Extract date from filename: YYMMDDHHMMBBNNNN_ships.txt
+                parts = link.split('_ships')[0]  # e.g., "2510281200AL1325"
+                if len(parts) < 10:
                     continue
                 try:
                     yy = int(parts[0:2])
                     mm = int(parts[2:4])
                     dd = int(parts[4:6])
                     hh = int(parts[6:8])
-                    bb_nnnn = parts[8:]  # e.g., "AL1325"
+                    # parts[8:10] = minutes (e.g., "00")
+                    bb_nnnn = parts[10:]  # e.g., "AL1325"
 
                     # Check if this file matches our ATCF ID (basin + storm# + 2-digit year)
                     if bb_nnnn != atcf_id:
