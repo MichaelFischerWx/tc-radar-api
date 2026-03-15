@@ -2845,7 +2845,7 @@ def _fetch_ships_from_nhc(atcf_id: str, analysis_dt: _dt) -> Optional[dict]:
     return None
 
 
-@app.get("/realtime/ships_debug")
+@router.get("/realtime/ships_debug")
 def ships_debug(atcf_id: str = "AL1325", year: int = 2025):
     """Temporary debug endpoint to diagnose SHIPS directory listing issues."""
     import traceback
