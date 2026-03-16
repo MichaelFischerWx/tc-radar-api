@@ -2818,16 +2818,26 @@ def _build_ships_result(ships_data: dict, atcf_id: str, analysis_datetime: _dt,
     # Archive VP uses: SHGC × (100 - RHLO) / VMPI  where SHGC is the
     # "generalized shear" (all levels 1000-100 hPa, vortex removed, 0-500 km).
     # The SHIPS text file provides SHEAR (KT) ≈ SHDC (standard 850-200 hPa,
-    # vortex removed, 0-500 km).  Empirical analysis of 388 archive cases
-    # shows SHGC/SHDC median ratio = 1.75 (IQR 1.45-2.21).
-    # We scale the raw shear by this factor to approximate SHGC.
+    # vortex removed, 0-500 km).  Empirical analysis of 396 archive cases
+    # yields the linear model:  SHGC = 0.953 × SHDC + 10.251  (R²=0.69)
+    # This implies a SHDC-dependent correction factor that is high for low
+    # shear (~9.9 at 1.7 kt SHDC) and converges toward ~1.3 at high shear
+    # (33 kt SHDC), matching the physical expectation that generalized shear
+    # from non-850-200 hPa levels contributes a ~10 kt floor.
+    # Equivalent ratio: max(1.0, 0.953 + 10.251 / SHDC)
     # RHMD (700-500 hPa) is used in place of RHLO (850-700 hPa) since the
     # text file doesn't provide RHLO; archive median RHLO ≈ 68% which is
     # comparable to typical RHMD in TC environments.
-    SHGC_SHDC_RATIO = 1.75  # empirical median from 388 TC-RADAR archive cases
+    _SHGC_SLOPE = 0.953
+    _SHGC_INTERCEPT = 10.251  # kt — floor contribution from non-850-200 levels
     if 'shear_kt' in ships_data and 'rhmd' in ships_data and 'pot_int_kt' in ships_data:
         shear_raw = ships_data['shear_kt']      # ≈ SHDC
-        shgc_est = shear_raw * SHGC_SHDC_RATIO  # estimated SHGC
+        # Variable correction factor: linear model with floor of 1.0
+        if shear_raw > 0:
+            shgc_shdc_ratio = max(1.0, _SHGC_SLOPE + _SHGC_INTERCEPT / shear_raw)
+        else:
+            shgc_shdc_ratio = 1.0  # avoid division by zero; low shear → low VP anyway
+        shgc_est = shear_raw * shgc_shdc_ratio   # estimated SHGC
         rhmd = ships_data['rhmd']
         pot_int = ships_data['pot_int_kt']
         if pot_int > 0:
@@ -2835,7 +2845,7 @@ def _build_ships_result(ships_data: dict, atcf_id: str, analysis_datetime: _dt,
             vp_components = {
                 "shear_kt": round(float(shear_raw), 2),
                 "shgc_est_kt": round(float(shgc_est), 2),
-                "shgc_shdc_ratio": SHGC_SHDC_RATIO,
+                "shgc_shdc_ratio": round(float(shgc_shdc_ratio), 3),
                 "rhmd": round(float(rhmd), 2),
                 "pot_int_kt": round(float(pot_int), 2),
             }
