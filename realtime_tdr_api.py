@@ -3012,13 +3012,13 @@ def get_rt_quadrant_mean(
         case_meta = _build_case_meta(ds)
 
         result = {
+            **case_meta,  # case_meta first so explicit keys can override
             "quadrant_means": {q: {"data": _clean_2d(quad_means[q])} for q in QUADRANT_DEFS},
             "radius_km": [round(float(r), 2) for r in r_centers],
             "height_km": [round(float(h), 2) for h in heights],
             "sddc": round(float(sddc), 1),
             "coverage_min": coverage_min,
             "variable": variable,
-            **case_meta,
         }
 
         # Optional overlay
@@ -3120,16 +3120,39 @@ def get_rt_anomaly_azimuthal_mean(
             climo_varname, vmax_kt
         )
 
-        # Compute Z* anomaly
+        # Compute Z* anomaly — handle height grid mismatch
         z_anomaly = np.full_like(az_mean, np.nan)
         if climo_mean is not None and climo_std is not None:
-            # climo_mean and climo_std are on same R_H grid
-            valid_climo = ~np.isnan(climo_mean)
-            z_anomaly[valid_climo] = (az_mean[valid_climo] - climo_mean[valid_climo]) / (climo_std[valid_climo] + 1e-6)
+            if az_mean.shape != climo_mean.shape:
+                # Interpolate climatology to real-time height grid
+                from scipy.interpolate import interp1d
+                climo_heights = _climatology.get("height_km", None)
+                if climo_heights is not None and len(climo_heights) > 1:
+                    climo_h = np.array(climo_heights, dtype=float)
+                    rt_h = np.array(heights, dtype=float)
+                    n_r = climo_mean.shape[1]
+                    cm_interp = np.full((len(rt_h), n_r), np.nan)
+                    cs_interp = np.full((len(rt_h), n_r), np.nan)
+                    for ri in range(n_r):
+                        col_m = climo_mean[:, ri]
+                        col_s = climo_std[:, ri]
+                        valid = ~np.isnan(col_m)
+                        if valid.sum() >= 2:
+                            fm = interp1d(climo_h[valid], col_m[valid], bounds_error=False, fill_value=np.nan)
+                            fs = interp1d(climo_h[valid], col_s[valid], bounds_error=False, fill_value=np.nan)
+                            cm_interp[:, ri] = fm(rt_h)
+                            cs_interp[:, ri] = fs(rt_h)
+                    climo_mean = cm_interp
+                    climo_std = cs_interp
+            # Apply minimum std floor to prevent extreme Z* values
+            STD_FLOOR = 1.0 if "vorticity" not in climo_varname else 5e-5
+            valid_climo = ~np.isnan(climo_mean) & (climo_std >= STD_FLOOR)
+            z_anomaly[valid_climo] = (az_mean[valid_climo] - climo_mean[valid_climo]) / climo_std[valid_climo]
 
         case_meta = _build_case_meta(ds)
 
         result = {
+            **case_meta,  # case_meta first so explicit keys below can override
             "anomaly": _clean_2d(z_anomaly),
             "azimuthal_mean": _clean_2d(az_mean),
             "coverage": _clean_2d(coverage),
@@ -3137,12 +3160,11 @@ def get_rt_anomaly_azimuthal_mean(
             "n_inner": n_inner,
             "height_km": [round(float(h), 2) for h in heights],
             "rmw_km": round(float(rmw_km), 2),
-            "vmax_kt": float(vmax_kt),
+            "vmax_kt": float(vmax_kt),  # from SHIPS, overrides case_meta's None
             "variable": variable,
             "climatology_available": climo_mean is not None,
             "climatology_intensity_bin": float(bin_centre) if bin_centre is not None else None,
             "climatology_count": int(climo_count) if climo_count is not None else 0,
-            **case_meta,
         }
 
         return JSONResponse(result)
@@ -3280,14 +3302,64 @@ def get_rt_vortex_raw(
                 "rmw_km": round(float(rmw_km), 2),
             })
 
-        # Compute Z* anomalies
+        # Compute Z* anomalies — ensure shapes match (may differ if real-time
+        # file has different height levels than the archive climatology)
+        if vt_az.shape != vt_climo_mean.shape:
+            # Interpolate climatology to match real-time height grid
+            from scipy.interpolate import interp1d
+            climo_heights = _climatology.get("height_km", None)
+            if climo_heights is not None and len(climo_heights) > 1:
+                climo_h = np.array(climo_heights, dtype=float)
+                rt_h = np.array(heights, dtype=float)
+                # Interpolate each radial bin along height axis
+                n_r = vt_climo_mean.shape[1]
+                vt_mean_interp = np.full((len(rt_h), n_r), np.nan)
+                vt_std_interp = np.full((len(rt_h), n_r), np.nan)
+                zeta_mean_interp = np.full((len(rt_h), n_r), np.nan)
+                zeta_std_interp = np.full((len(rt_h), n_r), np.nan)
+                for ri in range(n_r):
+                    col_m = vt_climo_mean[:, ri]
+                    col_s = vt_climo_std[:, ri]
+                    valid = ~np.isnan(col_m)
+                    if valid.sum() >= 2:
+                        f_m = interp1d(climo_h[valid], col_m[valid], bounds_error=False, fill_value=np.nan)
+                        f_s = interp1d(climo_h[valid], col_s[valid], bounds_error=False, fill_value=np.nan)
+                        vt_mean_interp[:, ri] = f_m(rt_h)
+                        vt_std_interp[:, ri] = f_s(rt_h)
+                    col_m2 = zeta_climo_mean[:, ri]
+                    col_s2 = zeta_climo_std[:, ri]
+                    valid2 = ~np.isnan(col_m2)
+                    if valid2.sum() >= 2:
+                        f_m2 = interp1d(climo_h[valid2], col_m2[valid2], bounds_error=False, fill_value=np.nan)
+                        f_s2 = interp1d(climo_h[valid2], col_s2[valid2], bounds_error=False, fill_value=np.nan)
+                        zeta_mean_interp[:, ri] = f_m2(rt_h)
+                        zeta_std_interp[:, ri] = f_s2(rt_h)
+                vt_climo_mean = vt_mean_interp
+                vt_climo_std = vt_std_interp
+                zeta_climo_mean = zeta_mean_interp
+                zeta_climo_std = zeta_std_interp
+                print(f"  [vortex_raw] Interpolated climatology from {len(climo_h)} to {len(rt_h)} heights")
+            else:
+                return JSONResponse({
+                    "status": "shape_mismatch",
+                    "message": f"Climatology shape {vt_climo_mean.shape} != azimuthal mean shape {vt_az.shape}",
+                })
+
+        # Use physically meaningful minimum std thresholds to prevent
+        # extreme Z* values from near-zero std at sparsely-sampled grid cells.
+        # Vt std < 1 m/s and vorticity std < 5e-5 s⁻¹ are unreliable.
+        VT_STD_FLOOR = 1.0       # m/s
+        ZETA_STD_FLOOR = 5e-5    # s⁻¹
+        vt_std_safe = np.where(vt_climo_std < VT_STD_FLOOR, np.nan, vt_climo_std)
+        zeta_std_safe = np.where(zeta_climo_std < ZETA_STD_FLOOR, np.nan, zeta_climo_std)
+
         vt_anom = np.where(
-            np.isnan(vt_az) | np.isnan(vt_climo_mean) | (vt_climo_std < 1e-6),
-            np.nan, (vt_az - vt_climo_mean) / (vt_climo_std + 1e-6)
+            np.isnan(vt_az) | np.isnan(vt_climo_mean) | np.isnan(vt_std_safe),
+            np.nan, (vt_az - vt_climo_mean) / vt_std_safe
         )
         zeta_anom = np.where(
-            np.isnan(zeta_az) | np.isnan(zeta_climo_mean) | (zeta_climo_std < 1e-6),
-            np.nan, (zeta_az - zeta_climo_mean) / (zeta_climo_std + 1e-6)
+            np.isnan(zeta_az) | np.isnan(zeta_climo_mean) | np.isnan(zeta_std_safe),
+            np.nan, (zeta_az - zeta_climo_mean) / zeta_std_safe
         )
 
         r_arr = np.array([float(r) if isinstance(r, (int, float)) else float(r) for r in r_h_labels])
@@ -3363,6 +3435,25 @@ def get_rt_vortex_raw(
             "raw_width_diff": round(raw_width_diff, 4),
             "rmw_km": round(float(rmw_km), 2),
             "vmax_kt": float(vmax_kt),
+            # Diagnostic info for debugging VF values
+            "diag": {
+                "vt_az_shape": list(vt_az.shape),
+                "climo_shape": list(vt_climo_mean.shape) if vt_climo_mean is not None else None,
+                "heights": [round(float(h), 2) for h in heights[:5]] + ["..."] + [round(float(h), 2) for h in heights[-3:]] if len(heights) > 8 else [round(float(h), 2) for h in heights],
+                "n_heights": len(heights),
+                "n_r_bins": len(r_arr),
+                "n_inner": n_inner,
+                "h1_z_count": int(h1_z.sum()),
+                "h1_r_count": int(h1_r.sum()),
+                "h1_vt_range": [round(float(np.nanmin(h1_vt)), 4), round(float(np.nanmax(h1_vt)), 4)],
+                "w1_zeta_range": [round(float(np.nanmin(w1_zeta)), 4), round(float(np.nanmax(w1_zeta)), 4)],
+                "w2_zeta_range": [round(float(np.nanmin(w2_zeta)), 4), round(float(np.nanmax(w2_zeta)), 4)],
+                "vt_climo_std_min_h1": round(float(np.nanmin(vt_climo_std[np.ix_(h1_z, h1_r)])), 6) if vt_climo_std is not None and h1_z.any() and h1_r.any() else None,
+                "vt_std_floor": VT_STD_FLOOR,
+                "zeta_std_floor": ZETA_STD_FLOOR,
+                "raw_w1_mean": round(raw_w1_mean, 4),
+                "raw_w2_mean": round(raw_w2_mean, 4),
+            },
         }
 
         # If database means are available, compute centred metrics directly

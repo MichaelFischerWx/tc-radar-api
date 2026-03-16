@@ -6285,8 +6285,11 @@ def _compute_anomaly_for_case(ds, local_idx, case_index, variable, data_type):
             "error": "Climatology not available. Run precompute_climatology.py.",
         }
 
+    # Minimum std floor: prevent extreme Z* from near-zero std cells
+    _STD_FLOOR = 5e-5 if "vorticity" in varname else 1.0
     anomaly = np.where(
-        np.isnan(az_raw) | np.isnan(clim_mean) | np.isnan(clim_std),
+        np.isnan(az_raw) | np.isnan(clim_mean) | np.isnan(clim_std)
+        | (clim_std < _STD_FLOOR),
         np.nan, (az_raw - clim_mean) / clim_std
     )
 
@@ -6335,8 +6338,10 @@ def _process_one_case_anomaly(case_idx, variable, data_type):
         if clim_mean is None:
             return None
 
+        _STD_FLOOR = 5e-5 if "vorticity" in varname else 1.0
         anomaly = np.where(
-            np.isnan(az_raw) | np.isnan(clim_mean) | np.isnan(clim_std) | (clim_std == 0),
+            np.isnan(az_raw) | np.isnan(clim_mean) | np.isnan(clim_std)
+            | (clim_std < _STD_FLOOR),
             np.nan, (az_raw - clim_mean) / clim_std
         )
         return (case_idx, anomaly, r_h_axis, n_inner)
@@ -6660,12 +6665,18 @@ def _compute_vortex_metrics_for_case(case_index, ds, local_idx, data_type):
         zeta_vol, x_coords, y_coords, height_vals, h_axis, rmw
     )
 
+    # Minimum std floors: cells with near-zero std are unreliable and
+    # produce extreme Z* values that distort vortex metrics.
+    _VT_STD_FLOOR = 1.0       # m/s
+    _ZETA_STD_FLOOR = 5e-5    # s⁻¹
     vt_anom = np.where(
-        np.isnan(vt_az) | np.isnan(vt_clim_mean) | np.isnan(vt_clim_std),
+        np.isnan(vt_az) | np.isnan(vt_clim_mean) | np.isnan(vt_clim_std)
+        | (vt_clim_std < _VT_STD_FLOOR),
         np.nan, (vt_az - vt_clim_mean) / vt_clim_std
     )
     zeta_anom = np.where(
-        np.isnan(zeta_az) | np.isnan(zeta_clim_mean) | np.isnan(zeta_clim_std),
+        np.isnan(zeta_az) | np.isnan(zeta_clim_mean) | np.isnan(zeta_clim_std)
+        | (zeta_clim_std < _ZETA_STD_FLOOR),
         np.nan, (zeta_az - zeta_clim_mean) / zeta_clim_std
     )
 
