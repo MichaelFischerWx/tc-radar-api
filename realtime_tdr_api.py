@@ -382,21 +382,17 @@ def _extract_2d(ds, variable: str, level_km: float):
     if variable in RT_DERIVED:
         info = RT_DERIVED[variable]
         u_name, v_name = info["components"]
-        u = ds[u_name].isel(time=0, level=z_idx).values
-        v = ds[v_name].isel(time=0, level=z_idx).values
+        # Use xarray named transpose to guarantee (y, x) output
+        u = ds[u_name].isel(time=0, level=z_idx).transpose("y", "x").values
+        v = ds[v_name].isel(time=0, level=z_idx).transpose("y", "x").values
         data = np.sqrt(u**2 + v**2)
     else:
-        data = ds[variable].isel(time=0, level=z_idx).values
+        # Use xarray named transpose — safe regardless of file dim order
+        data = ds[variable].isel(time=0, level=z_idx).transpose("y", "x").values
 
     # Unit conversion: real-time xy.nc stores VORT in 10⁻⁴ s⁻¹ → convert to s⁻¹
     if variable == "VORT":
         data = data * 1e-4
-
-    # Ensure shape is (y, x) for Plotly heatmap (row = y, col = x)
-    # File dims are (x, y, level, time), so after isel we have (x, y).
-    # Transpose so rows = y-axis, cols = x-axis.
-    if data.shape[0] == ds.sizes.get("x", 0) and data.shape[1] == ds.sizes.get("y", 0):
-        data = data.T
 
     return data, actual_level
 
@@ -500,14 +496,14 @@ def _extract_3d(ds, variable: str, max_height_km: float = 18.0):
     if variable in RT_DERIVED:
         info = RT_DERIVED[variable]
         u_name, v_name = info["components"]
-        u = ds[u_name].isel(time=0).values   # (x, y, level)
-        v = ds[v_name].isel(time=0).values
+        # Use xarray named transpose to guarantee (level, y, x) regardless
+        # of the dimension order in the file.
+        u = ds[u_name].isel(time=0).transpose("level", "y", "x").values
+        v = ds[v_name].isel(time=0).transpose("level", "y", "x").values
         vol = np.sqrt(u**2 + v**2)
     else:
-        vol = ds[variable].isel(time=0).values  # (x, y, level)
-
-    # Reorder from (x, y, level) → (level, y, x) for consistency
-    vol = np.transpose(vol, (2, 1, 0))  # (level, y, x)
+        # Use xarray named transpose — safe regardless of file dim order.
+        vol = ds[variable].isel(time=0).transpose("level", "y", "x").values
 
     # Unit conversion: real-time xy.nc files store VORT in 10⁻⁴ s⁻¹,
     # but the archive (and display colour ranges) expect s⁻¹.
