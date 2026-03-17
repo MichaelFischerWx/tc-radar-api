@@ -2663,115 +2663,80 @@ def _fetch_ships_by_name(
     lon: float = 0.0,
 ) -> Optional[tuple[dict, str]]:
     """
-    Search SHIPS files by storm name and analysis date.
+    Fast SHIPS lookup by storm name: construct direct URLs and probe in
+    parallel using ThreadPoolExecutor.
 
-    Scans NHC SHIPS directories for files near the analysis time, reads
-    each candidate's header to find the matching storm name.
+    Instead of fetching/parsing an NHC directory listing (slow HTML page),
+    we know the SHIPS filename format is ``YYMMDDHHBBSSYY_ships.txt``
+    (BB = basin, SS = storm number, YY = year).  We guess the basin from
+    lat/lon, pick the closest synoptic time, and try storm numbers 01-25
+    concurrently.  The first file whose header contains the storm name wins.
 
-    Parameters
-    ----------
-    storm_name : str
-        Storm name (e.g. "MELISSA")
-    analysis_dt : datetime
-        Analysis datetime (UTC)
-    lat, lon : float
-        Storm center coordinates (used to prioritize basin search)
-
-    Returns
-    -------
-    (dict, str) or None
-        Tuple of (parsed SHIPS data, discovered ATCF ID) or None
+    Falls back to one older synoptic cycle if the first round finds nothing.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     year = analysis_dt.year
+    yy = year % 100
     name_upper = storm_name.upper().strip()
 
+    likely_basins = (
+        _guess_basin_from_coords(lat, lon)
+        if (lat != 0 or lon != 0)
+        else ["AL", "EP"]
+    )
+
     base_urls = [
-        "https://ftp.nhc.noaa.gov/atcf/stext/",
-        f"https://ftp.nhc.noaa.gov/atcf/archive/MESSAGES/{year}/stext/",
+        "https://ftp.nhc.noaa.gov/atcf/stext",
+        f"https://ftp.nhc.noaa.gov/atcf/archive/MESSAGES/{year}/stext",
     ]
 
-    # Use lat/lon to guess likely basins — prioritize search
-    likely_basins = _guess_basin_from_coords(lat, lon) if (lat != 0 or lon != 0) else ["AL", "EP", "CP", "WP"]
+    # Build candidate synoptic times (nearest 6-h cycle, then one prior)
+    hour_floor = (analysis_dt.hour // 6) * 6
+    base_synoptic = analysis_dt.replace(
+        hour=hour_floor, minute=0, second=0, microsecond=0
+    )
+    synoptic_times = [base_synoptic - timedelta(hours=6 * i) for i in range(3)]
 
-    for base_url in base_urls:
+    def _try_url(url: str) -> Optional[tuple[dict, str, str]]:
+        """Fetch one SHIPS URL; return (parsed_data, atcf_id, text) or None."""
         try:
-            links = _parse_directory(base_url)
+            text = _fetch_text(url, timeout=8)
         except Exception:
-            continue
+            return None
+        # Verify storm name in header (first 10 lines)
+        for hline in text.split("\n")[:10]:
+            if name_upper in hline.upper():
+                return (_parse_ships_text(text), None, url)  # placeholder atcf
+        return None
 
-        # Collect candidate files: within ±24h of analysis time, not future
-        candidate_files = []
-        for link in links:
-            if '_ships.txt' not in link:
-                continue
-            parts = link.split('_ships')[0]
-            if len(parts) < 14:
-                continue
-            try:
-                # Filename format: YYMMDDHHBBNNNN_ships.txt
-                # e.g., 25102812AL1325_ships.txt  (14 chars before _ships)
-                yy = int(parts[0:2])
-                mm = int(parts[2:4])
-                dd = int(parts[4:6])
-                hh = int(parts[6:8])
-                bb_nnnn = parts[8:]  # e.g., "AL1325"
+    # For each synoptic time, build all candidate URLs across basins and
+    # storm numbers, then probe them in parallel.
+    for syn_dt in synoptic_times:
+        dt_prefix = syn_dt.strftime("%y%m%d%H")
+        urls_and_ids = []  # (url, atcf_id)
+        for basin in likely_basins:
+            for stnum in range(1, 26):
+                atcf_id = f"{basin}{stnum:02d}{yy:02d}"
+                fname = f"{dt_prefix}{atcf_id}_ships.txt"
+                for base_url in base_urls:
+                    urls_and_ids.append((f"{base_url}/{fname}", atcf_id))
 
-                file_dt = _dt(2000 + yy, mm, dd, hh, tzinfo=timezone.utc)
-
-                # Must not be in the future
-                if file_dt > analysis_dt:
-                    continue
-
-                # Within 24 hours before analysis
-                delta_h = (analysis_dt - file_dt).total_seconds() / 3600
-                if delta_h > 24:
-                    continue
-
-                # Extract basin from filename
-                file_basin = bb_nnnn[:2] if len(bb_nnnn) >= 2 else ""
-
-                candidate_files.append((file_dt, link, file_basin, bb_nnnn))
-            except (ValueError, IndexError):
-                continue
-
-        if not candidate_files:
-            continue
-
-        # Sort: prioritize likely basins, then by recency
-        def _sort_key(item):
-            file_dt, _, file_basin, _ = item
-            basin_priority = likely_basins.index(file_basin) if file_basin in likely_basins else 99
-            return (basin_priority, -file_dt.timestamp())
-
-        candidate_files.sort(key=_sort_key)
-
-        # Check each candidate (fetch header and look for storm name)
-        checked = 0
-        for file_dt, link, file_basin, bb_nnnn in candidate_files:
-            if checked >= 8:  # Don't fetch too many files
-                break
-            checked += 1
-
-            file_url = base_url.rstrip('/') + '/' + link
-            try:
-                text = _fetch_text(file_url, timeout=15)
-            except Exception:
-                continue
-
-            # Check if storm name appears in the header (first ~10 lines)
-            header_lines = text.split('\n')[:10]
-            name_found = False
-            for hline in header_lines:
-                if name_upper in hline.upper():
-                    name_found = True
-                    break
-
-            if name_found:
-                ships_data = _parse_ships_text(text)
-                # Reconstruct full ATCF ID: bb_nnnn is like "AL1325"
-                # We need it as "AL1325" for the endpoint response
-                discovered_atcf = bb_nnnn
-                return (ships_data, discovered_atcf)
+        # Fire all requests concurrently (cap threads to avoid overload)
+        with ThreadPoolExecutor(max_workers=12) as executor:
+            future_map = {
+                executor.submit(_try_url, url): atcf_id
+                for url, atcf_id in urls_and_ids
+            }
+            for future in as_completed(future_map):
+                result = future.result()
+                if result is not None:
+                    ships_data, _, _ = result
+                    atcf_id = future_map[future]
+                    # Cancel remaining futures
+                    for f in future_map:
+                        f.cancel()
+                    return (ships_data, atcf_id)
 
     return None
 
