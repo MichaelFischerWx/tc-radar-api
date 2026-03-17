@@ -3065,6 +3065,7 @@ def get_rt_anomaly_azimuthal_mean(
     variable: str = Query("TANGENTIAL_WIND"),
     vmax_kt: float = Query(..., ge=0, le=200, description="Current Vmax in kt (from SHIPS)"),
     rmw_km: Optional[float] = Query(None, ge=1, le=200, description="RMW in km (auto-estimated if omitted)"),
+    coverage_min: float = Query(0.5, ge=0.0, le=1.0, description="Min azimuthal coverage fraction"),
 ):
     """
     Compute Z* anomaly azimuthal mean on hybrid R_H coordinate.
@@ -3120,7 +3121,7 @@ def get_rt_anomaly_azimuthal_mean(
 
         # Compute azimuthal mean on hybrid R_H
         az_mean, coverage, r_h_labels, n_inner = _compute_azimuthal_mean_hybrid(
-            vol, x_km, y_km, heights, h_axis=0, rmw=rmw_km, coverage_min=0.5
+            vol, x_km, y_km, heights, h_axis=0, rmw=rmw_km, coverage_min=coverage_min
         )
 
         # Look up intensity-matched climatology
