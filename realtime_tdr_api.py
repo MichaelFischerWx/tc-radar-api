@@ -3006,38 +3006,6 @@ def get_rt_quadrant_mean(
         vol, heights = _extract_3d(ds, variable)
         x_km, y_km = _get_xy_coords(ds)
 
-        # ── Diagnostics: volume & coordinate info ──────────────────
-        diag = {}
-        diag["vol_shape"] = list(vol.shape)
-        diag["n_heights"] = len(heights)
-        diag["height_range"] = [round(float(heights[0]), 2), round(float(heights[-1]), 2)] if len(heights) > 0 else []
-        diag["x_km_range"] = [round(float(x_km[0]), 2), round(float(x_km[-1]), 2)]
-        diag["y_km_range"] = [round(float(y_km[0]), 2), round(float(y_km[-1]), 2)]
-        # Count valid (non-NaN) values at mid-height
-        mid_h = len(heights) // 2
-        if mid_h < vol.shape[0]:
-            mid_slab = vol[mid_h, :, :]
-            diag["mid_slab_shape"] = list(mid_slab.shape)
-            diag["mid_slab_valid_count"] = int(np.count_nonzero(~np.isnan(mid_slab)))
-            diag["mid_slab_total"] = int(mid_slab.size)
-        # Check azimuth distribution of valid data at mid-height
-        xx, yy = np.meshgrid(x_km, y_km)
-        az_math = np.degrees(np.arctan2(yy, xx))
-        az_met = (90.0 - az_math) % 360.0
-        shear_rel = (az_met - sddc) % 360.0
-        if mid_h < vol.shape[0]:
-            valid_mask = ~np.isnan(mid_slab)
-            diag["valid_in_quadrant"] = {}
-            for qn, (a0, a1) in QUADRANT_DEFS.items():
-                qm = (shear_rel >= a0) & (shear_rel < a1)
-                diag["valid_in_quadrant"][qn] = int(np.count_nonzero(valid_mask & qm))
-        # File dimension info
-        ref_var = variable if variable not in RT_DERIVED else list(RT_DERIVED[variable]["components"])[0]
-        if ref_var in ds:
-            diag["file_dims"] = list(ds[ref_var].dims)
-            diag["file_shape"] = list(ds[ref_var].shape)
-        # ── End diagnostics ────────────────────────────────────────
-
         # Compute quadrant means
         quad_means, r_centers = _compute_quadrant_means_rt(
             vol, x_km, y_km, heights, h_axis=0,
@@ -3057,7 +3025,6 @@ def get_rt_quadrant_mean(
             "sddc": round(float(sddc), 1),
             "coverage_min": coverage_min,
             "variable": variable,
-            "diagnostics": diag,
         }
 
         # Optional overlay
