@@ -388,6 +388,10 @@ def _extract_2d(ds, variable: str, level_km: float):
     else:
         data = ds[variable].isel(time=0, level=z_idx).values
 
+    # Unit conversion: real-time xy.nc stores VORT in 10⁻⁴ s⁻¹ → convert to s⁻¹
+    if variable == "VORT":
+        data = data * 1e-4
+
     # Ensure shape is (y, x) for Plotly heatmap (row = y, col = x)
     # File dims are (x, y, level, time), so after isel we have (x, y).
     # Transpose so rows = y-axis, cols = x-axis.
@@ -504,6 +508,11 @@ def _extract_3d(ds, variable: str, max_height_km: float = 18.0):
 
     # Reorder from (x, y, level) → (level, y, x) for consistency
     vol = np.transpose(vol, (2, 1, 0))  # (level, y, x)
+
+    # Unit conversion: real-time xy.nc files store VORT in 10⁻⁴ s⁻¹,
+    # but the archive (and display colour ranges) expect s⁻¹.
+    if variable == "VORT":
+        vol = vol * 1e-4
 
     # Trim to max height
     n_h = int(h_mask.sum())
@@ -3253,6 +3262,8 @@ def get_rt_vortex_raw(
         vt_vol, heights = _extract_3d(ds, "TANGENTIAL_WIND")
         vort_vol, _ = _extract_3d(ds, "VORT")
         x_km, y_km = _get_xy_coords(ds)
+
+        # (VORT unit conversion 10⁻⁴ s⁻¹ → s⁻¹ is handled inside _extract_3d)
 
         # Auto-estimate RMW if not provided
         if rmw_km is None or rmw_km <= 0:
