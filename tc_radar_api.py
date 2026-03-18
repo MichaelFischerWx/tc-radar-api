@@ -1364,6 +1364,56 @@ def _get_shdc(ds, local_idx):
     return _get_ships_value(ds, local_idx, "shdc_ships")
 
 
+def _get_storm_motion(ds, local_idx):
+    """
+    Extract TC motion direction (met heading, deg) and speed (kt) from the dataset.
+
+    Tries per-case variables storm_u_ms / storm_v_ms first (eastward / northward
+    components in m/s), then falls back to global attrs.  Returns (direction, speed)
+    in meteorological heading (0=N, 90=E) and knots, or (None, None) if unavailable.
+    """
+    storm_u, storm_v = None, None
+    # Per-case variables (archive Zarr stores)
+    for u_key in ("storm_u_ms", "storm_motion_east_ms"):
+        if u_key in ds:
+            try:
+                val = float(ds[u_key].isel(num_cases=local_idx).values)
+                if val != -999 and val != 9999 and not np.isnan(val):
+                    storm_u = val
+                    break
+            except Exception:
+                pass
+    for v_key in ("storm_v_ms", "storm_motion_north_ms"):
+        if v_key in ds:
+            try:
+                val = float(ds[v_key].isel(num_cases=local_idx).values)
+                if val != -999 and val != 9999 and not np.isnan(val):
+                    storm_v = val
+                    break
+            except Exception:
+                pass
+    # Fallback: global attrs (older single-case files)
+    if storm_u is None and hasattr(ds, "attrs"):
+        try:
+            su = float(ds.attrs.get("EASTWARD STORM MOTION (METERS PER SECOND)",
+                       ds.attrs.get("storm_motion_east_ms", -999)))
+            sv = float(ds.attrs.get("NORTHWARD STORM MOTION (METERS PER SECOND)",
+                       ds.attrs.get("storm_motion_north_ms", -999)))
+            if su != -999 and sv != -999 and not np.isnan(su) and not np.isnan(sv):
+                storm_u, storm_v = su, sv
+        except Exception:
+            pass
+    if storm_u is None or storm_v is None:
+        return None, None
+    # Compute speed (m/s → kt) and meteorological heading
+    spd_ms = np.sqrt(storm_u**2 + storm_v**2)
+    spd_kt = round(float(spd_ms * 1.94384), 1)  # m/s → kt
+    # Math angle (CCW from east) → met heading (CW from north)
+    math_angle = np.degrees(np.arctan2(storm_v, storm_u))
+    met_heading = (90.0 - math_angle) % 360.0
+    return round(float(met_heading), 0), spd_kt
+
+
 def _get_ships_value_at_lag(ds, local_idx, varname, lag_idx):
     """
     Look up a SHIPS variable at an arbitrary lag-hour index.
@@ -2171,7 +2221,7 @@ def get_era5_sounding(
 
 
 def _build_case_meta(case_index, ds=None, local_idx=None, data_type="swath"):
-    """Build case_meta dict with SDDC included."""
+    """Build case_meta dict with SDDC, SHDC, and TC motion included."""
     cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
     case_meta = cache.get(case_index, {"case_index": case_index})
     meta = {
@@ -2186,6 +2236,11 @@ def _build_case_meta(case_index, ds=None, local_idx=None, data_type="swath"):
         shdc = _get_shdc(ds, local_idx)
         meta["sddc"] = sddc if sddc is not None else 9999
         meta["shdc"] = shdc if shdc is not None else 9999
+
+        # TC motion vector from dataset (storm_u_ms, storm_v_ms in m/s)
+        motion_dir, motion_spd = _get_storm_motion(ds, local_idx)
+        meta["motion_dir"] = motion_dir if motion_dir is not None else 9999
+        meta["motion_spd"] = motion_spd if motion_spd is not None else 9999
     return meta
 
 
