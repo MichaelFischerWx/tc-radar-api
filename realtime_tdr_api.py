@@ -2629,7 +2629,12 @@ def _parse_ships_text(text: str) -> dict:
         'POT. INT. (KT)': 'pot_int_kt',
         '700-500 MB RH': 'rhmd',
         'STM SPEED (KT)': 'stm_speed_kt',
+        'STM SPEED': 'stm_speed_kt',
+        'STORM SPEED': 'stm_speed_kt',
+        'STM HEADING (DEG)': 'stm_heading_deg',
         'STM HEADING': 'stm_heading_deg',
+        'STORM HEADING': 'stm_heading_deg',
+        'STORM DIRECTION': 'stm_heading_deg',
         '200 MB DIV': '200mb_div',
         'HEAT CONTENT': 'heat_content',
         'LAT (DEG N)': 'lat',
@@ -2656,6 +2661,22 @@ def _parse_ships_text(text: str) -> dict:
                     except (ValueError, IndexError):
                         pass
                 break
+
+        # Parse "INITIAL HEADING/SPEED (DEG/KT): 25/ 7" line
+        if not matched and 'HEADING/SPEED' in line and 'stm_heading_deg' not in result:
+            try:
+                # Format: "... HEADING/SPEED (DEG/KT): heading/ speed"
+                colon_idx = line.index(':')
+                hs_str = line[colon_idx + 1:].strip()  # "25/ 7" or "25/7"
+                hs_parts = hs_str.split('/')
+                if len(hs_parts) == 2:
+                    h_val = float(hs_parts[0].strip())
+                    s_val = float(hs_parts[1].strip())
+                    result['stm_heading_deg'] = h_val
+                    if 'stm_speed_kt' not in result:
+                        result['stm_speed_kt'] = s_val
+            except (ValueError, IndexError):
+                pass
 
     return result
 
