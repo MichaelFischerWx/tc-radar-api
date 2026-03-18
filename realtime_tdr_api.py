@@ -874,6 +874,7 @@ def get_rt_data(
     variable:   str   = Query(DEFAULT_RT_VARIABLE,           description="Variable name"),
     level_km:   float = Query(2.0,            ge=0.0, le=18, description="Altitude in km"),
     overlay:    str   = Query("",                            description="Optional overlay variable"),
+    wind_barbs: bool  = Query(False,                         description="Include subsampled U/V for wind barbs"),
 ):
     """Return a 2D plan-view data slice as JSON for client-side Plotly rendering."""
     if variable not in RT_VARIABLES and variable not in RT_DERIVED:
@@ -911,6 +912,26 @@ def get_rt_data(
             "vmin": ov_info["vmin"],
             "vmax": ov_info["vmax"],
         }
+
+    # Optional wind barbs: subsampled U/V at requested height
+    if wind_barbs:
+        try:
+            levels = _get_level_axis(ds)
+            z_idx = int(np.argmin(np.abs(levels - level_km)))
+            u_full = ds["U"].isel(time=0, level=z_idx).transpose("y", "x").values
+            v_full = ds["V"].isel(time=0, level=z_idx).transpose("y", "x").values
+            ny, nx = u_full.shape
+            stride = max(1, min(nx, ny) // 20)
+            result["wind_barbs"] = {
+                "u": _clean_2d(u_full[::stride, ::stride]),
+                "v": _clean_2d(v_full[::stride, ::stride]),
+                "x": np.round(x_km[::stride], 2).tolist(),
+                "y": np.round(y_km[::stride], 2).tolist(),
+                "units": "m/s",
+                "type": "earth_relative",
+            }
+        except Exception:
+            pass
 
     return JSONResponse(result)
 
