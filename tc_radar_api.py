@@ -1382,6 +1382,7 @@ def _get_storm_motion(ds, local_idx):
       1. Per-case variables storm_u_ms / storm_v_ms (U/V in m/s)
       2. SHIPS storm speed/heading variables (spd_ships / dir_ships at t=0)
       3. Global attrs (single-case files)
+      4. Difference between earth-relative and storm-relative wind at 2 km
 
     Returns (direction, speed) as meteorological heading (0=N, 90=E) and knots,
     or (None, None) if unavailable.
@@ -1415,7 +1416,6 @@ def _get_storm_motion(ds, local_idx):
         return round(float(met_heading), 0), spd_kt
 
     # ── Method 2: SHIPS storm speed & heading at t=0 ────────────
-    # spd_ships = storm speed (kt), dir_ships = heading TC is MOVING TOWARD (met deg)
     spd_ships = _get_ships_value(ds, local_idx, "spd_ships")
     dir_ships = _get_ships_value(ds, local_idx, "dir_ships")
     if spd_ships is not None and dir_ships is not None and spd_ships > 0:
@@ -1436,6 +1436,43 @@ def _get_storm_motion(ds, local_idx):
                 return round(float(met_heading), 0), spd_kt
         except Exception:
             pass
+
+    # ── Method 4: derive from earth-relative minus storm-relative wind ──
+    # The archive stores both wind frames; their difference is the storm
+    # motion vector.  Sample a single valid grid point at 2 km to extract it.
+    try:
+        er_u_name = sr_u_name = er_v_name = sr_v_name = None
+        for _eu, _su in [("recentered_earth_relative_eastward_wind", "recentered_eastward_wind")]:
+            if _eu in ds and _su in ds:
+                er_u_name, sr_u_name = _eu, _su
+                break
+        for _ev, _sv in [("recentered_earth_relative_northward_wind", "recentered_northward_wind")]:
+            if _ev in ds and _sv in ds:
+                er_v_name, sr_v_name = _ev, _sv
+                break
+        if er_u_name and sr_u_name and er_v_name and sr_v_name:
+            height_vals = ds["height"].values
+            z_idx = int(np.argmin(np.abs(height_vals - 2.0)))
+            er_u = ds[er_u_name].isel(num_cases=local_idx, height=z_idx).values
+            sr_u = ds[sr_u_name].isel(num_cases=local_idx, height=z_idx).values
+            er_v = ds[er_v_name].isel(num_cases=local_idx, height=z_idx).values
+            sr_v = ds[sr_v_name].isel(num_cases=local_idx, height=z_idx).values
+            # Storm motion = earth-relative − storm-relative (constant across grid)
+            diff_u = er_u - sr_u
+            diff_v = er_v - sr_v
+            # Use median of valid points (should all be identical, but median is robust)
+            valid = np.isfinite(diff_u) & np.isfinite(diff_v)
+            if np.count_nonzero(valid) > 10:
+                su = float(np.median(diff_u[valid]))
+                sv = float(np.median(diff_v[valid]))
+                spd_ms = np.sqrt(su**2 + sv**2)
+                if spd_ms > 0.1:  # sanity check: at least ~0.2 kt
+                    spd_kt = round(float(spd_ms * 1.94384), 1)
+                    math_angle = np.degrees(np.arctan2(sv, su))
+                    met_heading = (90.0 - math_angle) % 360.0
+                    return round(float(met_heading), 0), spd_kt
+    except Exception:
+        pass
 
     return None, None
 
