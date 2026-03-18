@@ -993,6 +993,7 @@ def get_rt_volume(
     variable:      str   = Query(DEFAULT_RT_VARIABLE,              description="Variable name"),
     stride:        int   = Query(2,                ge=1, le=5,     description="Spatial subsampling stride"),
     max_height_km: float = Query(15.0,             ge=1, le=18,   description="Maximum height (km)"),
+    tilt_profile:  bool  = Query(False,                            description="Include WCM vortex tilt profile"),
 ):
     """Return the full 3D volume for Plotly isosurface rendering (compact mode)."""
     if variable not in RT_VARIABLES and variable not in RT_DERIVED:
@@ -1029,7 +1030,7 @@ def get_rt_volume(
 
     case_meta = _build_case_meta(ds)
 
-    return JSONResponse({
+    result = {
         "value": v_flat.tolist(),
         "sentinel": SENTINEL,
         "grid_shape": [nz, ny, nx],
@@ -1038,7 +1039,17 @@ def get_rt_volume(
         "z_axis": np.round(height_sub, 2).tolist(),
         "variable": var_info,
         "case_meta": case_meta,
-    })
+    }
+
+    if tilt_profile:
+        try:
+            tilt = _compute_rt_tilt_profile(ds)
+            if tilt:
+                result["tilt_profile"] = tilt
+        except Exception:
+            pass
+
+    return JSONResponse(result)
 
 
 # ---------------------------------------------------------------------------
@@ -3445,3 +3456,352 @@ def get_rt_vortex_raw(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error computing vortex metrics: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# WCM Center Finding & Tilt Profile (km-space version)
+# ---------------------------------------------------------------------------
+
+def _wcm_center_km(u_2d, v_2d, x_km, y_km,
+                    num_sectors=24, spad=6, num_iterations=4,
+                    first_guess_xy=None):
+    """
+    Weighted Circulation Maximisation (WCM) centre-finding in storm-centred
+    km-space.  This is a streamlined adaptation of the original lat/lon WCM
+    by M. Fischer (2023) that exploits the regular Cartesian grid to avoid
+    all haversine / bearing calculations.
+
+    Parameters
+    ----------
+    u_2d : ndarray (ny, nx)   — storm-relative eastward wind (m/s)
+    v_2d : ndarray (ny, nx)   — storm-relative northward wind (m/s)
+    x_km : 1D array           — eastward distance from initial centre (km)
+    y_km : 1D array           — northward distance from initial centre (km)
+    num_sectors : int          — azimuthal sectors for mean-error calc
+    spad : int                 — search-pad in grid points around current guess
+    num_iterations : int       — max refinement iterations
+    first_guess_xy : (ix, iy) or None — grid-index first guess; uses smoothed
+                      vorticity maximum when None.
+
+    Returns
+    -------
+    dict with keys: center_x_km, center_y_km, center_ix, center_iy,
+                    rmw_km, vt_max_ms, data_coverage, converged
+    """
+    ny, nx = u_2d.shape
+    xx, yy = np.meshgrid(x_km, y_km)          # (ny, nx) grids
+
+    ws = np.sqrt(u_2d**2 + v_2d**2)
+    wind_angle = np.arctan2(v_2d, u_2d)        # radians, math convention
+    data_mask = np.isfinite(ws)
+
+    # Angle sector boundaries
+    angle_thresh = np.linspace(-np.pi, np.pi, num_sectors + 1)
+
+    # Search / weighting radii (km)
+    search_radius  = 150.0
+    core_sigma     = 50.0
+    coverage_r     = 100.0
+    coverage_r_inn = 50.0
+    min_data_frac  = 0.02
+    min_wt         = 1e-6
+
+    # ── First guess ──────────────────────────────────────────────
+    if first_guess_xy is not None:
+        pnxi, pnyi = first_guess_xy
+    else:
+        # Smoothed vorticity maximum
+        dx_m = float(np.abs(x_km[1] - x_km[0])) * 1000.0 if len(x_km) > 1 else 2000.0
+        dy_m = float(np.abs(y_km[1] - y_km[0])) * 1000.0 if len(y_km) > 1 else 2000.0
+        dvdx = np.gradient(v_2d, dx_m, axis=1)
+        dudy = np.gradient(u_2d, dy_m, axis=0)
+        relvort = dvdx - dudy
+
+        ksize = 21
+        kernel = np.ones((ksize, ksize)) / (ksize * ksize)
+        mask_f = np.isfinite(relvort)
+        rv_filled = np.where(mask_f, relvort, 0.0)
+        from scipy.ndimage import convolve
+        sm_data = convolve(rv_filled, kernel, mode='reflect')
+        sm_wt   = convolve(mask_f.astype(float), kernel, mode='reflect')
+        smooth_vort = np.where(sm_wt >= 0.25, sm_data / sm_wt, np.nan)
+
+        mx = np.nanmax(smooth_vort)
+        if mx > 0:
+            loc = np.unravel_index(np.nanargmax(smooth_vort), smooth_vort.shape)
+            pnyi, pnxi = int(loc[0]), int(loc[1])
+        else:
+            pnyi, pnxi = ny // 2, nx // 2
+
+    # ── Pre-allocate ─────────────────────────────────────────────
+    sector_mean_err = np.full((num_sectors, ny, nx), np.nan, dtype=np.float32)
+    prev_best = np.inf
+    yloc = xloc = np.nan
+    best_cov = np.nan
+
+    # ── Iterate ──────────────────────────────────────────────────
+    for it in range(num_iterations):
+        if it >= 1:
+            if prev_best < np.inf:
+                pnyi, pnxi = int(yloc), int(xloc)
+            else:
+                break
+
+        ry = np.arange(max(0, pnyi - spad), min(ny, pnyi + spad + 1))
+        rx = np.arange(max(0, pnxi - spad), min(nx, pnxi + spad + 1))
+
+        for yi in ry:
+            for xi in rx:
+                if it >= 1 and np.isfinite(np.nanmean(sector_mean_err[:, yi, xi])):
+                    continue
+
+                dx_grid = xx - x_km[xi]
+                dy_grid = yy - y_km[yi]
+                dist = np.sqrt(dx_grid**2 + dy_grid**2)
+                angle = np.arctan2(dy_grid, dx_grid)
+
+                # Gaussian distance weight
+                wt_dist = np.where(data_mask,
+                                   np.exp(-0.5 * (dist / core_sigma)**2),
+                                   np.nan)
+                wt_dist = np.maximum(wt_dist, min_wt)
+                wt_dist /= np.nanmean(wt_dist)
+
+                wt_wind = np.sqrt(ws + 1.0)
+                weight = wt_dist * wt_wind
+
+                # Ideal tangential angle (90° CCW of radial)
+                ideal = angle + np.pi / 2.0
+                ideal = np.where(ideal > np.pi, ideal - 2.0 * np.pi, ideal)
+
+                adiff = wind_angle - ideal
+                # Wrap to [-π, π]
+                adiff = (adiff + np.pi) % (2.0 * np.pi) - np.pi
+
+                wdiff = weight * adiff
+                wdiff = np.where(dist <= search_radius, wdiff, np.nan)
+
+                # Coverage check
+                c_mask = dist <= coverage_r
+                ci_mask = dist <= coverage_r_inn
+                nf = np.count_nonzero(np.isfinite(wdiff) & c_mask)
+                nt = max(np.count_nonzero(c_mask), 1)
+                nfi = np.count_nonzero(np.isfinite(wdiff) & ci_mask)
+                nti = max(np.count_nonzero(ci_mask), 1)
+                if nf / nt < min_data_frac:
+                    continue
+
+                # Sector mean absolute error
+                for si in range(num_sectors):
+                    smask = (angle >= angle_thresh[si]) & (angle < angle_thresh[si + 1])
+                    vals = wdiff[smask]
+                    if vals.size > 0:
+                        sector_mean_err[si, yi, xi] = np.nanmean(np.abs(vals))
+
+                curr = float(np.nanmean(sector_mean_err[:, yi, xi]))
+                if curr < prev_best:
+                    prev_best = curr
+                    yloc, xloc = yi, xi
+                    best_cov = min(nf / nt, nfi / nti)
+
+        # Convergence check
+        if it >= 1 and yloc == pnyi and xloc == pnxi:
+            break
+
+    # ── RMW from converged centre ────────────────────────────────
+    rmw_km = np.nan
+    vt_max = np.nan
+    cx_km = cy_km = np.nan
+    converged = not (np.isnan(yloc) or np.isnan(xloc))
+    if converged:
+        yi_c, xi_c = int(yloc), int(xloc)
+        cx_km = float(x_km[xi_c])
+        cy_km = float(y_km[yi_c])
+
+        dx_g = xx - cx_km
+        dy_g = yy - cy_km
+        dist_c = np.sqrt(dx_g**2 + dy_g**2)
+        ang_c  = np.arctan2(dy_g, dx_g)
+        vt = -u_2d * np.sin(ang_c) + v_2d * np.cos(ang_c)
+
+        dr = 2.0
+        radii = np.arange(2.0, 176.0, dr)
+        vt_ann = np.full(len(radii), np.nan)
+        for ri, r in enumerate(radii):
+            amask = (dist_c >= r - 0.5 * dr) & (dist_c < r + 0.5 * dr)
+            if np.any(amask):
+                vt_ann[ri] = np.nanmean(vt[amask])
+        vt_max = float(np.nanmax(vt_ann)) if np.any(np.isfinite(vt_ann)) else np.nan
+        try:
+            rmw_km = float(radii[np.nanargmax(vt_ann)])
+        except (ValueError, IndexError):
+            rmw_km = np.nan
+
+    return {
+        "center_x_km": round(cx_km, 2) if np.isfinite(cx_km) else None,
+        "center_y_km": round(cy_km, 2) if np.isfinite(cy_km) else None,
+        "center_ix": int(xloc) if converged else None,
+        "center_iy": int(yloc) if converged else None,
+        "rmw_km": round(rmw_km, 1) if np.isfinite(rmw_km) else None,
+        "vt_max_ms": round(vt_max, 2) if np.isfinite(vt_max) else None,
+        "data_coverage": round(best_cov, 3) if np.isfinite(best_cov) else None,
+        "converged": converged,
+    }
+
+
+def _compute_rt_tilt_profile(ds, min_height=0.5, max_height=8.0, ref_height=2.0):
+    """
+    Compute vortex tilt profile for a real-time TDR file by running the WCM
+    center finder at every analysis height in parallel.
+
+    Returns the same dict structure as the archive _compute_tilt_profile():
+    {x_km, y_km, height_km, tilt_magnitude_km, ref_height_km, rmw_km, method}
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    levels = _get_level_axis(ds)
+    x_km, y_km = _get_xy_coords(ds)
+
+    # ── Storm-motion correction ──────────────────────────────────
+    # U and V in real-time TDR files are earth-relative.  The WCM
+    # needs storm-relative wind, so subtract the storm motion vector.
+    attrs = ds.attrs if hasattr(ds, "attrs") else {}
+    storm_u = float(attrs.get("EASTWARD STORM MOTION (METERS PER SECOND)", -999))
+    storm_v = float(attrs.get("NORTHWARD STORM MOTION (METERS PER SECOND)", -999))
+    has_motion = (storm_u != -999 and storm_v != -999
+                  and not np.isnan(storm_u) and not np.isnan(storm_v))
+
+    # Select heights in range
+    mask = (levels >= min_height - 0.01) & (levels <= max_height + 0.01)
+    sel_levels = levels[mask]
+    if len(sel_levels) == 0:
+        return None
+
+    # Extract U, V at each selected height and convert to storm-relative.
+    # .transpose("y", "x") guarantees (ny, nx) dimension order regardless
+    # of the native file ordering (which may be (x, y)).
+    uv_slices = {}
+    for lev in sel_levels:
+        z_idx = int(np.argmin(np.abs(levels - lev)))
+        try:
+            u_er = ds["U"].isel(time=0, level=z_idx).transpose("y", "x").values
+            v_er = ds["V"].isel(time=0, level=z_idx).transpose("y", "x").values
+            if has_motion:
+                u_sr = u_er - storm_u     # earth-relative → storm-relative
+                v_sr = v_er - storm_v
+            else:
+                u_sr, v_sr = u_er, v_er   # best effort if motion unavailable
+            uv_slices[float(lev)] = (u_sr, v_sr)
+        except Exception:
+            pass
+
+    if not uv_slices:
+        return None
+
+    # Find centre at reference height first (provides first-guess for others)
+    ref_lev = float(sel_levels[np.argmin(np.abs(sel_levels - ref_height))])
+    if ref_lev not in uv_slices:
+        ref_lev = list(uv_slices.keys())[0]
+
+    u_ref, v_ref = uv_slices[ref_lev]
+    ref_result = _wcm_center_km(u_ref, v_ref, x_km, y_km,
+                                 num_sectors=24, spad=6, num_iterations=5)
+    if not ref_result["converged"]:
+        # Fall back to grid centre
+        ref_result["center_ix"] = len(x_km) // 2
+        ref_result["center_iy"] = len(y_km) // 2
+
+    ref_guess = (ref_result["center_ix"], ref_result["center_iy"])
+
+    # Run WCM at all heights in parallel, using ref centre as first guess
+    def _solve_level(lev):
+        u, v = uv_slices[lev]
+        res = _wcm_center_km(u, v, x_km, y_km,
+                              num_sectors=24, spad=8, num_iterations=4,
+                              first_guess_xy=ref_guess)
+        return lev, res
+
+    results = {}
+    sorted_levels = sorted(uv_slices.keys())
+    n_workers = min(len(sorted_levels), 8)
+
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_solve_level, lev): lev for lev in sorted_levels}
+        for fut in as_completed(futures):
+            try:
+                lev, res = fut.result()
+                results[lev] = res
+            except Exception:
+                pass
+
+    if not results:
+        return None
+
+    # Build profile relative to reference level
+    ref_cx = ref_result["center_x_km"] or 0.0
+    ref_cy = ref_result["center_y_km"] or 0.0
+
+    x_out, y_out, h_out, mag_out, rmw_out = [], [], [], [], []
+    for lev in sorted_levels:
+        r = results.get(lev)
+        if r is None or not r["converged"]:
+            continue
+        cx = r["center_x_km"] or 0.0
+        cy = r["center_y_km"] or 0.0
+        dx = cx - ref_cx
+        dy = cy - ref_cy
+        x_out.append(round(dx, 2))
+        y_out.append(round(dy, 2))
+        h_out.append(round(lev, 2))
+        mag_out.append(round(np.sqrt(dx**2 + dy**2), 2))
+        rmw_out.append(round(r["rmw_km"], 1) if r["rmw_km"] is not None else None)
+
+    if len(h_out) < 2:
+        return None
+
+    return {
+        "x_km": x_out,
+        "y_km": y_out,
+        "height_km": h_out,
+        "tilt_magnitude_km": mag_out,
+        "ref_height_km": round(ref_lev, 2),
+        "rmw_km": rmw_out,
+        "method": "wcm_realtime",
+        "ref_center_x_km": round(ref_cx, 2),
+        "ref_center_y_km": round(ref_cy, 2),
+        "storm_motion_corrected": has_motion,
+    }
+
+
+@router.get("/tilt_profile")
+def get_rt_tilt_profile(
+    file_url:    str   = Query(...,            description="Full URL to the xy.nc(.gz) file"),
+    min_height:  float = Query(0.5, ge=0, le=8, description="Minimum height (km)"),
+    max_height:  float = Query(8.0, ge=1, le=18, description="Maximum height (km)"),
+    ref_height:  float = Query(2.0, ge=0, le=10, description="Reference height for tilt origin (km)"),
+):
+    """
+    Compute WCM vortex centre at every analysis height and return the tilt
+    profile (centre displacement relative to the reference height).
+
+    Uses parallel ThreadPoolExecutor for each height level.
+    """
+    try:
+        ds = _open_rt_dataset(file_url)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not open file: {str(e)}")
+
+    t0 = time.time()
+    try:
+        tilt = _compute_rt_tilt_profile(ds, min_height, max_height, ref_height)
+    except Exception as e:
+        raise HTTPException(status_code=500,
+                            detail=f"Error computing tilt profile: {str(e)}")
+    elapsed = time.time() - t0
+
+    if tilt is None:
+        raise HTTPException(status_code=400,
+                            detail="Could not compute tilt — insufficient data.")
+
+    tilt["compute_time_s"] = round(elapsed, 2)
+    return JSONResponse(tilt)
