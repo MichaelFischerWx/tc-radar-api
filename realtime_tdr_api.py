@@ -2629,6 +2629,7 @@ def _parse_ships_text(text: str) -> dict:
         'POT. INT. (KT)': 'pot_int_kt',
         '700-500 MB RH': 'rhmd',
         'STM SPEED (KT)': 'stm_speed_kt',
+        'STM HEADING': 'stm_heading_deg',
         '200 MB DIV': '200mb_div',
         'HEAT CONTENT': 'heat_content',
         'LAT (DEG N)': 'lat',
