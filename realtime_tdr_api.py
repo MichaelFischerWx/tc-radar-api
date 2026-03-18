@@ -390,9 +390,9 @@ def _extract_2d(ds, variable: str, level_km: float):
         # Use xarray named transpose — safe regardless of file dim order
         data = ds[variable].isel(time=0, level=z_idx).transpose("y", "x").values
 
-    # Unit conversion: real-time xy.nc stores VORT in 10⁻⁴ s⁻¹ → convert to s⁻¹
+    # Unit conversion: real-time xy.nc stores VORT in 10⁻³ s⁻¹ (.001/seconds) → s⁻¹
     if variable == "VORT":
-        data = data * 1e-4
+        data = data * 1e-3
 
     return data, actual_level
 
@@ -505,10 +505,10 @@ def _extract_3d(ds, variable: str, max_height_km: float = 18.0):
         # Use xarray named transpose — safe regardless of file dim order.
         vol = ds[variable].isel(time=0).transpose("level", "y", "x").values
 
-    # Unit conversion: real-time xy.nc files store VORT in 10⁻⁴ s⁻¹,
-    # but the archive (and display colour ranges) expect s⁻¹.
+    # Unit conversion: real-time xy.nc files store VORT in 10⁻³ s⁻¹
+    # (.001/seconds per the file metadata), but the archive expects s⁻¹.
     if variable == "VORT":
-        vol = vol * 1e-4
+        vol = vol * 1e-3
 
     # Trim to max height
     n_h = int(h_mask.sum())
