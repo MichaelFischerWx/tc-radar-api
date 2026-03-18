@@ -1203,6 +1203,7 @@ def get_volume(
     stride:     int   = Query(2,                ge=1, le=5,    description="Spatial subsampling stride (2 = half res)"),
     max_height_km: float = Query(15.0,          ge=1, le=18,   description="Maximum height to include (km)"),
     compact:    bool  = Query(False,                            description="If true, send 1D axis vectors instead of flattened meshgrid"),
+    tilt_profile: bool = Query(False,                           description="Include vortex tilt profile (center at each height)"),
 ):
     """
     Return the full 3D volume as flattened arrays for Plotly isosurface rendering.
@@ -1316,6 +1317,15 @@ def get_volume(
         result["x"] = np.round(X.ravel(), 2).tolist()
         result["y"] = np.round(Y.ravel(), 2).tolist()
         result["z"] = np.round(Z.ravel(), 2).tolist()
+
+    # Optional vortex tilt profile
+    if tilt_profile:
+        try:
+            tilt_data = _compute_tilt_profile(ds, local_idx, data_type)
+            if tilt_data:
+                result["tilt_profile"] = tilt_data
+        except Exception:
+            pass
 
     return JSONResponse(result)
 
@@ -3117,8 +3127,9 @@ def composite_azimuthal_mean(
     variable:      str   = Query(DEFAULT_VARIABLE,       description="Variable key"),
     overlay:       str   = Query("",                     description="Optional overlay variable key"),
     data_type:     str   = Query("swath",                description="'swath' or 'merge'"),
-    max_r_rmw:     float = Query(8.0,   ge=1, le=20,    description="Max radius in R/RMW"),
-    dr_rmw:        float = Query(0.25,  ge=0.05, le=2,  description="Radial bin width in R/RMW"),
+    normalize_rmw: bool  = Query(True,                   description="Normalise radii by RMW"),
+    max_r_rmw:     float = Query(8.0,   ge=1, le=20,    description="Max radius in R/RMW (or km when normalize_rmw=false)"),
+    dr_rmw:        float = Query(0.25,  ge=0.05, le=2,  description="Radial bin width in R/RMW (or km when normalize_rmw=false)"),
     coverage_min:  float = Query(0.25,  ge=0.0, le=1.0),
     stream:        bool  = Query(False,                  description="Stream NDJSON progress events"),
     min_intensity:  float = Query(0),    max_intensity:  float = Query(200),
@@ -3129,7 +3140,7 @@ def composite_azimuthal_mean(
     min_shear_dir:  float = Query(0),    max_shear_dir:  float = Query(360),
     min_dtl:        float = Query(0),    dtl_window:     str   = Query("24h"),
 ):
-    """Compute RMW-normalised composite azimuthal mean across matching cases."""
+    """Compute composite azimuthal mean across matching cases, optionally RMW-normalised."""
     if variable not in VARIABLES:
         raise HTTPException(status_code=400, detail=f"Unknown variable '{variable}'.")
     if overlay and overlay not in VARIABLES:
@@ -3150,14 +3161,18 @@ def composite_azimuthal_mean(
     if len(matching) > _COMPOSITE_MAX_CASES:
         matching = matching[:_COMPOSITE_MAX_CASES]
 
-    # Filter to cases with valid RMW
-    cases_with_rmw = []
-    for ci in matching:
-        rmw = meta_cache.get(ci, {}).get("rmw_km")
-        if rmw is not None and not np.isnan(float(rmw)) and float(rmw) > 0:
-            cases_with_rmw.append((ci, float(rmw)))
-    if not cases_with_rmw:
-        raise HTTPException(status_code=400, detail="No matching cases have valid RMW data.")
+    # Filter to cases with valid RMW (only required when normalising)
+    if normalize_rmw:
+        cases_with_rmw = []
+        for ci in matching:
+            rmw = meta_cache.get(ci, {}).get("rmw_km")
+            if rmw is not None and not np.isnan(float(rmw)) and float(rmw) > 0:
+                cases_with_rmw.append((ci, float(rmw)))
+        if not cases_with_rmw:
+            raise HTTPException(status_code=400, detail="No matching cases have valid RMW data.")
+    else:
+        # Physical-distance mode: include all matched cases (rmw=None → km bins)
+        cases_with_rmw = [(ci, None) for ci in matching]
 
     display_name, varname, cmap, units, vmin, vmax = VARIABLES[variable]
     ref_varname = DERIVED_VARIABLES[variable][0] if variable in DERIVED_VARIABLES else varname
@@ -3220,7 +3235,7 @@ def composite_azimuthal_mean(
             "azimuthal_mean": _clean_2d(composite),
             "radius_rrmw": [round(float(r), 3) for r in r_centers],
             "height_km": [round(float(h), 2) for h in height_km],
-            "normalized": True,
+            "normalized": normalize_rmw,
             "coverage_min": coverage_min,
             "min_cases_per_bin": min_cases,
             "n_cases": n_processed,
