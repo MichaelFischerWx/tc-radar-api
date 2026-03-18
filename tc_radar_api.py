@@ -1378,12 +1378,17 @@ def _get_storm_motion(ds, local_idx):
     """
     Extract TC motion direction (met heading, deg) and speed (kt) from the dataset.
 
-    Tries per-case variables storm_u_ms / storm_v_ms first (eastward / northward
-    components in m/s), then falls back to global attrs.  Returns (direction, speed)
-    in meteorological heading (0=N, 90=E) and knots, or (None, None) if unavailable.
+    Tries (in order):
+      1. Per-case variables storm_u_ms / storm_v_ms (U/V in m/s)
+      2. SHIPS storm speed/heading variables (spd_ships / dir_ships at t=0)
+      3. Global attrs (single-case files)
+
+    Returns (direction, speed) as meteorological heading (0=N, 90=E) and knots,
+    or (None, None) if unavailable.
     """
     storm_u, storm_v = None, None
-    # Per-case variables (archive Zarr stores)
+
+    # ── Method 1: per-case U/V variables (m/s) ──────────────────
     for u_key in ("storm_u_ms", "storm_motion_east_ms"):
         if u_key in ds:
             try:
@@ -1402,26 +1407,37 @@ def _get_storm_motion(ds, local_idx):
                     break
             except Exception:
                 pass
-    # Fallback: global attrs (older single-case files)
-    if storm_u is None and hasattr(ds, "attrs"):
+    if storm_u is not None and storm_v is not None:
+        spd_ms = np.sqrt(storm_u**2 + storm_v**2)
+        spd_kt = round(float(spd_ms * 1.94384), 1)
+        math_angle = np.degrees(np.arctan2(storm_v, storm_u))
+        met_heading = (90.0 - math_angle) % 360.0
+        return round(float(met_heading), 0), spd_kt
+
+    # ── Method 2: SHIPS storm speed & heading at t=0 ────────────
+    # spd_ships = storm speed (kt), dir_ships = heading TC is MOVING TOWARD (met deg)
+    spd_ships = _get_ships_value(ds, local_idx, "spd_ships")
+    dir_ships = _get_ships_value(ds, local_idx, "dir_ships")
+    if spd_ships is not None and dir_ships is not None and spd_ships > 0:
+        return round(float(dir_ships), 0), round(float(spd_ships), 1)
+
+    # ── Method 3: global attrs (single-case files) ──────────────
+    if hasattr(ds, "attrs"):
         try:
             su = float(ds.attrs.get("EASTWARD STORM MOTION (METERS PER SECOND)",
                        ds.attrs.get("storm_motion_east_ms", -999)))
             sv = float(ds.attrs.get("NORTHWARD STORM MOTION (METERS PER SECOND)",
                        ds.attrs.get("storm_motion_north_ms", -999)))
             if su != -999 and sv != -999 and not np.isnan(su) and not np.isnan(sv):
-                storm_u, storm_v = su, sv
+                spd_ms = np.sqrt(su**2 + sv**2)
+                spd_kt = round(float(spd_ms * 1.94384), 1)
+                math_angle = np.degrees(np.arctan2(sv, su))
+                met_heading = (90.0 - math_angle) % 360.0
+                return round(float(met_heading), 0), spd_kt
         except Exception:
             pass
-    if storm_u is None or storm_v is None:
-        return None, None
-    # Compute speed (m/s → kt) and meteorological heading
-    spd_ms = np.sqrt(storm_u**2 + storm_v**2)
-    spd_kt = round(float(spd_ms * 1.94384), 1)  # m/s → kt
-    # Math angle (CCW from east) → met heading (CW from north)
-    math_angle = np.degrees(np.arctan2(storm_v, storm_u))
-    met_heading = (90.0 - math_angle) % 360.0
-    return round(float(met_heading), 0), spd_kt
+
+    return None, None
 
 
 def _get_ships_value_at_lag(ds, local_idx, varname, lag_idx):
