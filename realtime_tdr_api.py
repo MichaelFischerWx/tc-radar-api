@@ -3484,60 +3484,28 @@ def get_rt_vortex_raw(
 # ---------------------------------------------------------------------------
 
 def _wcm_center_km(u_2d, v_2d, x_km, y_km,
-                    num_sectors=24, spad=6, num_iterations=4,
+                    num_sectors=12, spad=6, num_iterations=3,
                     first_guess_xy=None):
     """
     Weighted Circulation Maximisation (WCM) centre-finding in storm-centred
-    km-space.  This is a streamlined adaptation of the original lat/lon WCM
-    by M. Fischer (2023) that exploits the regular Cartesian grid to avoid
-    all haversine / bearing calculations.
+    km-space.  Optimised version: crops data to a ~200 km region around the
+    first guess to avoid full-grid operations on every candidate.
 
-    Parameters
-    ----------
-    u_2d : ndarray (ny, nx)   — storm-relative eastward wind (m/s)
-    v_2d : ndarray (ny, nx)   — storm-relative northward wind (m/s)
-    x_km : 1D array           — eastward distance from initial centre (km)
-    y_km : 1D array           — northward distance from initial centre (km)
-    num_sectors : int          — azimuthal sectors for mean-error calc
-    spad : int                 — search-pad in grid points around current guess
-    num_iterations : int       — max refinement iterations
-    first_guess_xy : (ix, iy) or None — grid-index first guess; uses smoothed
-                      vorticity maximum when None.
-
-    Returns
-    -------
-    dict with keys: center_x_km, center_y_km, center_ix, center_iy,
-                    rmw_km, vt_max_ms, data_coverage, converged
+    Returns dict with center_x_km, center_y_km, center_ix, center_iy,
+    rmw_km, vt_max_ms, data_coverage, converged.
     """
     ny, nx = u_2d.shape
-    xx, yy = np.meshgrid(x_km, y_km)          # (ny, nx) grids
-
-    ws = np.sqrt(u_2d**2 + v_2d**2)
-    wind_angle = np.arctan2(v_2d, u_2d)        # radians, math convention
-    data_mask = np.isfinite(ws)
-
-    # Angle sector boundaries
-    angle_thresh = np.linspace(-np.pi, np.pi, num_sectors + 1)
-
-    # Search / weighting radii (km)
-    search_radius  = 150.0
-    core_sigma     = 50.0
-    coverage_r     = 100.0
-    coverage_r_inn = 50.0
-    min_data_frac  = 0.02
-    min_wt         = 1e-6
+    dx_km = float(np.abs(x_km[1] - x_km[0])) if len(x_km) > 1 else 2.0
 
     # ── First guess ──────────────────────────────────────────────
     if first_guess_xy is not None:
         pnxi, pnyi = first_guess_xy
     else:
-        # Smoothed vorticity maximum
-        dx_m = float(np.abs(x_km[1] - x_km[0])) * 1000.0 if len(x_km) > 1 else 2000.0
+        dx_m = dx_km * 1000.0
         dy_m = float(np.abs(y_km[1] - y_km[0])) * 1000.0 if len(y_km) > 1 else 2000.0
         dvdx = np.gradient(v_2d, dx_m, axis=1)
         dudy = np.gradient(u_2d, dy_m, axis=0)
         relvort = dvdx - dudy
-
         ksize = 21
         kernel = np.ones((ksize, ksize)) / (ksize * ksize)
         mask_f = np.isfinite(relvort)
@@ -3546,7 +3514,6 @@ def _wcm_center_km(u_2d, v_2d, x_km, y_km,
         sm_data = convolve(rv_filled, kernel, mode='reflect')
         sm_wt   = convolve(mask_f.astype(float), kernel, mode='reflect')
         smooth_vort = np.where(sm_wt >= 0.25, sm_data / sm_wt, np.nan)
-
         mx = np.nanmax(smooth_vort)
         if mx > 0:
             loc = np.unravel_index(np.nanargmax(smooth_vort), smooth_vort.shape)
@@ -3554,96 +3521,132 @@ def _wcm_center_km(u_2d, v_2d, x_km, y_km,
         else:
             pnyi, pnxi = ny // 2, nx // 2
 
-    # ── Pre-allocate ─────────────────────────────────────────────
-    sector_mean_err = np.full((num_sectors, ny, nx), np.nan, dtype=np.float32)
+    # ── Crop to ~200 km region around first guess for speed ──────
+    crop_pad = int(np.ceil(200.0 / dx_km))  # ~100 grid points at 2 km res
+    y0 = max(0, pnyi - crop_pad)
+    y1 = min(ny, pnyi + crop_pad + 1)
+    x0 = max(0, pnxi - crop_pad)
+    x1 = min(nx, pnxi + crop_pad + 1)
+
+    u_c = u_2d[y0:y1, x0:x1]
+    v_c = v_2d[y0:y1, x0:x1]
+    x_c = x_km[x0:x1]
+    y_c = y_km[y0:y1]
+    xx_c, yy_c = np.meshgrid(x_c, y_c)
+    ws_c = np.sqrt(u_c**2 + v_c**2)
+    wind_angle_c = np.arctan2(v_c, u_c)
+    data_mask_c = np.isfinite(ws_c)
+    wt_wind_c = np.sqrt(ws_c + 1.0)  # pre-compute once
+
+    cny, cnx = u_c.shape
+
+    # Adjust first-guess indices into cropped frame
+    pnyi_c = pnyi - y0
+    pnxi_c = pnxi - x0
+
+    # Search / weighting constants
+    angle_thresh = np.linspace(-np.pi, np.pi, num_sectors + 1)
+    search_radius = 150.0
+    core_sigma = 50.0
+    coverage_r = 100.0
+    coverage_r_inn = 50.0
+    min_data_frac = 0.02
+    min_wt = 1e-6
+
     prev_best = np.inf
-    yloc = xloc = np.nan
+    yloc_c = xloc_c = np.nan
     best_cov = np.nan
+    # Track evaluated errors per candidate (sparse dict instead of full array)
+    evaluated = {}
 
     # ── Iterate ──────────────────────────────────────────────────
     for it in range(num_iterations):
         if it >= 1:
             if prev_best < np.inf:
-                pnyi, pnxi = int(yloc), int(xloc)
+                pnyi_c, pnxi_c = int(yloc_c), int(xloc_c)
             else:
                 break
 
-        ry = np.arange(max(0, pnyi - spad), min(ny, pnyi + spad + 1))
-        rx = np.arange(max(0, pnxi - spad), min(nx, pnxi + spad + 1))
+        ry = range(max(0, pnyi_c - spad), min(cny, pnyi_c + spad + 1))
+        rx = range(max(0, pnxi_c - spad), min(cnx, pnxi_c + spad + 1))
 
         for yi in ry:
             for xi in rx:
-                if it >= 1 and np.isfinite(np.nanmean(sector_mean_err[:, yi, xi])):
+                if (yi, xi) in evaluated:
                     continue
 
-                dx_grid = xx - x_km[xi]
-                dy_grid = yy - y_km[yi]
+                dx_grid = xx_c - x_c[xi]
+                dy_grid = yy_c - y_c[yi]
                 dist = np.sqrt(dx_grid**2 + dy_grid**2)
+
+                # Quick coverage check before expensive ops
+                c_mask = dist <= coverage_r
+                nf_quick = np.count_nonzero(data_mask_c & c_mask)
+                nt_quick = max(np.count_nonzero(c_mask), 1)
+                if nf_quick / nt_quick < min_data_frac:
+                    evaluated[(yi, xi)] = np.inf
+                    continue
+
                 angle = np.arctan2(dy_grid, dx_grid)
 
-                # Gaussian distance weight
-                wt_dist = np.where(data_mask,
+                wt_dist = np.where(data_mask_c,
                                    np.exp(-0.5 * (dist / core_sigma)**2),
                                    np.nan)
                 wt_dist = np.maximum(wt_dist, min_wt)
-                wt_dist /= np.nanmean(wt_dist)
+                wt_dist_mean = np.nanmean(wt_dist)
+                if wt_dist_mean > 0:
+                    wt_dist /= wt_dist_mean
 
-                wt_wind = np.sqrt(ws + 1.0)
-                weight = wt_dist * wt_wind
+                weight = wt_dist * wt_wind_c
 
-                # Ideal tangential angle (90° CCW of radial)
                 ideal = angle + np.pi / 2.0
                 ideal = np.where(ideal > np.pi, ideal - 2.0 * np.pi, ideal)
+                adiff = (wind_angle_c - ideal + np.pi) % (2.0 * np.pi) - np.pi
+                wdiff = np.where(dist <= search_radius, weight * adiff, np.nan)
 
-                adiff = wind_angle - ideal
-                # Wrap to [-π, π]
-                adiff = (adiff + np.pi) % (2.0 * np.pi) - np.pi
-
-                wdiff = weight * adiff
-                wdiff = np.where(dist <= search_radius, wdiff, np.nan)
-
-                # Coverage check
-                c_mask = dist <= coverage_r
+                # Full coverage check
                 ci_mask = dist <= coverage_r_inn
                 nf = np.count_nonzero(np.isfinite(wdiff) & c_mask)
                 nt = max(np.count_nonzero(c_mask), 1)
                 nfi = np.count_nonzero(np.isfinite(wdiff) & ci_mask)
                 nti = max(np.count_nonzero(ci_mask), 1)
-                if nf / nt < min_data_frac:
-                    continue
 
                 # Sector mean absolute error
+                sector_errs = np.empty(num_sectors)
+                sector_errs[:] = np.nan
                 for si in range(num_sectors):
                     smask = (angle >= angle_thresh[si]) & (angle < angle_thresh[si + 1])
                     vals = wdiff[smask]
                     if vals.size > 0:
-                        sector_mean_err[si, yi, xi] = np.nanmean(np.abs(vals))
+                        sector_errs[si] = np.nanmean(np.abs(vals))
 
-                curr = float(np.nanmean(sector_mean_err[:, yi, xi]))
+                curr = float(np.nanmean(sector_errs))
+                evaluated[(yi, xi)] = curr
+
                 if curr < prev_best:
                     prev_best = curr
-                    yloc, xloc = yi, xi
+                    yloc_c, xloc_c = yi, xi
                     best_cov = min(nf / nt, nfi / nti)
 
         # Convergence check
-        if it >= 1 and yloc == pnyi and xloc == pnxi:
+        if it >= 1 and yloc_c == pnyi_c and xloc_c == pnxi_c:
             break
 
     # ── RMW from converged centre ────────────────────────────────
     rmw_km = np.nan
     vt_max = np.nan
     cx_km = cy_km = np.nan
-    converged = not (np.isnan(yloc) or np.isnan(xloc))
+    converged = not (np.isnan(yloc_c) or np.isnan(xloc_c))
     if converged:
-        yi_c, xi_c = int(yloc), int(xloc)
-        cx_km = float(x_km[xi_c])
-        cy_km = float(y_km[yi_c])
+        yi_c, xi_c = int(yloc_c), int(xloc_c)
+        cx_km = float(x_c[xi_c])
+        cy_km = float(y_c[yi_c])
 
-        dx_g = xx - cx_km
-        dy_g = yy - cy_km
+        dx_g = xx_c - cx_km
+        dy_g = yy_c - cy_km
         dist_c = np.sqrt(dx_g**2 + dy_g**2)
         ang_c  = np.arctan2(dy_g, dx_g)
-        vt = -u_2d * np.sin(ang_c) + v_2d * np.cos(ang_c)
+        vt = -u_c * np.sin(ang_c) + v_c * np.cos(ang_c)
 
         dr = 2.0
         radii = np.arange(2.0, 176.0, dr)
@@ -3658,11 +3661,15 @@ def _wcm_center_km(u_2d, v_2d, x_km, y_km,
         except (ValueError, IndexError):
             rmw_km = np.nan
 
+    # Convert back to full-grid indices
+    full_ix = int(xloc_c) + x0 if converged else None
+    full_iy = int(yloc_c) + y0 if converged else None
+
     return {
         "center_x_km": round(cx_km, 2) if np.isfinite(cx_km) else None,
         "center_y_km": round(cy_km, 2) if np.isfinite(cy_km) else None,
-        "center_ix": int(xloc) if converged else None,
-        "center_iy": int(yloc) if converged else None,
+        "center_ix": full_ix,
+        "center_iy": full_iy,
         "rmw_km": round(rmw_km, 1) if np.isfinite(rmw_km) else None,
         "vt_max_ms": round(vt_max, 2) if np.isfinite(vt_max) else None,
         "data_coverage": round(best_cov, 3) if np.isfinite(best_cov) else None,
@@ -3726,7 +3733,7 @@ def _compute_rt_tilt_profile(ds, min_height=0.5, max_height=8.0, ref_height=2.0)
 
     u_ref, v_ref = uv_slices[ref_lev]
     ref_result = _wcm_center_km(u_ref, v_ref, x_km, y_km,
-                                 num_sectors=24, spad=6, num_iterations=5)
+                                 num_sectors=12, spad=6, num_iterations=3)
     if not ref_result["converged"]:
         # Fall back to grid centre
         ref_result["center_ix"] = len(x_km) // 2
@@ -3738,7 +3745,7 @@ def _compute_rt_tilt_profile(ds, min_height=0.5, max_height=8.0, ref_height=2.0)
     def _solve_level(lev):
         u, v = uv_slices[lev]
         res = _wcm_center_km(u, v, x_km, y_km,
-                              num_sectors=24, spad=8, num_iterations=4,
+                              num_sectors=12, spad=6, num_iterations=3,
                               first_guess_xy=ref_guess)
         return lev, res
 
