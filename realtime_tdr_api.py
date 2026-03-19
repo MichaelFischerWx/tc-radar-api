@@ -953,6 +953,8 @@ def get_rt_data(
         if c2["converged"]:
             result["wcm_rmw_km"] = c2["rmw_km"]
             result["wcm_vt_max_ms"] = c2["vt_max_ms"]
+            result["wcm_center_x_km"] = c2["center_x_km"]
+            result["wcm_center_y_km"] = c2["center_y_km"]
             # 2-to-6 km tilt
             c6 = _quick_center(6.0)
             if c6["converged"] and c2["center_x_km"] is not None and c6["center_x_km"] is not None:
