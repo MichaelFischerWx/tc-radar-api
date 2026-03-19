@@ -2293,6 +2293,7 @@ def _build_case_meta(case_index, ds=None, local_idx=None, data_type="swath"):
         "vmax_kt": case_meta.get("vmax_kt"),
         "rmw_km": case_meta.get("rmw_km"),
         "mission_id": case_meta.get("mission_id", ""),
+        "tilt_magnitude_km": case_meta.get("tilt_magnitude_km"),
     }
     if ds is not None and local_idx is not None:
         sddc = _get_sddc(ds, local_idx)

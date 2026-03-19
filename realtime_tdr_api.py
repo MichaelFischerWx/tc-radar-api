@@ -933,6 +933,35 @@ def get_rt_data(
         except Exception:
             pass
 
+    # Quick tilt + RMW: run WCM at 2 km and 6 km only (lightweight, ~0.5s)
+    try:
+        levels = _get_level_axis(ds)
+        attrs = ds.attrs if hasattr(ds, "attrs") else {}
+        _su = float(attrs.get("EASTWARD STORM MOTION (METERS PER SECOND)", -999))
+        _sv = float(attrs.get("NORTHWARD STORM MOTION (METERS PER SECOND)", -999))
+        _has_mot = (_su != -999 and _sv != -999 and not np.isnan(_su) and not np.isnan(_sv))
+
+        def _quick_center(target_km):
+            zi = int(np.argmin(np.abs(levels - target_km)))
+            u = ds["U"].isel(time=0, level=zi).transpose("y", "x").values
+            v = ds["V"].isel(time=0, level=zi).transpose("y", "x").values
+            if _has_mot:
+                u = u - _su; v = v - _sv
+            return _wcm_center_km(u, v, x_km, y_km, num_sectors=12, spad=6, num_iterations=3)
+
+        c2 = _quick_center(2.0)
+        if c2["converged"]:
+            result["wcm_rmw_km"] = c2["rmw_km"]
+            result["wcm_vt_max_ms"] = c2["vt_max_ms"]
+            # 2-to-6 km tilt
+            c6 = _quick_center(6.0)
+            if c6["converged"] and c2["center_x_km"] is not None and c6["center_x_km"] is not None:
+                dx = c6["center_x_km"] - c2["center_x_km"]
+                dy = c6["center_y_km"] - c2["center_y_km"]
+                result["tilt_2_6_km"] = round(np.sqrt(dx**2 + dy**2), 1)
+    except Exception:
+        pass
+
     return JSONResponse(result)
 
 
