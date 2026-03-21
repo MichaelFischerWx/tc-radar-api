@@ -1072,6 +1072,10 @@ def _regrid_swath(data: np.ndarray, lats: np.ndarray, lons: np.ndarray,
     """
     from scipy.interpolate import griddata
 
+    # Convert longitudes from 0–360 to -180/+180 if needed (TC-PRIMED uses 0–360)
+    lons = lons.copy()
+    lons[lons > 180] -= 360
+
     # Flatten
     mask = np.isfinite(data.ravel()) & np.isfinite(lats.ravel()) & np.isfinite(lons.ravel())
     flat_data = data.ravel()[mask]
