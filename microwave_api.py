@@ -564,74 +564,138 @@ async def get_microwave_data(
         raise HTTPException(400, f"Sensor {sensor} does not have 37 GHz channels")
 
     try:
-        # Open the NetCDF from S3
+        # Open the NetCDF from S3 using h5netcdf to discover group structure
         import fsspec
+        import h5netcdf
         s3_url = f"s3://{TCPRIMED_BUCKET}/{s3_key}"
         fs = fsspec.filesystem("s3", anon=True)
 
+        # First, discover the HDF5 group structure
         with fs.open(s3_url, "rb") as f:
-            ds = xr.open_dataset(f, engine="h5netcdf", group="")
+            h5file = h5netcdf.File(f, "r")
+            all_groups = list(h5file.groups.keys())
+            root_vars = list(h5file.variables.keys())
+            # Also check subgroups
+            subgroups = {}
+            for g in all_groups:
+                grp = h5file.groups[g]
+                subgroups[g] = {
+                    "subgroups": list(grp.groups.keys()) if hasattr(grp, "groups") else [],
+                    "variables": list(grp.variables.keys()),
+                }
+            h5file.close()
 
-        # TC-PRIMED files have a hierarchical structure with groups.
-        # The swath data is typically in sensor-specific groups.
-        # We need to find the right group for brightness temperatures.
-        #
-        # Common group structure:
-        #   / (root) — storm metadata (lat, lon, time, etc.)
-        #   /{SENSOR}/brightness_temperature — TB channels
-        #   /interpolation/ — storm-relative grids
-        #
-        # Let's try the interpolation group first (pre-gridded to storm center)
-        # then fall back to swath data.
-
-        # Close root and try interpolation group
-        ds.close()
+        logger.info("TC-PRIMED file groups: %s, root vars: %s", all_groups, root_vars[:10])
+        for g, info in subgroups.items():
+            logger.info("  Group '%s': subgroups=%s, vars=%s", g, info["subgroups"], info["variables"][:10])
 
         data_dict = None
 
-        # Try the storm-centered interpolated grid first
-        try:
-            with fs.open(s3_url, "rb") as f:
-                ds_interp = xr.open_dataset(
-                    f, engine="h5netcdf",
-                    group=f"/{sensor}/interpolation"
-                )
+        # Strategy: try multiple possible group paths for brightness temperature data
+        # TC-PRIMED files may use various group hierarchies
+        bt_group_candidates = [
+            f"/{sensor}/interpolation",
+            f"/{sensor}/brightness_temperature",
+            f"/{sensor}",
+            "/passive_microwave/interpolation",
+            "/passive_microwave/brightness_temperature",
+            "/passive_microwave",
+            "/interpolation",
+            "/brightness_temperature",
+        ]
+        geo_group_candidates = [
+            f"/{sensor}/geolocation",
+            "/passive_microwave/geolocation",
+            "/geolocation",
+        ]
 
-            if product == "89pct":
-                data_dict = _compute_89pct_interpolated(ds_interp, sensor)
-            else:
-                data_dict = _compute_37h_interpolated(ds_interp, sensor)
+        # Also try groups we actually found in the file
+        for g in all_groups:
+            bt_group_candidates.append(f"/{g}")
+            for sg in subgroups.get(g, {}).get("subgroups", []):
+                bt_group_candidates.append(f"/{g}/{sg}")
 
-            ds_interp.close()
+        # Try to find brightness temperature data
+        ds_data = None
+        ds_geo = None
+        used_group = None
 
-        except Exception as e_interp:
-            logger.warning("Interpolated grid not found for %s: %s, trying swath",
-                          sensor, e_interp)
-
-            # Fall back to swath-level brightness temperatures
+        for group_path in bt_group_candidates:
             try:
                 with fs.open(s3_url, "rb") as f:
-                    ds_bt = xr.open_dataset(
-                        f, engine="h5netcdf",
-                        group=f"/{sensor}/brightness_temperature"
-                    )
-                with fs.open(s3_url, "rb") as f:
-                    ds_geo = xr.open_dataset(
-                        f, engine="h5netcdf",
-                        group=f"/{sensor}/geolocation"
-                    )
-
-                if product == "89pct":
-                    data_dict = _compute_89pct_swath(ds_bt, ds_geo, sensor)
+                    ds_candidate = xr.open_dataset(f, engine="h5netcdf", group=group_path)
+                # Check if this group has brightness temperature-like variables
+                var_names = [v.upper() for v in ds_candidate.data_vars]
+                has_bt = any(
+                    "89" in v or "91" in v or "85" in v or "88" in v or
+                    "37" in v or "36" in v or
+                    "BRIGHTNESS" in v or "TB" in v or "PCT" in v
+                    for v in var_names
+                )
+                if has_bt or len(ds_candidate.data_vars) > 2:
+                    ds_data = ds_candidate
+                    used_group = group_path
+                    logger.info("Found usable data in group '%s': %s",
+                               group_path, list(ds_candidate.data_vars)[:10])
+                    break
                 else:
-                    data_dict = _compute_37h_swath(ds_bt, ds_geo, sensor)
+                    ds_candidate.close()
+            except Exception:
+                continue
 
-                ds_bt.close()
+        if ds_data is None:
+            # Last resort: try root group
+            try:
+                with fs.open(s3_url, "rb") as f:
+                    ds_data = xr.open_dataset(f, engine="h5netcdf", group="")
+                used_group = "/"
+                logger.info("Using root group, vars: %s", list(ds_data.data_vars)[:15])
+            except Exception as e:
+                raise HTTPException(500,
+                    f"Could not find brightness temperature data. "
+                    f"File groups: {all_groups}, subgroups: {subgroups}")
+
+        # Try to get geolocation (lat/lon) — might be in data group or separate
+        has_latlon = ("latitude" in ds_data.data_vars or "latitude" in ds_data.coords or
+                      "lat" in ds_data.data_vars or "lat" in ds_data.coords)
+        if not has_latlon:
+            for geo_path in geo_group_candidates:
+                try:
+                    with fs.open(s3_url, "rb") as f:
+                        ds_geo = xr.open_dataset(f, engine="h5netcdf", group=geo_path)
+                    logger.info("Found geolocation in group '%s'", geo_path)
+                    break
+                except Exception:
+                    continue
+
+        # Compute the product
+        try:
+            if has_latlon or "x_distance" in ds_data.coords or "x_distance" in ds_data.dims:
+                # Gridded / interpolated data
+                if product == "89pct":
+                    data_dict = _compute_89pct_interpolated(ds_data, sensor)
+                else:
+                    data_dict = _compute_37h_interpolated(ds_data, sensor)
+            elif ds_geo is not None:
+                # Swath data with separate geolocation
+                if product == "89pct":
+                    data_dict = _compute_89pct_swath(ds_data, ds_geo, sensor)
+                else:
+                    data_dict = _compute_37h_swath(ds_data, ds_geo, sensor)
                 ds_geo.close()
+            else:
+                # Try as gridded anyway
+                if product == "89pct":
+                    data_dict = _compute_89pct_interpolated(ds_data, sensor)
+                else:
+                    data_dict = _compute_37h_interpolated(ds_data, sensor)
+        except Exception as e_compute:
+            ds_data.close()
+            raise HTTPException(500,
+                f"Found data in group '{used_group}' with vars "
+                f"{list(ds_data.data_vars)[:15]} but failed to compute {product}: {e_compute}")
 
-            except Exception as e_swath:
-                logger.error("Failed to read swath data: %s", e_swath)
-                raise HTTPException(500, f"Could not extract {product} data: {e_swath}")
+        ds_data.close()
 
         if data_dict is None:
             raise HTTPException(500, "No data could be extracted")
