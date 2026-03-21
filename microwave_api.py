@@ -1134,6 +1134,29 @@ def _compute_37h_swath(ds_bt, ds_geo, sensor: str) -> dict:
     return gridded
 
 
+def _percentile_stretch(arr: np.ndarray, lo: float = 1.0, hi: float = 99.0) -> np.ndarray:
+    """
+    Per-channel percentile-based histogram stretch for false-color composites.
+
+    Stretches the valid (finite, non-zero) data between the lo-th and hi-th
+    percentiles to the full 0–255 byte range.  This ensures each channel uses
+    its actual dynamic range and prevents any single channel from dominating
+    the colour balance (the root cause of the orange-tint problem when using
+    a uniform 100–300 K range for R=PCT37, G=V37, B=H37).
+    """
+    valid = arr[np.isfinite(arr) & (arr > 0)]
+    if valid.size == 0:
+        return np.zeros(arr.shape, dtype=np.uint8)
+    vmin = np.percentile(valid, lo)
+    vmax = np.percentile(valid, hi)
+    if vmax <= vmin:
+        vmax = vmin + 1.0
+    scaled = (arr - vmin) / (vmax - vmin)
+    scaled = np.clip(scaled, 0, 1) * 255
+    scaled[~np.isfinite(arr) | (arr <= 0)] = 0
+    return scaled.astype(np.uint8)
+
+
 def _compute_37color_swath(ds_bt, ds_geo, sensor: str) -> dict:
     """
     Compute 37 GHz false-color composite from swath data and regrid.
@@ -1161,17 +1184,12 @@ def _compute_37color_swath(ds_bt, ds_geo, sensor: str) -> dict:
         [pct37, tb_v, tb_h], lats, lons, channel_names=["pct37", "v37", "h37"]
     )
 
-    # Scale to 0-255 for RGB: use 100-300 K range for all channels
-    rgb_min, rgb_max = 100.0, 300.0
-    def _scale_channel(arr):
-        scaled = (arr - rgb_min) / (rgb_max - rgb_min)
-        scaled = np.clip(scaled, 0, 1) * 255
-        scaled[~np.isfinite(arr)] = 0
-        return scaled.astype(np.uint8)
-
-    r = _scale_channel(gridded["channels"]["pct37"])
-    g = _scale_channel(gridded["channels"]["v37"])
-    b = _scale_channel(gridded["channels"]["h37"])
+    # Per-channel percentile stretch for proper false-color contrast.
+    # Each channel has a very different dynamic range (PCT37 ≫ V37 > H37
+    # over ocean), so a uniform min/max washes out colour separation.
+    r = _percentile_stretch(gridded["channels"]["pct37"])
+    g = _percentile_stretch(gridded["channels"]["v37"])
+    b = _percentile_stretch(gridded["channels"]["h37"])
 
     # Stack into RGB (ny, nx, 3)
     rgb = np.stack([r, g, b], axis=-1)
@@ -1209,17 +1227,10 @@ def _compute_37color_interpolated(ds, sensor: str) -> dict:
     tb_h = ds[h_name].values.astype(np.float32)
     pct37 = 2.18 * tb_v - 1.18 * tb_h
 
-    # Scale to 0-255 for RGB: use 100-300 K range for all channels
-    rgb_min, rgb_max = 100.0, 300.0
-    def _scale_channel(arr):
-        scaled = (arr - rgb_min) / (rgb_max - rgb_min)
-        scaled = np.clip(scaled, 0, 1) * 255
-        scaled[~np.isfinite(arr)] = 0
-        return scaled.astype(np.uint8)
-
-    r = _scale_channel(pct37)
-    g = _scale_channel(tb_v)
-    b = _scale_channel(tb_h)
+    # Per-channel percentile stretch for proper false-color contrast
+    r = _percentile_stretch(pct37)
+    g = _percentile_stretch(tb_v)
+    b = _percentile_stretch(tb_h)
 
     rgb = np.stack([r, g, b], axis=-1)
 
@@ -1411,21 +1422,20 @@ def _build_storm_relative_rgb_grid(
     dists, _ = tree.query(np.column_stack([gx.ravel(), gy.ravel()]))
     far_mask = dists.reshape((n, n)) > 15.0
 
-    # Scale: 100-300 K → 0-255
-    rgb_min, rgb_max = 100.0, 300.0
-
-    def _grid_and_scale(raw_data):
+    # Grid each channel, then apply per-channel percentile stretch
+    def _grid_channel(raw_data):
         zf = raw_data.ravel().astype(np.float32)[mask_valid]
         g = griddata((xf_m, yf_m), zf, (gx, gy), method="nearest")
         g[far_mask] = np.nan
-        scaled = (g - rgb_min) / (rgb_max - rgb_min)
-        scaled = np.clip(scaled, 0, 1) * 255
-        scaled[np.isnan(g)] = 0
-        return scaled.astype(np.uint8)
+        return g
 
-    r_ch = _grid_and_scale(pct37)
-    g_ch = _grid_and_scale(v37)
-    b_ch = _grid_and_scale(h37)
+    r_raw = _grid_channel(pct37)
+    g_raw = _grid_channel(v37)
+    b_raw = _grid_channel(h37)
+
+    r_ch = _percentile_stretch(r_raw)
+    g_ch = _percentile_stretch(g_raw)
+    b_ch = _percentile_stretch(b_raw)
 
     # Create alpha channel: transparent where data is missing
     alpha = np.where(far_mask, 0, 180).astype(np.uint8)
