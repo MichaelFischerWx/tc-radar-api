@@ -675,39 +675,44 @@ async def get_microwave_data(
         print(f"[MW]   Product={product}, freq_patterns={_FREQ_PATTERNS}")
         print(f"[MW]   BT candidates: {bt_group_candidates}")
 
-        # ── Try each candidate ──
+        # ── Find the right group using pre-enumerated variable names ──
+        # (No need to open the file for each candidate — use subgroups dict)
         ds_data = None
         ds_geo = None
         used_group = None
 
         for group_path in bt_group_candidates:
-            try:
-                with fs.open(s3_url, "rb") as f:
-                    ds_candidate = xr.open_dataset(f, engine="h5netcdf", group=group_path)
-                # Check for frequency-appropriate TB variables
-                has_right_freq = False
-                for vname in ds_candidate.data_vars:
-                    vname_upper = vname.upper()
-                    if "TB" in vname_upper or "BRIGHTNESS" in vname_upper:
-                        if any(fp in vname_upper for fp in _FREQ_PATTERNS):
-                            has_right_freq = True
-                            break
-                if has_right_freq:
-                    ds_data = ds_candidate
-                    used_group = group_path
-                    print(f"[MW]   ✓ Found matching data in '{group_path}': {list(ds_candidate.data_vars)[:10]}")
-                    break
-                else:
-                    print(f"[MW]   ✗ '{group_path}' no matching freq: {list(ds_candidate.data_vars)[:8]}")
-                    ds_candidate.close()
-            except Exception as e_try:
-                print(f"[MW]   ✗ '{group_path}' error: {e_try}")
+            # Strip leading slash to get the subgroups dict key
+            sg_key = group_path.lstrip("/")
+            sg_vars = subgroups.get(sg_key, {}).get("variables", [])
+            if not sg_vars:
+                # Not in our pre-enumerated dict — skip (fallback candidates)
                 continue
+            has_right_freq = False
+            for vname in sg_vars:
+                vname_upper = vname.upper()
+                if "TB" in vname_upper or "BRIGHTNESS" in vname_upper:
+                    if any(fp in vname_upper for fp in _FREQ_PATTERNS):
+                        has_right_freq = True
+                        break
+            if has_right_freq:
+                used_group = group_path
+                print(f"[MW]   ✓ Selected group '{group_path}' (has matching BT vars: {sg_vars[:8]})")
+                break
+            else:
+                print(f"[MW]   ✗ '{group_path}' no matching freq in: {sg_vars[:8]}")
 
-        if ds_data is None:
+        if used_group is None:
             raise HTTPException(500,
                 f"Could not find {product} data. "
                 f"File groups: {all_groups}, subgroups: {list(subgroups.keys())}")
+
+        # Now open the file ONCE and eagerly load all data into memory
+        # (avoids lazy-loading + closed file handle issue)
+        print(f"[MW]   Opening '{used_group}' and loading data into memory...")
+        with fs.open(s3_url, "rb") as f:
+            ds_data = xr.open_dataset(f, engine="h5netcdf", group=used_group).load()
+        print(f"[MW]   Loaded: vars={list(ds_data.data_vars)[:10]}, coords={list(ds_data.coords)[:6]}")
 
         # Determine if data is swath (2D lat/lon) or regular grid (1D or x/y offsets)
         has_latlon = ("latitude" in ds_data.data_vars or "latitude" in ds_data.coords or
