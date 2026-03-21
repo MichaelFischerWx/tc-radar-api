@@ -247,6 +247,17 @@ def _build_index_thread(metadata_path: str, ibtracs_path: str):
         logger.info("Microwave index build starting...")
         t0 = time.time()
 
+        # If local JSON files don't exist, fetch from GitHub Pages
+        if not os.path.isfile(metadata_path):
+            logger.info("Local metadata not found at %s, fetching from GitHub Pages...", metadata_path)
+            cache_dir = Path(metadata_path).parent
+            metadata_path = _fetch_json_from_url(_METADATA_URL, str(cache_dir / "tc_radar_metadata.json"))
+
+        if not os.path.isfile(ibtracs_path):
+            logger.info("Local IBTrACS not found at %s, fetching from GitHub Pages...", ibtracs_path)
+            cache_dir = Path(ibtracs_path).parent
+            ibtracs_path = _fetch_json_from_url(_IBTRACS_URL, str(cache_dir / "ibtracs_storms.json"))
+
         # Step 1: Load TC-RADAR metadata
         with open(metadata_path, "r") as f:
             meta = json.load(f)
@@ -375,16 +386,42 @@ def _build_index_thread(metadata_path: str, ibtracs_path: str):
         _index_ready.set()
 
 
+def _fetch_json_from_url(url: str, local_cache_path: str) -> str:
+    """
+    Download a JSON file from a URL and cache it locally.
+    Returns the path to the local file.
+    """
+    import requests as _req
+    logger.info("Fetching %s ...", url)
+    resp = _req.get(url, timeout=120)
+    resp.raise_for_status()
+    with open(local_cache_path, "w") as f:
+        f.write(resp.text)
+    logger.info("Cached %s -> %s (%.1f MB)",
+                url, local_cache_path, len(resp.text) / 1e6)
+    return local_cache_path
+
+
+# GitHub Pages URLs for the JSON data files (fallback if not in local repo)
+_GITHUB_PAGES_BASE = "https://michaelfischerwx.github.io/TC-RADAR"
+_METADATA_URL = f"{_GITHUB_PAGES_BASE}/tc_radar_metadata.json"
+_IBTRACS_URL = f"{_GITHUB_PAGES_BASE}/ibtracs_storms.json"
+
+
 def start_index_build(metadata_path: str = None, ibtracs_path: str = None):
     """
     Kick off the background index build. Called from the main app at startup.
-    Paths default to the files alongside this module.
+    Paths default to the files alongside this module. If those don't exist
+    (e.g. API repo doesn't include them), fetches from GitHub Pages.
     """
     base = Path(__file__).parent
     if metadata_path is None:
         metadata_path = str(base / "tc_radar_metadata.json")
     if ibtracs_path is None:
         ibtracs_path = str(base / "ibtracs_storms.json")
+
+    # If local files don't exist, we'll fetch them from GitHub Pages
+    # inside the thread (to avoid blocking app startup)
 
     thread = threading.Thread(
         target=_build_index_thread,
