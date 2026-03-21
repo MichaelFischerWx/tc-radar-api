@@ -3899,6 +3899,7 @@ def composite_ir_plan_view(
     shear_relative: bool  = Query(False,                 description="Rotate to shear-relative frame?"),
     coverage_min:   float = Query(0.25, ge=0.0,  le=1.0, description="Min coverage fraction"),
     max_radius_km:  float = Query(500.0, ge=100, le=1200, description="Max storm-centred domain radius (km)"),
+    include_tilt:   bool  = Query(True,                  description="Include composite mean tilt overlay?"),
     stream:         bool  = Query(False,                 description="Stream NDJSON progress events"),
     min_intensity:  float = Query(0),    max_intensity:  float = Query(200),
     min_vmax_change:float = Query(-100), max_vmax_change:float = Query(85),
@@ -4017,55 +4018,56 @@ def composite_ir_plan_view(
             x_label = "Eastward distance (km)"
             y_label = "Northward distance (km)"
 
-        # ── Composite mean tilt profile ──
+        # ── Composite mean tilt profile (optional) ──
         # Extract per-case tilt vectors, optionally normalize by RMW and
         # rotate to shear-relative, then average across cases.
         tilt_overlay = None
-        try:
-            tilt_cases_x = []  # list of arrays (n_heights,)
-            tilt_cases_y = []
-            tilt_heights = None
-            for ci, rmw_val, sddc_val in cases_ready:
-                if ci not in processed_indices:
-                    continue
-                try:
-                    ds, local_idx = resolve_case(ci, data_type)
-                    tilt = _compute_tilt_profile(ds, local_idx, data_type)
-                    if tilt is None:
+        if include_tilt:
+            try:
+                tilt_cases_x = []  # list of arrays (n_heights,)
+                tilt_cases_y = []
+                tilt_heights = None
+                for ci, rmw_val, sddc_val in cases_ready:
+                    if ci not in processed_indices:
                         continue
-                    tx = np.array(tilt["x_km"], dtype=np.float64)
-                    ty = np.array(tilt["y_km"], dtype=np.float64)
-                    if tilt_heights is None:
-                        tilt_heights = tilt["height_km"]
-                    # RMW-normalize tilt displacement
-                    if normalize_rmw and rmw_val is not None and rmw_val > 0:
-                        tx = tx / rmw_val
-                        ty = ty / rmw_val
-                    # Shear-relative rotation
-                    if shear_relative and sddc_val is not None:
-                        angle_rad = np.radians(90.0 - float(sddc_val))
-                        cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
-                        tx_rot = cos_a * tx - sin_a * ty
-                        ty_rot = sin_a * tx + cos_a * ty
-                        tx, ty = tx_rot, ty_rot
-                    tilt_cases_x.append(tx)
-                    tilt_cases_y.append(ty)
-                except Exception:
-                    continue
+                    try:
+                        ds, local_idx = resolve_case(ci, data_type)
+                        tilt = _compute_tilt_profile(ds, local_idx, data_type)
+                        if tilt is None:
+                            continue
+                        tx = np.array(tilt["x_km"], dtype=np.float64)
+                        ty = np.array(tilt["y_km"], dtype=np.float64)
+                        if tilt_heights is None:
+                            tilt_heights = tilt["height_km"]
+                        # RMW-normalize tilt displacement
+                        if normalize_rmw and rmw_val is not None and rmw_val > 0:
+                            tx = tx / rmw_val
+                            ty = ty / rmw_val
+                        # Shear-relative rotation
+                        if shear_relative and sddc_val is not None:
+                            angle_rad = np.radians(90.0 - float(sddc_val))
+                            cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
+                            tx_rot = cos_a * tx - sin_a * ty
+                            ty_rot = sin_a * tx + cos_a * ty
+                            tx, ty = tx_rot, ty_rot
+                        tilt_cases_x.append(tx)
+                        tilt_cases_y.append(ty)
+                    except Exception:
+                        continue
 
-            if len(tilt_cases_x) >= 3 and tilt_heights is not None:
-                all_x = np.array(tilt_cases_x)  # (n_cases, n_heights)
-                all_y = np.array(tilt_cases_y)
-                mean_x = np.nanmean(all_x, axis=0)
-                mean_y = np.nanmean(all_y, axis=0)
-                tilt_overlay = {
-                    "x": [round(float(v), 3) if np.isfinite(v) else None for v in mean_x],
-                    "y": [round(float(v), 3) if np.isfinite(v) else None for v in mean_y],
-                    "height_km": tilt_heights,
-                    "n_cases": len(tilt_cases_x),
-                }
-        except Exception as e:
-            print(f"IR composite tilt overlay: skipped ({e})")
+                if len(tilt_cases_x) >= 3 and tilt_heights is not None:
+                    all_x = np.array(tilt_cases_x)  # (n_cases, n_heights)
+                    all_y = np.array(tilt_cases_y)
+                    mean_x = np.nanmean(all_x, axis=0)
+                    mean_y = np.nanmean(all_y, axis=0)
+                    tilt_overlay = {
+                        "x": [round(float(v), 3) if np.isfinite(v) else None for v in mean_x],
+                        "y": [round(float(v), 3) if np.isfinite(v) else None for v in mean_y],
+                        "height_km": tilt_heights,
+                        "n_cases": len(tilt_cases_x),
+                    }
+            except Exception as e:
+                print(f"IR composite tilt overlay: skipped ({e})")
 
         result = {
             "plan_view": _clean_2d(composite),
