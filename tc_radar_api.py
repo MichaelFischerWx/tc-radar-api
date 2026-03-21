@@ -3808,7 +3808,20 @@ def _process_one_case_ir_plan_view(case_idx, rmw, sddc, data_type,
                 data_2d, x_km, y_km, rmw, max_r_rmw, dr_rmw,
             )
         else:
-            x_grid, y_grid = x_km, y_km
+            # Regrid to a common standard km grid (4 km spacing) so that
+            # cases at different latitudes can be composited together.
+            dx = 4.0  # km — matches MergedIR native resolution
+            half_n = int(max_radius_km / dx)
+            x_std = np.linspace(-max_radius_km, max_radius_km, 2 * half_n + 1)
+            y_std = np.linspace(-max_radius_km, max_radius_km, 2 * half_n + 1)
+            interp = RegularGridInterpolator(
+                (y_km, x_km), data_2d,
+                method="linear", bounds_error=False, fill_value=np.nan,
+            )
+            xx_s, yy_s = np.meshgrid(x_std, y_std)
+            pts = np.column_stack([yy_s.ravel(), xx_s.ravel()])
+            data_2d = interp(pts).reshape(len(y_std), len(x_std))
+            x_grid, y_grid = x_std, y_std
 
         return (case_idx, data_2d, x_grid, y_grid, None)
     except Exception as e:
@@ -3996,19 +4009,11 @@ def composite_ir_plan_view(
             x_label = "X / RMW"
             y_label = "Y / RMW"
         else:
-            # Use the grid from first processed case — all non-normalized
-            # cases share the same IR native grid (cropped to max_radius_km)
-            ir_idx_0 = cases_ready[0][0]
-            if data_type == "merge":
-                ir_idx_0 = _merge_to_swath_index.get(ir_idx_0, ir_idx_0)
-            center_lat_0 = float(ir_store['center_lat'][ir_idx_0])
-            lat_offsets_0 = ir_store['lat_offsets'][:]
-            lon_offsets_0 = ir_store['lon_offsets'][:]
-            x_out, y_out = _ir_latlon_to_km(lon_offsets_0, lat_offsets_0, center_lat_0)
-            x_mask = np.abs(x_out) <= max_radius_km
-            y_mask = np.abs(y_out) <= max_radius_km
-            x_out = x_out[x_mask]
-            y_out = y_out[y_mask]
+            # Standard km grid (matches the regridding in the worker)
+            dx = 4.0
+            half_n = int(max_radius_km / dx)
+            x_out = np.linspace(-max_radius_km, max_radius_km, 2 * half_n + 1)
+            y_out = np.linspace(-max_radius_km, max_radius_km, 2 * half_n + 1)
             x_label = "Eastward distance (km)"
             y_label = "Northward distance (km)"
 
