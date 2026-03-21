@@ -34,6 +34,7 @@ from datetime import datetime
 from functools import lru_cache
 
 import numpy as np
+import requests
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
 from PIL import Image
@@ -1291,7 +1292,9 @@ def _load_gridsat_subset_inner(target_dt, center_lat, center_lon, requests_mod, 
     lon_max = min(lon_max, 180.0)
 
     # Strategy 1: OPeNDAP via THREDDS (efficient server-side subsetting)
+    # Requires the netCDF4 C library for DAP protocol support
     try:
+        import netCDF4 as _nc4  # noqa: F401 — needed by xarray's netcdf4 engine
         logger.info(f"GridSat: trying OPeNDAP {thredds_url[:100]}...")
         ds = xr.open_dataset(thredds_url, engine="netcdf4")
 

@@ -3703,6 +3703,496 @@ def composite_plan_view(
 
 
 # ---------------------------------------------------------------------------
+# IR Satellite Composite helpers & endpoints
+# ---------------------------------------------------------------------------
+
+# IR composite variable config — these are "virtual" variables not in VARIABLES dict
+IR_COMPOSITE_VARIABLES = {
+    "ir_brightness_temp": {
+        "display_name": "IR Brightness Temperature",
+        "units": "K",
+        "vmin": 190,
+        "vmax": 310,
+        "colorscale": IR_COLORMAP,  # Enhanced IR colormap already defined above
+    },
+}
+
+
+def _ir_latlon_to_km(lat_offsets, lon_offsets, center_lat):
+    """
+    Convert IR geographic offsets (degrees) to storm-centred Cartesian km.
+
+    Uses simple spherical approximation:
+        1° lat ≈ 111.32 km
+        1° lon ≈ 111.32 * cos(lat) km
+    """
+    km_per_deg_lat = 111.32
+    km_per_deg_lon = 111.32 * np.cos(np.radians(center_lat))
+    y_km = np.array(lat_offsets) * km_per_deg_lat
+    x_km = np.array(lon_offsets) * km_per_deg_lon
+    return x_km, y_km
+
+
+def _extract_ir_2d(ir_store, ir_idx, center_lat, max_radius_km=500.0):
+    """
+    Extract the t=0 IR brightness temperature as a storm-centred 2D array
+    in Cartesian km coordinates, cropped to max_radius_km.
+
+    Returns (data_2d, x_km, y_km) or None on failure.
+    """
+    try:
+        status = int(ir_store['status'][ir_idx])
+    except (IndexError, KeyError):
+        return None
+    if status != 1:
+        return None
+
+    tb = ir_store['Tb'][ir_idx, 0]  # shape: (n_lat, n_lon), t=0 frame
+    if np.all(np.isnan(tb)):
+        return None
+
+    lat_offsets = ir_store['lat_offsets'][:]
+    lon_offsets = ir_store['lon_offsets'][:]
+    x_km, y_km = _ir_latlon_to_km(lat_offsets, lon_offsets, center_lat)
+
+    # Crop to storm-centred domain (±max_radius_km) to reduce memory
+    x_mask = np.abs(x_km) <= max_radius_km
+    y_mask = np.abs(y_km) <= max_radius_km
+
+    if np.sum(x_mask) < 4 or np.sum(y_mask) < 4:
+        return None
+
+    x_km = x_km[x_mask]
+    y_km = y_km[y_mask]
+    tb_cropped = np.array(tb, dtype=np.float32)
+    tb_cropped = tb_cropped[np.ix_(y_mask, x_mask)]
+
+    return tb_cropped, x_km, y_km
+
+
+def _process_one_case_ir_plan_view(case_idx, rmw, sddc, data_type,
+                                    normalize_rmw, max_r_rmw, dr_rmw,
+                                    shear_relative, max_radius_km):
+    """
+    Process a single case for IR plan-view composite.
+    Reads from the IR Zarr store, converts to km, applies shear rotation
+    and RMW normalization.
+    """
+    try:
+        ir_store = get_ir_dataset()
+        if ir_store is None:
+            return None
+
+        # Map merge case_index to swath index (IR Zarr is swath-indexed)
+        ir_idx = case_idx
+        if data_type == "merge":
+            ir_idx = _merge_to_swath_index.get(case_idx)
+            if ir_idx is None:
+                return None
+
+        center_lat = float(ir_store['center_lat'][ir_idx])
+        result = _extract_ir_2d(ir_store, ir_idx, center_lat, max_radius_km)
+        if result is None:
+            return None
+
+        data_2d, x_km, y_km = result
+
+        # Shear-relative rotation
+        if shear_relative and sddc is not None:
+            rotation_angle = 90.0 - float(sddc)
+            data_2d = _rotate_2d_grid(data_2d, rotation_angle)
+
+        # RMW normalisation
+        if normalize_rmw and rmw is not None and rmw > 0:
+            data_2d, x_grid, y_grid = _regrid_to_rmw_normalized(
+                data_2d, x_km, y_km, rmw, max_r_rmw, dr_rmw,
+            )
+        else:
+            x_grid, y_grid = x_km, y_km
+
+        return (case_idx, data_2d, x_grid, y_grid, None)
+    except Exception as e:
+        print(f"Composite IR plan_view: skipping case {case_idx}: {e}")
+        return None
+
+
+def _process_one_case_ir_azimuthal(case_idx, rmw, data_type,
+                                     max_radius, dr, coverage_min,
+                                     max_radius_km):
+    """
+    Process a single case for IR azimuthal-mean composite.
+    Computes azimuthal mean of IR Tb in storm-centred coordinates.
+    Returns (case_idx, az_mean_1d, r_centers) or None.
+    """
+    try:
+        ir_store = get_ir_dataset()
+        if ir_store is None:
+            return None
+
+        ir_idx = case_idx
+        if data_type == "merge":
+            ir_idx = _merge_to_swath_index.get(case_idx)
+            if ir_idx is None:
+                return None
+
+        center_lat = float(ir_store['center_lat'][ir_idx])
+        result = _extract_ir_2d(ir_store, ir_idx, center_lat, max_radius_km)
+        if result is None:
+            return None
+
+        data_2d, x_km, y_km = result
+
+        # Build radius grid
+        xx, yy = np.meshgrid(x_km, y_km)
+        rr = np.sqrt(xx**2 + yy**2)
+
+        # RMW-normalise if RMW is valid
+        if rmw is not None and rmw > 0:
+            rr = rr / rmw
+
+        # Radial bins
+        r_edges = np.arange(0, max_radius + dr, dr)
+        r_centers = (r_edges[:-1] + r_edges[1:]) / 2.0
+        n_rbins = len(r_centers)
+
+        bin_idx = np.digitize(rr, r_edges) - 1
+        valid = ~np.isnan(data_2d)
+
+        az_mean = np.full(n_rbins, np.nan)
+        for r in range(n_rbins):
+            mask = (bin_idx == r)
+            n_total = np.count_nonzero(mask)
+            if n_total == 0:
+                continue
+            in_bin = mask & valid
+            n_valid = np.count_nonzero(in_bin)
+            frac = n_valid / n_total
+            if frac >= coverage_min:
+                az_mean[r] = float(np.nanmean(data_2d[in_bin]))
+
+        return (case_idx, az_mean, r_centers)
+    except Exception as e:
+        print(f"Composite IR azimuthal: skipping case {case_idx}: {e}")
+        return None
+
+
+@app.get("/composite/ir_plan_view")
+def composite_ir_plan_view(
+    ir_variable:    str   = Query("ir_brightness_temp",  description="IR variable key"),
+    data_type:      str   = Query("swath",               description="'swath' or 'merge'"),
+    normalize_rmw:  bool  = Query(True,                  description="Normalise X/Y by RMW?"),
+    max_r_rmw:      float = Query(5.0,  ge=1,   le=20,  description="Max extent in R/RMW"),
+    dr_rmw:         float = Query(0.1,  ge=0.05, le=1,  description="Grid spacing in R/RMW"),
+    shear_relative: bool  = Query(False,                 description="Rotate to shear-relative frame?"),
+    coverage_min:   float = Query(0.25, ge=0.0,  le=1.0, description="Min coverage fraction"),
+    max_radius_km:  float = Query(500.0, ge=100, le=1200, description="Max storm-centred domain radius (km)"),
+    stream:         bool  = Query(False,                 description="Stream NDJSON progress events"),
+    min_intensity:  float = Query(0),    max_intensity:  float = Query(200),
+    min_vmax_change:float = Query(-100), max_vmax_change:float = Query(85),
+    min_tilt:       float = Query(0),    max_tilt:       float = Query(200),
+    min_year:       int   = Query(1997), max_year:       int   = Query(2024),
+    min_shear_mag:  float = Query(0),    max_shear_mag:  float = Query(100),
+    min_shear_dir:  float = Query(0),    max_shear_dir:  float = Query(360),
+    min_dtl:        float = Query(0),    dtl_window:     str   = Query("24h"),
+):
+    """Composite plan-view mean of IR brightness temperature."""
+
+    if ir_variable not in IR_COMPOSITE_VARIABLES:
+        raise HTTPException(status_code=400, detail=f"Unknown IR variable '{ir_variable}'.")
+    if data_type not in ("swath", "merge"):
+        raise HTTPException(status_code=400, detail="data_type must be 'swath' or 'merge'")
+
+    ir_store = get_ir_dataset()
+    if ir_store is None:
+        raise HTTPException(status_code=503, detail="IR data not available (S3 not configured)")
+
+    meta_cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
+
+    matching = _filter_cases_for_composite(
+        min_intensity, max_intensity, min_vmax_change, max_vmax_change,
+        min_tilt, max_tilt, min_year, max_year,
+        min_shear_mag, max_shear_mag, min_shear_dir, max_shear_dir,
+        min_dtl=min_dtl, dtl_window=dtl_window,
+        data_type=data_type,
+    )
+    if not matching:
+        raise HTTPException(status_code=400, detail="No cases match the specified criteria.")
+    if len(matching) > _COMPOSITE_MAX_CASES:
+        matching = matching[:_COMPOSITE_MAX_CASES]
+
+    # Collect per-case metadata
+    cases_ready = []
+    for ci in matching:
+        meta = meta_cache.get(ci, {})
+        rmw = meta.get("rmw_km")
+        if normalize_rmw:
+            if rmw is None or np.isnan(float(rmw)) or float(rmw) <= 0:
+                continue
+        else:
+            rmw = rmw if (rmw is not None and not np.isnan(float(rmw)) and float(rmw) > 0) else None
+
+        sddc = meta.get("sddc") if shear_relative else None
+        if shear_relative and sddc is None:
+            continue
+
+        # Check IR availability for this case
+        ir_idx = ci
+        if data_type == "merge":
+            ir_idx = _merge_to_swath_index.get(ci)
+            if ir_idx is None:
+                continue
+        try:
+            if int(ir_store['status'][ir_idx]) != 1:
+                continue
+        except (IndexError, KeyError):
+            continue
+
+        cases_ready.append((ci, float(rmw) if rmw is not None else None, sddc))
+
+    if not cases_ready:
+        raise HTTPException(status_code=400, detail="No matching cases have valid IR data and required metadata.")
+
+    var_info = IR_COMPOSITE_VARIABLES[ir_variable]
+
+    work_items = [
+        (ci, rmw, sddc, data_type,
+         normalize_rmw, max_r_rmw, dr_rmw, shear_relative, max_radius_km)
+        for ci, rmw, sddc in cases_ready
+    ]
+
+    def _compute(progress_cb=None):
+        accum_sum = None
+        accum_count = None
+        n_processed = 0
+        processed_indices = []
+
+        def _accum(result):
+            nonlocal accum_sum, accum_count, n_processed
+            ci, plan_2d, x_grid, y_grid, _ = result
+            if accum_sum is None:
+                accum_sum = np.zeros((len(y_grid), len(x_grid)))
+                accum_count = np.zeros_like(accum_sum)
+            valid = ~np.isnan(plan_2d)
+            accum_sum[valid] += plan_2d[valid]
+            accum_count[valid] += 1
+            n_processed += 1
+            processed_indices.append(ci)
+
+        _process_composites_batched(
+            _process_one_case_ir_plan_view, work_items, _accum,
+            progress_cb=progress_cb,
+        )
+
+        if n_processed == 0:
+            raise RuntimeError("Could not process any matching IR cases.")
+
+        min_cases = max(3, int(np.ceil(0.33 * n_processed)))
+        composite = np.where(accum_count >= min_cases, accum_sum / accum_count, np.nan)
+
+        if normalize_rmw:
+            half_n = int(round(max_r_rmw / dr_rmw))
+            x_out = np.linspace(-max_r_rmw, max_r_rmw, 2 * half_n + 1)
+            y_out = np.linspace(-max_r_rmw, max_r_rmw, 2 * half_n + 1)
+            x_label = "X / RMW"
+            y_label = "Y / RMW"
+        else:
+            # Use the grid from first processed case — all non-normalized
+            # cases share the same IR native grid (cropped to max_radius_km)
+            ir_idx_0 = cases_ready[0][0]
+            if data_type == "merge":
+                ir_idx_0 = _merge_to_swath_index.get(ir_idx_0, ir_idx_0)
+            center_lat_0 = float(ir_store['center_lat'][ir_idx_0])
+            lat_offsets_0 = ir_store['lat_offsets'][:]
+            lon_offsets_0 = ir_store['lon_offsets'][:]
+            x_out, y_out = _ir_latlon_to_km(lon_offsets_0, lat_offsets_0, center_lat_0)
+            x_mask = np.abs(x_out) <= max_radius_km
+            y_mask = np.abs(y_out) <= max_radius_km
+            x_out = x_out[x_mask]
+            y_out = y_out[y_mask]
+            x_label = "Eastward distance (km)"
+            y_label = "Northward distance (km)"
+
+        return {
+            "plan_view": _clean_2d(composite),
+            "x_axis": [round(float(v), 3) for v in x_out],
+            "y_axis": [round(float(v), 3) for v in y_out],
+            "x_label": x_label,
+            "y_label": y_label,
+            "normalize_rmw": normalize_rmw,
+            "shear_relative": shear_relative,
+            "coverage_min": coverage_min,
+            "min_cases_per_bin": min_cases,
+            "n_cases": n_processed,
+            "n_matched": len(matching),
+            "n_with_valid_meta": len(cases_ready),
+            "case_list": _build_case_list(processed_indices, data_type),
+            "variable": {
+                "key": ir_variable,
+                "display_name": var_info["display_name"],
+                "units": var_info["units"],
+                "vmin": var_info["vmin"],
+                "vmax": var_info["vmax"],
+                "colorscale": var_info["colorscale"],
+            },
+            "filters": {
+                "intensity": [min_intensity, max_intensity],
+                "vmax_change": [min_vmax_change, max_vmax_change],
+                "tilt": [min_tilt, max_tilt],
+                "year": [min_year, max_year],
+                "shear_mag": [min_shear_mag, max_shear_mag],
+                "shear_dir": [min_shear_dir, max_shear_dir],
+            },
+        }
+
+    if stream:
+        return _streaming_composite_response(_compute)
+    return JSONResponse(_compute())
+
+
+@app.get("/composite/ir_azimuthal_mean")
+def composite_ir_azimuthal_mean(
+    ir_variable:    str   = Query("ir_brightness_temp",  description="IR variable key"),
+    data_type:      str   = Query("swath",               description="'swath' or 'merge'"),
+    normalize_rmw:  bool  = Query(True,                  description="Normalise radii by RMW"),
+    max_r_rmw:      float = Query(8.0,  ge=1,   le=20,  description="Max radius in R/RMW (or km)"),
+    dr_rmw:         float = Query(0.25, ge=0.05, le=2,  description="Radial bin width in R/RMW (or km)"),
+    coverage_min:   float = Query(0.25, ge=0.0,  le=1.0),
+    max_radius_km:  float = Query(500.0, ge=100, le=1200, description="Max storm-centred domain radius (km)"),
+    stream:         bool  = Query(False,                 description="Stream NDJSON progress events"),
+    min_intensity:  float = Query(0),    max_intensity:  float = Query(200),
+    min_vmax_change:float = Query(-100), max_vmax_change:float = Query(85),
+    min_tilt:       float = Query(0),    max_tilt:       float = Query(200),
+    min_year:       int   = Query(1997), max_year:       int   = Query(2024),
+    min_shear_mag:  float = Query(0),    max_shear_mag:  float = Query(100),
+    min_shear_dir:  float = Query(0),    max_shear_dir:  float = Query(360),
+    min_dtl:        float = Query(0),    dtl_window:     str   = Query("24h"),
+):
+    """Composite azimuthal-mean of IR brightness temperature."""
+
+    if ir_variable not in IR_COMPOSITE_VARIABLES:
+        raise HTTPException(status_code=400, detail=f"Unknown IR variable '{ir_variable}'.")
+    if data_type not in ("swath", "merge"):
+        raise HTTPException(status_code=400, detail="data_type must be 'swath' or 'merge'")
+
+    ir_store = get_ir_dataset()
+    if ir_store is None:
+        raise HTTPException(status_code=503, detail="IR data not available (S3 not configured)")
+
+    meta_cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
+
+    matching = _filter_cases_for_composite(
+        min_intensity, max_intensity, min_vmax_change, max_vmax_change,
+        min_tilt, max_tilt, min_year, max_year,
+        min_shear_mag, max_shear_mag, min_shear_dir, max_shear_dir,
+        min_dtl=min_dtl, dtl_window=dtl_window,
+        data_type=data_type,
+    )
+    if not matching:
+        raise HTTPException(status_code=400, detail="No cases match the specified criteria.")
+    if len(matching) > _COMPOSITE_MAX_CASES:
+        matching = matching[:_COMPOSITE_MAX_CASES]
+
+    cases_ready = []
+    for ci in matching:
+        meta = meta_cache.get(ci, {})
+        rmw = meta.get("rmw_km")
+        if normalize_rmw:
+            if rmw is None or np.isnan(float(rmw)) or float(rmw) <= 0:
+                continue
+        else:
+            rmw = rmw if (rmw is not None and not np.isnan(float(rmw)) and float(rmw) > 0) else None
+
+        ir_idx = ci
+        if data_type == "merge":
+            ir_idx = _merge_to_swath_index.get(ci)
+            if ir_idx is None:
+                continue
+        try:
+            if int(ir_store['status'][ir_idx]) != 1:
+                continue
+        except (IndexError, KeyError):
+            continue
+
+        cases_ready.append((ci, float(rmw) if rmw is not None else None))
+
+    if not cases_ready:
+        raise HTTPException(status_code=400, detail="No matching cases have valid IR data and RMW.")
+
+    var_info = IR_COMPOSITE_VARIABLES[ir_variable]
+
+    work_items = [
+        (ci, rmw, data_type, max_r_rmw, dr_rmw, coverage_min, max_radius_km)
+        for ci, rmw in cases_ready
+    ]
+
+    def _compute(progress_cb=None):
+        accum_sum = None
+        accum_count = None
+        n_processed = 0
+        processed_indices = []
+
+        def _accum_az(result):
+            nonlocal accum_sum, accum_count, n_processed
+            ci, az_mean_1d, r_centers = result
+            if accum_sum is None:
+                accum_sum = np.zeros(len(r_centers))
+                accum_count = np.zeros_like(accum_sum)
+            valid = ~np.isnan(az_mean_1d)
+            accum_sum[valid] += az_mean_1d[valid]
+            accum_count[valid] += 1
+            n_processed += 1
+            processed_indices.append(ci)
+
+        _process_composites_batched(
+            _process_one_case_ir_azimuthal, work_items, _accum_az,
+            progress_cb=progress_cb,
+        )
+
+        if n_processed == 0:
+            raise RuntimeError("Could not process any matching IR cases.")
+
+        min_cases = max(3, int(np.ceil(0.33 * n_processed)))
+        composite_1d = np.where(accum_count >= min_cases, accum_sum / accum_count, np.nan)
+
+        r_edges = np.arange(0, max_r_rmw + dr_rmw, dr_rmw)
+        r_centers = ((r_edges[:-1] + r_edges[1:]) / 2.0).tolist()
+        r_label = "R / RMW" if normalize_rmw else "Radius (km)"
+
+        return {
+            "radial_profile": [None if np.isnan(v) else round(float(v), 2) for v in composite_1d],
+            "r_centers": [round(float(v), 3) for v in r_centers],
+            "r_label": r_label,
+            "normalize_rmw": normalize_rmw,
+            "coverage_min": coverage_min,
+            "min_cases_per_bin": min_cases,
+            "n_cases": n_processed,
+            "n_matched": len(matching),
+            "n_with_valid_meta": len(cases_ready),
+            "case_list": _build_case_list(processed_indices, data_type),
+            "variable": {
+                "key": ir_variable,
+                "display_name": var_info["display_name"],
+                "units": var_info["units"],
+                "vmin": var_info["vmin"],
+                "vmax": var_info["vmax"],
+                "colorscale": var_info["colorscale"],
+            },
+            "filters": {
+                "intensity": [min_intensity, max_intensity],
+                "vmax_change": [min_vmax_change, max_vmax_change],
+                "tilt": [min_tilt, max_tilt],
+                "year": [min_year, max_year],
+                "shear_mag": [min_shear_mag, max_shear_mag],
+                "shear_dir": [min_shear_dir, max_shear_dir],
+            },
+        }
+
+    if stream:
+        return _streaming_composite_response(_compute)
+    return JSONResponse(_compute())
+
+
+# ---------------------------------------------------------------------------
 # Composite CFAD (Contoured Frequency by Altitude Diagram) endpoint
 # ---------------------------------------------------------------------------
 
