@@ -709,17 +709,31 @@ async def get_microwave_data(
                 f"Could not find {product} data. "
                 f"File groups: {all_groups}, subgroups: {list(subgroups.keys())}")
 
-        # TC-PRIMED S* groups have latitude/longitude AND x/y in the same group
+        # Determine if data is swath (2D lat/lon) or regular grid (1D or x/y offsets)
         has_latlon = ("latitude" in ds_data.data_vars or "latitude" in ds_data.coords or
                       "lat" in ds_data.data_vars or "lat" in ds_data.coords)
-        has_xy = ("x" in ds_data.coords or "x" in ds_data.dims or
-                  "x_distance" in ds_data.coords or "x_distance" in ds_data.dims)
+        has_xy_coord = ("x_distance" in ds_data.coords or "x_distance" in ds_data.dims)
 
-        print(f"[MW]   Data group '{used_group}': has_latlon={has_latlon}, has_xy={has_xy}, "
+        # Check dimensionality of lat/lon to distinguish swath from grid
+        is_swath = False
+        if has_latlon:
+            for lat_name in ["latitude", "lat"]:
+                if lat_name in ds_data.coords:
+                    lat_shape = ds_data[lat_name].shape
+                    is_swath = len(lat_shape) >= 2  # 2D = swath data
+                    print(f"[MW]   '{lat_name}' shape={lat_shape}, is_swath={is_swath}")
+                    break
+                elif lat_name in ds_data.data_vars:
+                    lat_shape = ds_data[lat_name].shape
+                    is_swath = len(lat_shape) >= 2
+                    print(f"[MW]   '{lat_name}' (data_var) shape={lat_shape}, is_swath={is_swath}")
+                    break
+
+        print(f"[MW]   Data group '{used_group}': has_latlon={has_latlon}, "
+              f"has_xy_coord={has_xy_coord}, is_swath={is_swath}, "
               f"vars={list(ds_data.data_vars)[:12]}, coords={list(ds_data.coords)[:10]}")
 
         # Inject center_lat/center_lon from query params into ds attrs
-        # (TC-PRIMED S* groups may not have storm_latitude attr)
         if "storm_latitude" not in ds_data.attrs and center_lat is not None:
             ds_data.attrs["storm_latitude"] = center_lat
         if "storm_longitude" not in ds_data.attrs and center_lon is not None:
@@ -727,13 +741,33 @@ async def get_microwave_data(
 
         # Compute the product
         try:
-            if has_xy or has_latlon:
-                # Storm-centered grid (x/y km offsets) or has lat/lon coords
+            if is_swath:
+                # TC-PRIMED S* swath: lat/lon are 2D, in the same dataset as BT
+                # Use ds_data as both BT and geo source
+                print(f"[MW]   Using SWATH compute path (2D lat/lon in same group)")
+                if product == "89pct":
+                    data_dict = _compute_89pct_swath(ds_data, ds_data, sensor)
+                else:
+                    data_dict = _compute_37h_swath(ds_data, ds_data, sensor)
+            elif has_xy_coord:
+                # Storm-centered regular grid with x_distance/y_distance
+                print(f"[MW]   Using GRID compute path (x_distance/y_distance)")
                 if product == "89pct":
                     data_dict = _compute_89pct_interpolated(ds_data, sensor)
                 else:
                     data_dict = _compute_37h_interpolated(ds_data, sensor)
+            elif has_latlon:
+                # Has lat/lon but they're 1D — treat as regular grid
+                print(f"[MW]   Using GRID compute path (1D lat/lon)")
+                if product == "89pct":
+                    data_dict = _compute_89pct_interpolated(ds_data, sensor)
+                else:
+                    data_dict = _compute_37h_interpolated(ds_data, sensor)
+            else:
+                raise ValueError("No geolocation data found in dataset")
         except Exception as e_compute:
+            import traceback
+            traceback.print_exc()
             ds_data.close()
             raise HTTPException(500,
                 f"Found data in group '{used_group}' with vars "
