@@ -1096,11 +1096,13 @@ def _compute_37color_swath(ds_bt, ds_geo, sensor: str) -> dict:
     tb_h = ds_bt[h_name].values.astype(np.float32)
     pct37 = 2.18 * tb_v - 1.18 * tb_h
 
-    # Regrid each channel separately on the same lat/lon grid
     lats, lons = _get_swath_geolocation(ds_geo)
-    gridded_pct = _regrid_swath(pct37, lats, lons)
-    gridded_v = _regrid_swath(tb_v, lats, lons)
-    gridded_h = _regrid_swath(tb_h, lats, lons)
+
+    # Regrid all three channels onto a SINGLE consistent grid
+    # Use _regrid_swath_multi to ensure identical output dimensions
+    gridded = _regrid_swath_multi(
+        [pct37, tb_v, tb_h], lats, lons, channel_names=["pct37", "v37", "h37"]
+    )
 
     # Scale to 0-255 for RGB: use 100-300 K range for all channels
     rgb_min, rgb_max = 100.0, 300.0
@@ -1110,21 +1112,21 @@ def _compute_37color_swath(ds_bt, ds_geo, sensor: str) -> dict:
         scaled[~np.isfinite(arr)] = 0
         return scaled.astype(np.uint8)
 
-    r = _scale_channel(gridded_pct["data"])
-    g = _scale_channel(gridded_v["data"])
-    b = _scale_channel(gridded_h["data"])
+    r = _scale_channel(gridded["channels"]["pct37"])
+    g = _scale_channel(gridded["channels"]["v37"])
+    b = _scale_channel(gridded["channels"]["h37"])
 
     # Stack into RGB (ny, nx, 3)
     rgb = np.stack([r, g, b], axis=-1)
 
     result = {
         "data": rgb,
-        "center_lat": gridded_pct["center_lat"],
-        "center_lon": gridded_pct["center_lon"],
-        "bounds": gridded_pct["bounds"],
-        "nx": gridded_pct["nx"],
-        "ny": gridded_pct["ny"],
-        "dx_km": gridded_pct["dx_km"],
+        "center_lat": gridded["center_lat"],
+        "center_lon": gridded["center_lon"],
+        "bounds": gridded["bounds"],
+        "nx": gridded["nx"],
+        "ny": gridded["ny"],
+        "dx_km": gridded["dx_km"],
         "is_rgb": True,
         "product_label": "37 GHz Color Composite",
         "stats": {
@@ -1433,6 +1435,72 @@ def _regrid_swath(data: np.ndarray, lats: np.ndarray, lons: np.ndarray,
 
     return {
         "data": gridded,
+        "center_lat": center_lat,
+        "center_lon": center_lon,
+        "bounds": [[lat_min, lon_min], [lat_max, lon_max]],
+        "nx": n_lon,
+        "ny": n_lat,
+        "dx_km": grid_res_deg * 111.0,
+    }
+
+
+def _regrid_swath_multi(
+    data_channels: list, lats: np.ndarray, lons: np.ndarray,
+    channel_names: list = None, grid_res_deg: float = 0.02
+) -> dict:
+    """
+    Regrid multiple co-located swath channels onto a SINGLE regular lat/lon
+    grid. All channels share the same geometry (lats, lons) and are regridded
+    onto identical output grids — critical for building RGB composites.
+
+    Returns dict with 'channels' (dict of name->2D array), plus grid metadata.
+    """
+    from scipy.interpolate import griddata
+
+    # Convert longitudes from 0–360 to -180/+180
+    lons = lons.copy()
+    lons[lons > 180] -= 360
+
+    # Build a common validity mask: a pixel must be valid in ALL channels
+    mask = np.isfinite(lats.ravel()) & np.isfinite(lons.ravel())
+    for ch in data_channels:
+        mask &= np.isfinite(ch.ravel())
+
+    flat_lat = lats.ravel()[mask]
+    flat_lon = lons.ravel()[mask]
+
+    if len(flat_lat) < 10:
+        raise ValueError("Insufficient valid data points for multi-channel regridding")
+
+    # Define regular grid
+    lat_min, lat_max = float(flat_lat.min()), float(flat_lat.max())
+    lon_min, lon_max = float(flat_lon.min()), float(flat_lon.max())
+
+    max_grid_dim = 500
+    n_lat = min(int((lat_max - lat_min) / grid_res_deg) + 1, max_grid_dim)
+    n_lon = min(int((lon_max - lon_min) / grid_res_deg) + 1, max_grid_dim)
+
+    grid_lat = np.linspace(lat_min, lat_max, n_lat)
+    grid_lon = np.linspace(lon_min, lon_max, n_lon)
+    glon, glat = np.meshgrid(grid_lon, grid_lat)
+
+    # Regrid each channel onto the same grid
+    if channel_names is None:
+        channel_names = [f"ch{i}" for i in range(len(data_channels))]
+
+    channels = {}
+    for name, ch_data in zip(channel_names, data_channels):
+        flat_ch = ch_data.ravel()[mask]
+        channels[name] = griddata(
+            (flat_lon, flat_lat), flat_ch,
+            (glon, glat), method="nearest",
+        )
+
+    center_lat = (lat_min + lat_max) / 2.0
+    center_lon = (lon_min + lon_max) / 2.0
+
+    return {
+        "channels": channels,
         "center_lat": center_lat,
         "center_lon": center_lon,
         "bounds": [[lat_min, lon_min], [lat_max, lon_max]],
