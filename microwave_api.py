@@ -10,9 +10,9 @@ Products:
       Available from: GMI, SSMIS, AMSR2, SSM/I, TMI
     - 37 GHz H-pol brightness temperature:
       Available from: GMI, SSMIS, AMSR2, SSM/I, TMI
-    - 37 GHz Color Composite (NRL 37color per Jiang et al. 2018):
-        RGB false-color: R=PCT37, G=V37, B=H37
-        PCT37 = 2.18 * V37 − 1.18 * H37
+    - 37 GHz Color Composite (NRL 37color per Lee et al. 2002 / Kieper & Jiang 2012):
+        RGB false-color: R=f(PCT37), G=f(H37), B=f(V37)
+        PCT37 = 2.20 * V37 − 1.20 * H37
       Available from: GMI, SSMIS, AMSR2, SSM/I, TMI
 
 Data source:
@@ -689,9 +689,9 @@ async def get_microwave_data(
         # by checking which subgroup has matching frequency variables.
 
         # Frequency patterns to match for each product
-        if product == "89pct":
+        if product in ("89pct", "89v", "89h"):
             _FREQ_PATTERNS = ["89", "91", "85", "88", "92"]
-        else:  # 37h or 37color
+        else:  # 37h, 37v, or 37color
             _FREQ_PATTERNS = ["37", "36"]
 
         # Build candidate groups — prioritize passive_microwave sub-swaths
@@ -806,35 +806,45 @@ async def get_microwave_data(
             ds_data.attrs["storm_longitude"] = center_lon
 
         # Compute the product
+        _SWATH_DISPATCH = {
+            "89pct": _compute_89pct_swath,
+            "89v": _compute_89v_swath,
+            "89h": _compute_89h_swath,
+            "37h": _compute_37h_swath,
+            "37v": _compute_37v_swath,
+            "37color": _compute_37color_swath,
+        }
+        _GRID_DISPATCH = {
+            "89pct": _compute_89pct_interpolated,
+            "89v": _compute_89v_interpolated,
+            "89h": _compute_89h_interpolated,
+            "37h": _compute_37h_interpolated,
+            "37v": _compute_37v_interpolated,
+            "37color": _compute_37color_interpolated,
+        }
         try:
             if is_swath:
                 # TC-PRIMED S* swath: lat/lon are 2D, in the same dataset as BT
                 # Use ds_data as both BT and geo source
                 print(f"[MW]   Using SWATH compute path (2D lat/lon in same group)")
-                if product == "89pct":
-                    data_dict = _compute_89pct_swath(ds_data, ds_data, sensor)
-                elif product == "37color":
-                    data_dict = _compute_37color_swath(ds_data, ds_data, sensor)
+                if product in _SWATH_DISPATCH:
+                    data_dict = _SWATH_DISPATCH[product](ds_data, ds_data, sensor)
                 else:
-                    data_dict = _compute_37h_swath(ds_data, ds_data, sensor)
+                    raise ValueError(f"Unknown product: {product}")
             elif has_xy_coord:
                 # Storm-centered regular grid with x_distance/y_distance
                 print(f"[MW]   Using GRID compute path (x_distance/y_distance)")
-                if product == "89pct":
-                    data_dict = _compute_89pct_interpolated(ds_data, sensor)
-                elif product == "37color":
-                    data_dict = _compute_37color_interpolated(ds_data, sensor)
+                if product in _GRID_DISPATCH:
+                    data_dict = _GRID_DISPATCH[product](ds_data, sensor)
                 else:
-                    data_dict = _compute_37h_interpolated(ds_data, sensor)
+                    raise ValueError(f"Unknown product: {product}")
             elif has_latlon:
                 # Has lat/lon but they're 1D — treat as regular grid
                 print(f"[MW]   Using GRID compute path (1D lat/lon)")
-                if product == "89pct":
-                    data_dict = _compute_89pct_interpolated(ds_data, sensor)
-                elif product == "37color":
-                    data_dict = _compute_37color_interpolated(ds_data, sensor)
+                if product in _GRID_DISPATCH:
+                    data_dict = _GRID_DISPATCH[product](ds_data, sensor)
                 else:
-                    data_dict = _compute_37h_interpolated(ds_data, sensor)
+                    raise ValueError(f"Unknown product: {product}")
             else:
                 raise ValueError("No geolocation data found in dataset")
         except Exception as e_compute:
@@ -870,7 +880,7 @@ async def get_microwave_data(
                     if v37_name and h37_name:
                         v37_raw = ds_data[v37_name].values.astype(np.float32)
                         h37_raw = ds_data[h37_name].values.astype(np.float32)
-                        pct37_raw = 2.18 * v37_raw - 1.18 * h37_raw
+                        pct37_raw = 2.20 * v37_raw - 1.20 * h37_raw
                         # Build a single grid from PCT37 for the single-channel Plotly view
                         storm_grid = _build_storm_relative_grid(
                             x_km_raw, y_km_raw, pct37_raw, grid_extent_km=250, grid_res_km=4
@@ -884,22 +894,29 @@ async def get_microwave_data(
                             print(f"[MW]   Storm-relative 37color grid built: "
                                   f"{storm_grid['nx']}x{storm_grid['ny']}")
                 else:
-                    # Single-channel products: 89pct or 37h
-                    freq = 89 if product == "89pct" else 37
-                    pol = "V" if product == "89pct" else "H"
+                    # Single-channel products: 89pct, 89v, 89h, 37h, 37v
+                    _PROD_CHAN = {
+                        "89pct": (89, "V"),  # V-pol used for PCT computation
+                        "89v":   (89, "V"),
+                        "89h":   (89, "H"),
+                        "37h":   (37, "H"),
+                        "37v":   (37, "V"),
+                    }
+                    freq, pol = _PROD_CHAN.get(product, (89, "V"))
                     v_name = _find_channel_var(ds_data, sensor, freq, pol)
+                    # For PCT products, also need opposite pol
                     h_name = _find_channel_var(ds_data, sensor, 89, "H") if product == "89pct" else None
                     if v_name:
                         if product == "89pct" and h_name and v_name != h_name:
-                            pct_raw = (1.818 * ds_data[v_name].values.astype(np.float32) -
-                                       0.818 * ds_data[h_name].values.astype(np.float32))
+                            grid_data = (1.818 * ds_data[v_name].values.astype(np.float32) -
+                                         0.818 * ds_data[h_name].values.astype(np.float32))
                         elif product == "89pct":
-                            pct_raw = ds_data[v_name].values.astype(np.float32)
+                            grid_data = ds_data[v_name].values.astype(np.float32)
                         else:
-                            pct_raw = ds_data[v_name].values.astype(np.float32)
+                            grid_data = ds_data[v_name].values.astype(np.float32)
 
                         storm_grid = _build_storm_relative_grid(
-                            x_km_raw, y_km_raw, pct_raw, grid_extent_km=250, grid_res_km=4
+                            x_km_raw, y_km_raw, grid_data, grid_extent_km=250, grid_res_km=4
                         )
                         if storm_grid:
                             print(f"[MW]   Storm-relative grid built: {storm_grid['nx']}x{storm_grid['ny']}")
@@ -926,15 +943,24 @@ async def get_microwave_data(
             "is_rgb": product == "37color",
         }
 
+        # Colorscale / range per product
+        _PRODUCT_SCALES = {
+            "89pct": (NRL_89GHZ_PLOTLY_COLORSCALE, NRL_VMIN, NRL_VMAX),
+            "89v":   (NRL_89GHZ_PLOTLY_COLORSCALE, 150, 300),
+            "89h":   (NRL_89GHZ_PLOTLY_COLORSCALE, 100, 290),
+            "37h":   (NRL_89GHZ_PLOTLY_COLORSCALE, 130, 300),
+            "37v":   (NRL_89GHZ_PLOTLY_COLORSCALE, 150, 300),
+        }
         if product == "37color":
             # 37color is RGB — no single-channel colorscale
             response["colorscale"] = None
             response["vmin"] = 0
             response["vmax"] = 255
-        elif product == "89pct":
-            response["colorscale"] = NRL_89GHZ_PLOTLY_COLORSCALE
-            response["vmin"] = NRL_VMIN
-            response["vmax"] = NRL_VMAX
+        elif product in _PRODUCT_SCALES:
+            cs, vmin, vmax = _PRODUCT_SCALES[product]
+            response["colorscale"] = cs
+            response["vmin"] = vmin
+            response["vmax"] = vmax
         else:
             response["colorscale"] = NRL_89GHZ_PLOTLY_COLORSCALE
             response["vmin"] = 130
@@ -1134,37 +1160,155 @@ def _compute_37h_swath(ds_bt, ds_geo, sensor: str) -> dict:
     return gridded
 
 
-def _percentile_stretch(arr: np.ndarray, lo: float = 1.0, hi: float = 99.0) -> np.ndarray:
-    """
-    Per-channel percentile-based histogram stretch for false-color composites.
+def _compute_37v_interpolated(ds, sensor: str) -> dict:
+    """Compute 37 GHz V-pol from the interpolated grid."""
+    v_name = _find_channel_var(ds, sensor, 37, "V")
+    if not v_name:
+        raise ValueError(f"Cannot find 37 GHz V-pol for sensor {sensor}")
+    tb_v = ds[v_name].values.astype(np.float32)
+    result = _extract_grid_info(ds, tb_v)
+    result["product_label"] = "37 GHz V-pol TB (K)"
+    result["stats"] = {
+        "min": float(np.nanmin(tb_v)),
+        "max": float(np.nanmax(tb_v)),
+        "mean": float(np.nanmean(tb_v)),
+    }
+    return result
 
-    Stretches the valid (finite, non-zero) data between the lo-th and hi-th
-    percentiles to the full 0–255 byte range.  This ensures each channel uses
-    its actual dynamic range and prevents any single channel from dominating
-    the colour balance (the root cause of the orange-tint problem when using
-    a uniform 100–300 K range for R=PCT37, G=V37, B=H37).
+
+def _compute_37v_swath(ds_bt, ds_geo, sensor: str) -> dict:
+    """Compute 37 GHz V-pol from swath data and regrid."""
+    v_name = _find_channel_var(ds_bt, sensor, 37, "V")
+    if not v_name:
+        raise ValueError(f"Cannot find 37 GHz V-pol for sensor {sensor}")
+    data = ds_bt[v_name].values.astype(np.float32)
+    lats, lons = _get_swath_geolocation(ds_geo)
+    gridded = _regrid_swath(data, lats, lons)
+    gridded["product_label"] = "37 GHz V-pol TB (K)"
+    gridded["stats"] = {
+        "min": float(np.nanmin(data[np.isfinite(data)])) if np.any(np.isfinite(data)) else None,
+        "max": float(np.nanmax(data[np.isfinite(data)])) if np.any(np.isfinite(data)) else None,
+    }
+    return gridded
+
+
+def _compute_89v_interpolated(ds, sensor: str) -> dict:
+    """Compute 89 GHz V-pol (no PCT) from the interpolated grid."""
+    v_name = _find_channel_var(ds, sensor, 89, "V")
+    if not v_name:
+        raise ValueError(f"Cannot find 89 GHz V-pol for sensor {sensor}")
+    tb_v = ds[v_name].values.astype(np.float32)
+    result = _extract_grid_info(ds, tb_v)
+    result["product_label"] = "89 GHz V-pol TB (K)"
+    result["stats"] = {
+        "min": float(np.nanmin(tb_v)),
+        "max": float(np.nanmax(tb_v)),
+        "mean": float(np.nanmean(tb_v)),
+    }
+    return result
+
+
+def _compute_89v_swath(ds_bt, ds_geo, sensor: str) -> dict:
+    """Compute 89 GHz V-pol from swath data and regrid."""
+    v_name = _find_channel_var(ds_bt, sensor, 89, "V")
+    if not v_name:
+        raise ValueError(f"Cannot find 89 GHz V-pol for sensor {sensor}")
+    data = ds_bt[v_name].values.astype(np.float32)
+    lats, lons = _get_swath_geolocation(ds_geo)
+    gridded = _regrid_swath(data, lats, lons)
+    gridded["product_label"] = "89 GHz V-pol TB (K)"
+    gridded["stats"] = {
+        "min": float(np.nanmin(data[np.isfinite(data)])) if np.any(np.isfinite(data)) else None,
+        "max": float(np.nanmax(data[np.isfinite(data)])) if np.any(np.isfinite(data)) else None,
+    }
+    return gridded
+
+
+def _compute_89h_interpolated(ds, sensor: str) -> dict:
+    """Compute 89 GHz H-pol from the interpolated grid."""
+    h_name = _find_channel_var(ds, sensor, 89, "H")
+    if not h_name:
+        raise ValueError(f"Cannot find 89 GHz H-pol for sensor {sensor}")
+    tb_h = ds[h_name].values.astype(np.float32)
+    result = _extract_grid_info(ds, tb_h)
+    result["product_label"] = "89 GHz H-pol TB (K)"
+    result["stats"] = {
+        "min": float(np.nanmin(tb_h)),
+        "max": float(np.nanmax(tb_h)),
+        "mean": float(np.nanmean(tb_h)),
+    }
+    return result
+
+
+def _compute_89h_swath(ds_bt, ds_geo, sensor: str) -> dict:
+    """Compute 89 GHz H-pol from swath data and regrid."""
+    h_name = _find_channel_var(ds_bt, sensor, 89, "H")
+    if not h_name:
+        raise ValueError(f"Cannot find 89 GHz H-pol for sensor {sensor}")
+    data = ds_bt[h_name].values.astype(np.float32)
+    lats, lons = _get_swath_geolocation(ds_geo)
+    gridded = _regrid_swath(data, lats, lons)
+    gridded["product_label"] = "89 GHz H-pol TB (K)"
+    gridded["stats"] = {
+        "min": float(np.nanmin(data[np.isfinite(data)])) if np.any(np.isfinite(data)) else None,
+        "max": float(np.nanmax(data[np.isfinite(data)])) if np.any(np.isfinite(data)) else None,
+    }
+    return gridded
+
+
+def _nrl_37color_rgb(v37: np.ndarray, h37: np.ndarray) -> np.ndarray:
     """
-    valid = arr[np.isfinite(arr) & (arr > 0)]
-    if valid.size == 0:
-        return np.zeros(arr.shape, dtype=np.uint8)
-    vmin = np.percentile(valid, lo)
-    vmax = np.percentile(valid, hi)
-    if vmax <= vmin:
-        vmax = vmin + 1.0
-    scaled = (arr - vmin) / (vmax - vmin)
-    scaled = np.clip(scaled, 0, 1) * 255
-    scaled[~np.isfinite(arr) | (arr <= 0)] = 0
-    return scaled.astype(np.uint8)
+    NRL 37 GHz false-color composite per Lee et al. (2002) as documented
+    in Kieper and Jiang (2012, MWR, Eq. 3):
+
+        PCT37 = 2.20 * V37 − 1.20 * H37   (Cecil et al. 2002)
+
+        Red   = clamp(−0.05 * PCT37 + 14,   0, 1)
+        Green = clamp( 0.0083 * H37 − 1.5,  0, 1)
+        Blue  = clamp( 0.0071 * V37 − 1.1429, 0, 1)
+
+    Physical interpretation:
+        - Red is HIGH when PCT37 is LOW (ice scattering → deep convection pink)
+        - Green is HIGH when H37 is HIGH (warm rain / land)
+        - Blue is HIGH when V37 is HIGH (warm emission)
+        - Pink:  deep convection (high R, low G, low B)
+        - Cyan:  rain / low-level water cloud (low R, high G, high B)
+        - Green/orange: ocean / other (variable R, low G, moderate B)
+
+    Parameters
+    ----------
+    v37, h37 : 2-D float arrays (same shape), brightness temperatures in K.
+
+    Returns
+    -------
+    rgb : uint8 array, shape (*v37.shape, 3)
+    """
+    pct37 = 2.20 * v37 - 1.20 * h37
+
+    r = np.clip(-0.05 * pct37 + 14.0, 0.0, 1.0)
+    g = np.clip(0.0083 * h37 - 1.5, 0.0, 1.0)
+    b = np.clip(0.0071 * v37 - 1.1429, 0.0, 1.0)
+
+    # Mask invalid pixels
+    invalid = ~(np.isfinite(v37) & np.isfinite(h37) & (v37 > 0) & (h37 > 0))
+    r[invalid] = 0.0
+    g[invalid] = 0.0
+    b[invalid] = 0.0
+
+    rgb = np.stack([
+        (r * 255).astype(np.uint8),
+        (g * 255).astype(np.uint8),
+        (b * 255).astype(np.uint8),
+    ], axis=-1)
+    return rgb
 
 
 def _compute_37color_swath(ds_bt, ds_geo, sensor: str) -> dict:
     """
     Compute 37 GHz false-color composite from swath data and regrid.
 
-    NRL 37color product (Jiang et al. 2018):
-        R = PCT37 = 2.18 * V37 − 1.18 * H37
-        G = V37
-        B = H37
+    NRL 37 GHz color product per Lee et al. (2002) / Kieper & Jiang (2012):
+    three-channel RGB from PCT37, H37, V37.
     Returns dict with 'data' as 3D RGB array (ny, nx, 3), uint8 0-255.
     """
     v_name = _find_channel_var(ds_bt, sensor, 37, "V")
@@ -1174,25 +1318,20 @@ def _compute_37color_swath(ds_bt, ds_geo, sensor: str) -> dict:
 
     tb_v = ds_bt[v_name].values.astype(np.float32)
     tb_h = ds_bt[h_name].values.astype(np.float32)
-    pct37 = 2.18 * tb_v - 1.18 * tb_h
+    pct37 = 2.20 * tb_v - 1.20 * tb_h
 
     lats, lons = _get_swath_geolocation(ds_geo)
 
-    # Regrid all three channels onto a SINGLE consistent grid
-    # Use _regrid_swath_multi to ensure identical output dimensions
+    # Regrid V37 and H37 onto a SINGLE consistent grid (need both for RGB)
     gridded = _regrid_swath_multi(
-        [pct37, tb_v, tb_h], lats, lons, channel_names=["pct37", "v37", "h37"]
+        [tb_v, tb_h], lats, lons, channel_names=["v37", "h37"]
     )
 
-    # Per-channel percentile stretch for proper false-color contrast.
-    # Each channel has a very different dynamic range (PCT37 ≫ V37 > H37
-    # over ocean), so a uniform min/max washes out colour separation.
-    r = _percentile_stretch(gridded["channels"]["pct37"])
-    g = _percentile_stretch(gridded["channels"]["v37"])
-    b = _percentile_stretch(gridded["channels"]["h37"])
-
-    # Stack into RGB (ny, nx, 3)
-    rgb = np.stack([r, g, b], axis=-1)
+    # Apply NRL Lee et al. (2002) formulas
+    rgb = _nrl_37color_rgb(
+        gridded["channels"]["v37"],
+        gridded["channels"]["h37"],
+    )
 
     result = {
         "data": rgb,
@@ -1225,14 +1364,10 @@ def _compute_37color_interpolated(ds, sensor: str) -> dict:
 
     tb_v = ds[v_name].values.astype(np.float32)
     tb_h = ds[h_name].values.astype(np.float32)
-    pct37 = 2.18 * tb_v - 1.18 * tb_h
+    pct37 = 2.20 * tb_v - 1.20 * tb_h
 
-    # Per-channel percentile stretch for proper false-color contrast
-    r = _percentile_stretch(pct37)
-    g = _percentile_stretch(tb_v)
-    b = _percentile_stretch(tb_h)
-
-    rgb = np.stack([r, g, b], axis=-1)
+    # Apply NRL formulas
+    rgb = _nrl_37color_rgb(tb_v, tb_h)
 
     result = _extract_grid_info(ds, pct37)
     result["data"] = rgb
@@ -1387,28 +1522,29 @@ def _build_storm_relative_rgb_grid(
 ) -> Optional[str]:
     """
     Build a storm-relative RGB PNG (base64) for the 37 GHz color composite
-    on the Plotly plan view. Returns base64 PNG string or None.
+    on the Plotly plan view.  Returns base64 PNG string or None.
 
-    The RGB composite per Jiang et al. 2018:
-        R = PCT37, G = V37, B = H37  (scaled to 0-255 from 100-300 K)
+    Uses the NRL Lee et al. (2002) / Kieper & Jiang (2012) three-channel
+    formulas via ``_nrl_37color_rgb()``.  V37 and H37 are gridded separately
+    and the RGB is computed on the regular grid.
     """
     from scipy.interpolate import griddata
     from scipy.spatial import cKDTree
 
-    # Flatten & mask
+    # Flatten & mask (need both V37 and H37 valid)
     xf = x_km.ravel().astype(np.float32)
     yf = y_km.ravel().astype(np.float32)
+    vf = v37.ravel().astype(np.float32)
+    hf = h37.ravel().astype(np.float32)
 
     mask_valid = (np.isfinite(xf) & np.isfinite(yf) &
+                  np.isfinite(vf) & np.isfinite(hf) &
+                  (vf > 0) & (hf > 0) &
                   (np.abs(xf) <= grid_extent_km * 1.2) &
                   (np.abs(yf) <= grid_extent_km * 1.2))
 
-    channels = {"pct37": pct37, "v37": v37, "h37": h37}
-    for ch_name, ch_data in channels.items():
-        cf = ch_data.ravel().astype(np.float32)
-        mask_valid &= np.isfinite(cf)
-
     xf_m, yf_m = xf[mask_valid], yf[mask_valid]
+    vf_m, hf_m = vf[mask_valid], hf[mask_valid]
     if len(xf_m) < 50:
         return None
 
@@ -1417,34 +1553,27 @@ def _build_storm_relative_rgb_grid(
     ax = np.linspace(-grid_extent_km, grid_extent_km, n)
     gx, gy = np.meshgrid(ax, ax)
 
-    # Distance mask (same as single-channel version)
+    # Distance mask — transparent where no data within 15 km
     tree = cKDTree(np.column_stack([xf_m, yf_m]))
     dists, _ = tree.query(np.column_stack([gx.ravel(), gy.ravel()]))
     far_mask = dists.reshape((n, n)) > 15.0
 
-    # Grid each channel, then apply per-channel percentile stretch
-    def _grid_channel(raw_data):
-        zf = raw_data.ravel().astype(np.float32)[mask_valid]
-        g = griddata((xf_m, yf_m), zf, (gx, gy), method="nearest")
-        g[far_mask] = np.nan
-        return g
+    # Grid V37 and H37 independently
+    v37_grid = griddata((xf_m, yf_m), vf_m, (gx, gy), method="nearest")
+    h37_grid = griddata((xf_m, yf_m), hf_m, (gx, gy), method="nearest")
+    v37_grid[far_mask] = np.nan
+    h37_grid[far_mask] = np.nan
 
-    r_raw = _grid_channel(pct37)
-    g_raw = _grid_channel(v37)
-    b_raw = _grid_channel(h37)
-
-    r_ch = _percentile_stretch(r_raw)
-    g_ch = _percentile_stretch(g_raw)
-    b_ch = _percentile_stretch(b_raw)
+    # Apply NRL Lee et al. (2002) RGB formulas
+    rgb = _nrl_37color_rgb(v37_grid, h37_grid)  # (n, n, 3) uint8
 
     # Create alpha channel: transparent where data is missing
     alpha = np.where(far_mask, 0, 180).astype(np.uint8)
 
     # Build RGBA image
-    rgba = np.stack([r_ch, g_ch, b_ch, alpha], axis=-1)
+    rgba = np.concatenate([rgb, alpha[:, :, np.newaxis]], axis=-1)
 
-    # Flip vertically: numpy array has origin at top-left, but we want
-    # y increasing upward (matching Plotly plan view convention)
+    # Flip vertically (Plotly plan view convention: y increasing upward)
     rgba = rgba[::-1]
 
     # Encode as PNG
@@ -1667,14 +1796,16 @@ def _render_product_image(data_dict: dict, product: str) -> str:
 
     ny, nx = data.shape
 
-    # NRL-style colormap and range
-    if product == "89pct":
-        cmap = _nrl_89ghz_cmap()
-        vmin, vmax = NRL_VMIN, NRL_VMAX
-    else:
-        # 37 GHz H-pol — use same NRL map but tighter range
-        cmap = _nrl_89ghz_cmap()
-        vmin, vmax = 130, 300
+    # NRL-style colormap and range per product
+    _CBAR_RANGES = {
+        "89pct": (NRL_VMIN, NRL_VMAX),
+        "89v":   (150, 300),
+        "89h":   (100, 290),
+        "37h":   (130, 300),
+        "37v":   (150, 300),
+    }
+    cmap = _nrl_89ghz_cmap()
+    vmin, vmax = _CBAR_RANGES.get(product, (NRL_VMIN, NRL_VMAX))
 
     # Create figure with transparent background
     dpi = 100
@@ -1726,23 +1857,35 @@ async def get_colorbar(
     import matplotlib.colors as mcolors
 
     if product == "37color":
-        # 37color is RGB — return a legend image explaining the color mapping
-        fig, ax = plt.subplots(figsize=(4, 0.6))
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1)
-        ax.set_axis_off()
-        # Show color patches for the main features
-        patches = [
-            (0.05, "green",   "Ocean"),
-            (0.25, "cyan",    "Rain/Cloud"),
-            (0.50, "magenta", "Deep Conv."),
-            (0.75, "pink",    "Ice Scatter"),
-        ]
-        for x, color, lbl in patches:
-            ax.add_patch(plt.Rectangle((x, 0.1), 0.12, 0.5, facecolor=color, edgecolor="white", lw=0.5))
-            ax.text(x + 0.06, 0.72, lbl, ha="center", va="bottom", fontsize=7, color="white")
-        ax.set_title("37 GHz Color (R=PCT37 G=V37 B=H37)", fontsize=8, color="white", pad=2)
+        # Build a synthetic 1-D gradient bar using the Lee et al. (2002)
+        # / Kieper & Jiang (2012) formulas.  We sweep PCT37 from 170→310 K
+        # while keeping V37 and H37 at "typical" ocean-like values that are
+        # consistent with each PCT37 value.  For a rough physical mapping we
+        # assume pol-ratio (V-H)/V ≈ 0.07 → H37 ≈ 0.93*V37, then solve
+        # PCT37 = 2.20*V37 − 1.20*H37 = V37*(2.20 − 1.20*0.93) = 1.084*V37
+        # → V37 = PCT37 / 1.084, H37 = 0.93*V37.
+        pct_range = np.linspace(170, 310, 256)
+        v37_bar = pct_range / 1.084
+        h37_bar = 0.93 * v37_bar
+        rgb_1d = _nrl_37color_rgb(v37_bar, h37_bar)          # (256, 3) uint8
+        rgb_bar = rgb_1d[np.newaxis, :, :].astype(np.float64) / 255.0  # (1, 256, 3)
+
+        fig, ax = plt.subplots(figsize=(3.5, 0.5))
+        ax.imshow(rgb_bar, aspect="auto", extent=[170, 310, 0, 1])
+        ax.set_yticks([])
+        ax.set_xlabel("PCT37 (K)", fontsize=7, color="white", labelpad=2)
+        ax.tick_params(axis="x", colors="white", labelsize=6)
+        ax.set_xticks([180, 200, 220, 240, 260, 280, 300])
+        # Physical annotations
+        ax.text(185, 1.15, "Ice", fontsize=6, color="white", ha="center", va="bottom")
+        ax.text(230, 1.15, "Rain", fontsize=6, color="white", ha="center", va="bottom")
+        ax.text(265, 1.15, "Ocean", fontsize=6, color="white", ha="center", va="bottom")
+        ax.text(295, 1.15, "Land", fontsize=6, color="white", ha="center", va="bottom")
+        ax.set_title("37 GHz Color (Lee et al. 2002)", fontsize=7, color="white", pad=8)
         fig.patch.set_facecolor("none")
+        for spine in ax.spines.values():
+            spine.set_edgecolor("white")
+            spine.set_linewidth(0.5)
         buf = io.BytesIO()
         fig.savefig(buf, format="png", dpi=120, bbox_inches="tight", transparent=True)
         plt.close(fig)
@@ -1750,16 +1893,17 @@ async def get_colorbar(
         b64 = base64.b64encode(buf.read()).decode("ascii")
         return JSONResponse({"image_b64": b64, "product": product, "label": "37 GHz Color Composite"})
 
-    if product == "89pct":
-        vmin, vmax = 80, 280
-        cmap = plt.cm.get_cmap("RdYlBu")
-        label = "89 GHz PCT (K)"
-    elif product == "37h":
-        vmin, vmax = 130, 280
-        cmap = plt.cm.get_cmap("RdYlBu_r")
-        label = "37 GHz H-pol TB (K)"
-    else:
-        raise HTTPException(400, "product must be '89pct' or '37h'")
+    _CBAR_DEFS = {
+        "89pct": (80, 280, "RdYlBu", "89 GHz PCT (K)"),
+        "89v":   (150, 300, "RdYlBu", "89 GHz V-pol TB (K)"),
+        "89h":   (100, 290, "RdYlBu", "89 GHz H-pol TB (K)"),
+        "37h":   (130, 280, "RdYlBu_r", "37 GHz H-pol TB (K)"),
+        "37v":   (150, 300, "RdYlBu_r", "37 GHz V-pol TB (K)"),
+    }
+    if product not in _CBAR_DEFS:
+        raise HTTPException(400, f"Unknown product '{product}'")
+    vmin, vmax, cmap_name, label = _CBAR_DEFS[product]
+    cmap = plt.cm.get_cmap(cmap_name)
 
     fig, ax = plt.subplots(figsize=(4, 0.4))
     norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
