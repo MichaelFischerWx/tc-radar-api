@@ -3886,3 +3886,124 @@ def get_rt_tilt_profile(
 
     tilt["compute_time_s"] = round(elapsed, 2)
     return JSONResponse(tilt)
+
+
+# ---------------------------------------------------------------------------
+# Single-case CFAD (Contoured Frequency by Altitude Diagram) for real-time TDR
+# ---------------------------------------------------------------------------
+
+# Default bin configurations per variable
+_RT_CFAD_BINS = {
+    "REFLECTIVITY":    (-10, 60,  1.0),
+    "TANGENTIAL_WIND": (-10, 80,  2.0),
+    "RADIAL_WIND":     (-30, 30,  2.0),
+    "W":               (-8,  8,   0.5),
+    "WIND_SPEED":      (0,   80,  2.0),
+    "WIND_SPEED_EARTH":(0,   80,  2.0),
+    "VORT":            (-0.005, 0.005, 0.0002),
+}
+
+@router.get("/cfad")
+def get_rt_cfad(
+    file_url:    str   = Query(...,                 description="Full URL to the xy.nc(.gz) file"),
+    variable:    str   = Query("REFLECTIVITY",      description="Variable key"),
+    bin_min:     float = Query(None,                description="Lower bin edge (auto if omitted)"),
+    bin_max:     float = Query(None,                description="Upper bin edge (auto if omitted)"),
+    bin_width:   float = Query(None,                description="Bin width (auto if omitted)"),
+    n_bins:      int   = Query(40,   ge=5, le=200,  description="Number of bins (if bin_width omitted)"),
+    min_radius:  float = Query(0,    ge=0,  le=500, description="Minimum radius (km)"),
+    max_radius:  float = Query(200,  ge=0.1, le=500,description="Maximum radius (km)"),
+    normalise:   str   = Query("height",            description="'height', 'total', or 'raw'"),
+):
+    """Compute a CFAD for a single real-time TDR analysis."""
+    if variable not in RT_VARIABLES and variable not in RT_DERIVED:
+        raise HTTPException(status_code=400, detail=f"Unknown variable '{variable}'.")
+    if normalise not in ("total", "height", "raw"):
+        raise HTTPException(status_code=400, detail="normalise must be 'total', 'height', or 'raw'")
+
+    try:
+        ds = _open_rt_dataset(file_url)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not open file: {str(e)}")
+
+    # Extract 3D volume (level, y, x)
+    vol, heights = _extract_3d(ds, variable)
+    x_km, y_km = _get_xy_coords(ds)
+    meta = _build_case_meta(ds)
+
+    # Variable display info
+    if variable in RT_VARIABLES:
+        display_name, cmap, units, vmin, vmax = RT_VARIABLES[variable]
+    else:
+        info = RT_DERIVED[variable]
+        display_name, cmap, units, vmin, vmax = info["display_name"], info.get("cmap", "inferno"), info["units"], info["vmin"], info["vmax"]
+
+    # Bin edges
+    if variable in _RT_CFAD_BINS:
+        default_min, default_max, default_width = _RT_CFAD_BINS[variable]
+    else:
+        default_min, default_max, default_width = vmin, vmax, None
+
+    b_min = bin_min if bin_min is not None else default_min
+    b_max = bin_max if bin_max is not None else default_max
+    if bin_width is not None and bin_width > 0:
+        bin_edges = np.arange(b_min, b_max + bin_width * 0.5, bin_width)
+    elif default_width is not None and bin_width is None:
+        bin_edges = np.arange(b_min, b_max + default_width * 0.5, default_width)
+    else:
+        bin_edges = np.linspace(b_min, b_max, n_bins + 1)
+
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+    n_heights = len(heights)
+    actual_n_bins = len(bin_centers)
+
+    # Radial mask
+    xx, yy = np.meshgrid(x_km, y_km)
+    rr = np.sqrt(xx**2 + yy**2)
+    spatial_mask = (rr >= min_radius) & (rr <= max_radius)
+
+    # Histogram at each height
+    hist_2d = np.zeros((n_heights, actual_n_bins), dtype=np.float64)
+    for h in range(n_heights):
+        slab = vol[h, :, :]
+        vals = slab[spatial_mask & ~np.isnan(slab)]
+        if len(vals) == 0:
+            continue
+        counts, _ = np.histogram(vals, bins=bin_edges)
+        hist_2d[h, :] = counts
+
+    # Normalise
+    if normalise == "total":
+        total = np.nansum(hist_2d)
+        if total > 0:
+            hist_2d = (hist_2d / total) * 100.0
+    elif normalise == "height":
+        row_sums = np.nansum(hist_2d, axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1
+        hist_2d = (hist_2d / row_sums) * 100.0
+
+    norm_label = {"total": "% of total", "height": "% at each height"}.get(normalise, "count")
+
+    # Clean for JSON
+    cfad_list = []
+    for row in hist_2d:
+        cfad_list.append([round(float(v), 4) if np.isfinite(v) else 0.0 for v in row])
+
+    return JSONResponse({
+        "cfad": cfad_list,
+        "bin_centers": [round(float(b), 6) for b in bin_centers],
+        "bin_edges": [round(float(b), 6) for b in bin_edges],
+        "bin_width": round(float(bin_edges[1] - bin_edges[0]), 6),
+        "height_km": [round(float(h), 2) for h in heights],
+        "normalise": normalise,
+        "norm_label": norm_label,
+        "variable": {
+            "key": variable,
+            "display_name": display_name,
+            "units": units,
+            "vmin": vmin,
+            "vmax": vmax,
+        },
+        "radial_domain": [min_radius, max_radius],
+        "case_meta": meta,
+    })

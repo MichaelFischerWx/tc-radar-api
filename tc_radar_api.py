@@ -4047,6 +4047,119 @@ def composite_cfad(
 
 
 # ---------------------------------------------------------------------------
+# Single-case CFAD endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/cfad/single")
+def single_case_cfad(
+    case_index:    int   = Query(...,                      description="Case index"),
+    variable:      str   = Query(DEFAULT_VARIABLE,         description="Variable key"),
+    data_type:     str   = Query("swath",                  description="'swath', 'merge', or 'tilt'"),
+    era:           str   = Query("",                       description="Era tag (empty = auto-detect)"),
+    bin_min:       float = Query(None,                     description="Lower edge of first bin (auto if omitted)"),
+    bin_max:       float = Query(None,                     description="Upper edge of last bin (auto if omitted)"),
+    bin_width:     float = Query(None,                     description="Bin width (auto if omitted)"),
+    n_bins:        int   = Query(40,   ge=5, le=200,       description="Number of bins (used when bin_width not given)"),
+    min_radius:    float = Query(0,    ge=0,  le=500,      description="Minimum radius (km)"),
+    max_radius:    float = Query(200,  ge=0.1, le=500,     description="Maximum radius (km)"),
+    normalise:     str   = Query("height",                 description="'height' = % at each level; 'total' = % of all; 'raw' = counts"),
+):
+    """Compute a CFAD for a single case/analysis."""
+    if variable not in VARIABLES:
+        raise HTTPException(status_code=400, detail=f"Unknown variable '{variable}'.")
+    if normalise not in ("total", "height", "raw"):
+        raise HTTPException(status_code=400, detail="normalise must be 'total', 'height', or 'raw'")
+
+    display_name, varname, cmap, units, vmin, vmax = VARIABLES[variable]
+    ref_varname = DERIVED_VARIABLES[variable][0] if variable in DERIVED_VARIABLES else varname
+
+    # Bin edges
+    b_min = bin_min if bin_min is not None else vmin
+    b_max = bin_max if bin_max is not None else vmax
+    if bin_width is not None and bin_width > 0:
+        bin_edges = np.arange(b_min, b_max + bin_width * 0.5, bin_width)
+    else:
+        bin_edges = np.linspace(b_min, b_max, n_bins + 1)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+
+    # Load volume
+    try:
+        ds, local_idx = resolve_case(case_index, data_type)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Could not load case {case_index}: {e}")
+
+    height_km = ds["height"].values
+    x_coords, y_coords, h_axis = _resolve_grid_and_haxis(ds, ref_varname)
+    vol, _ = _extract_3d_volume(ds, local_idx, variable)
+
+    n_heights = len(height_km)
+    actual_n_bins = len(bin_centers)
+
+    # Radial mask
+    xx, yy = np.meshgrid(x_coords, y_coords)
+    rr = np.sqrt(xx**2 + yy**2)
+    spatial_mask = (rr >= min_radius) & (rr <= max_radius)
+
+    # Histogram at each height
+    hist_2d = np.zeros((n_heights, actual_n_bins), dtype=np.float64)
+    for h in range(n_heights):
+        if h_axis == 0:
+            slab = vol[h, :, :]
+        elif h_axis == 2:
+            slab = vol[:, :, h]
+        else:
+            slab = vol[:, h, :]
+        vals = slab[spatial_mask & ~np.isnan(slab)]
+        if len(vals) == 0:
+            continue
+        counts, _ = np.histogram(vals, bins=bin_edges)
+        hist_2d[h, :] = counts
+
+    # Normalise
+    if normalise == "total":
+        total = np.nansum(hist_2d)
+        if total > 0:
+            hist_2d = (hist_2d / total) * 100.0
+    elif normalise == "height":
+        row_sums = np.nansum(hist_2d, axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1
+        hist_2d = (hist_2d / row_sums) * 100.0
+
+    norm_label = {"total": "% of total", "height": "% at each height"}.get(normalise, "count")
+
+    # Case metadata
+    meta_cache = _merge_metadata_cache if data_type == "merge" else _metadata_cache
+    case_meta = meta_cache.get(case_index, {})
+
+    return JSONResponse({
+        "cfad": _clean_2d(hist_2d),
+        "bin_centers": [round(float(b), 4) for b in bin_centers],
+        "bin_edges": [round(float(b), 4) for b in bin_edges],
+        "bin_width": round(float(bin_edges[1] - bin_edges[0]), 4),
+        "height_km": [round(float(h), 2) for h in height_km],
+        "normalise": normalise,
+        "norm_label": norm_label,
+        "variable": {
+            "key": variable,
+            "display_name": display_name,
+            "units": units,
+            "vmin": vmin,
+            "vmax": vmax,
+        },
+        "cfad_colorscale": _cmap_to_plotly("Spectral_r"),
+        "radial_domain": [min_radius, max_radius],
+        "case_index": case_index,
+        "case_meta": {
+            "storm_id": case_meta.get("storm_id", ""),
+            "storm_name": case_meta.get("storm_name", ""),
+            "vmax": case_meta.get("vmax"),
+            "latitude": case_meta.get("latitude"),
+            "longitude": case_meta.get("longitude"),
+        },
+    })
+
+
+# ---------------------------------------------------------------------------
 # Environmental composite endpoints (ERA5)
 # ---------------------------------------------------------------------------
 
