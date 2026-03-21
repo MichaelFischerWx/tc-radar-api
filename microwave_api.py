@@ -585,14 +585,46 @@ async def get_microwave_data(
                 }
             h5file.close()
 
-        logger.info("TC-PRIMED file groups: %s, root vars: %s", all_groups, root_vars[:10])
-        for g, info in subgroups.items():
-            logger.info("  Group '%s': subgroups=%s, vars=%s", g, info["subgroups"], info["variables"][:10])
+        # Log full structure with print() so it always shows in Render logs
+        print(f"[MW] TC-PRIMED file: {s3_key}")
+        print(f"[MW]   Top-level groups: {all_groups}")
+        print(f"[MW]   Root vars: {root_vars[:10]}")
+        for g, ginfo in subgroups.items():
+            print(f"[MW]   Group '{g}': subgroups={ginfo['subgroups']}, vars={ginfo['variables'][:15]}")
+            # Also enumerate sub-subgroups
+            if ginfo["subgroups"]:
+                try:
+                    with fs.open(s3_url, "rb") as f2:
+                        h5f2 = h5netcdf.File(f2, "r")
+                        for sg in ginfo["subgroups"]:
+                            sg_grp = h5f2.groups[g].groups[sg]
+                            sg_vars = list(sg_grp.variables.keys())
+                            sg_subs = list(sg_grp.groups.keys()) if hasattr(sg_grp, "groups") else []
+                            subgroups.setdefault(f"{g}/{sg}", {
+                                "subgroups": sg_subs,
+                                "variables": sg_vars,
+                            })
+                            print(f"[MW]     Sub '{g}/{sg}': subgroups={sg_subs}, vars={sg_vars[:15]}")
+                            # One more level deep
+                            for ssg in sg_subs:
+                                ssg_grp = sg_grp.groups[ssg]
+                                ssg_vars = list(ssg_grp.variables.keys())
+                                subgroups.setdefault(f"{g}/{sg}/{ssg}", {
+                                    "subgroups": [],
+                                    "variables": ssg_vars,
+                                })
+                                print(f"[MW]       Sub '{g}/{sg}/{ssg}': vars={ssg_vars[:15]}")
+                        h5f2.close()
+                except Exception as e_sub:
+                    print(f"[MW]   (error reading subgroups of '{g}': {e_sub})")
 
         data_dict = None
 
-        # Strategy: try multiple possible group paths for brightness temperature data
-        # TC-PRIMED files may use various group hierarchies
+        # ── Build candidate group paths ──
+        # Metadata-only groups to skip
+        _SKIP_GROUPS = {"overpass_metadata", "metadata", "overpass_storm"}
+
+        # Priority-ordered explicit candidates
         bt_group_candidates = [
             f"/{sensor}/interpolation",
             f"/{sensor}/brightness_temperature",
@@ -609,13 +641,23 @@ async def get_microwave_data(
             "/geolocation",
         ]
 
-        # Also try groups we actually found in the file
+        # Add every discovered group/subgroup (skipping metadata-only ones)
         for g in all_groups:
-            bt_group_candidates.append(f"/{g}")
-            for sg in subgroups.get(g, {}).get("subgroups", []):
-                bt_group_candidates.append(f"/{g}/{sg}")
+            if g.lower() not in _SKIP_GROUPS:
+                bt_group_candidates.append(f"/{g}")
+        for compound_key, sg_info in subgroups.items():
+            path = f"/{compound_key}"
+            if path not in bt_group_candidates:
+                leaf_name = compound_key.split("/")[-1].lower()
+                if leaf_name not in _SKIP_GROUPS:
+                    bt_group_candidates.append(path)
+                # Geolocation subgroups
+                if "geolocation" in leaf_name or "geo" == leaf_name:
+                    geo_group_candidates.append(path)
 
-        # Try to find brightness temperature data
+        print(f"[MW]   BT candidates to try: {bt_group_candidates}")
+
+        # ── Try each candidate ──
         ds_data = None
         ds_geo = None
         used_group = None
@@ -624,23 +666,23 @@ async def get_microwave_data(
             try:
                 with fs.open(s3_url, "rb") as f:
                     ds_candidate = xr.open_dataset(f, engine="h5netcdf", group=group_path)
-                # Check if this group has brightness temperature-like variables
-                var_names = [v.upper() for v in ds_candidate.data_vars]
+                var_names_upper = [v.upper() for v in ds_candidate.data_vars]
                 has_bt = any(
                     "89" in v or "91" in v or "85" in v or "88" in v or
                     "37" in v or "36" in v or
                     "BRIGHTNESS" in v or "TB" in v or "PCT" in v
-                    for v in var_names
+                    for v in var_names_upper
                 )
-                if has_bt or len(ds_candidate.data_vars) > 2:
+                if has_bt:
                     ds_data = ds_candidate
                     used_group = group_path
-                    logger.info("Found usable data in group '%s': %s",
-                               group_path, list(ds_candidate.data_vars)[:10])
+                    print(f"[MW]   ✓ Found BT data in '{group_path}': {list(ds_candidate.data_vars)[:10]}")
                     break
                 else:
+                    print(f"[MW]   ✗ Group '{group_path}' has no BT vars: {list(ds_candidate.data_vars)[:8]}")
                     ds_candidate.close()
-            except Exception:
+            except Exception as e_try:
+                print(f"[MW]   ✗ Group '{group_path}' error: {e_try}")
                 continue
 
         if ds_data is None:
@@ -649,7 +691,7 @@ async def get_microwave_data(
                 with fs.open(s3_url, "rb") as f:
                     ds_data = xr.open_dataset(f, engine="h5netcdf", group="")
                 used_group = "/"
-                logger.info("Using root group, vars: %s", list(ds_data.data_vars)[:15])
+                print(f"[MW]   Using root group, vars: {list(ds_data.data_vars)[:15]}")
             except Exception as e:
                 raise HTTPException(500,
                     f"Could not find brightness temperature data. "
