@@ -589,9 +589,12 @@ async def get_microwave_data(
         print(f"[MW] TC-PRIMED file: {s3_key}")
         print(f"[MW]   Top-level groups: {all_groups}")
         print(f"[MW]   Root vars: {root_vars[:10]}")
-        for g, ginfo in subgroups.items():
+
+        # Enumerate sub-subgroups (build into a separate dict to avoid
+        # mutating subgroups during iteration)
+        deep_groups = {}
+        for g, ginfo in list(subgroups.items()):
             print(f"[MW]   Group '{g}': subgroups={ginfo['subgroups']}, vars={ginfo['variables'][:15]}")
-            # Also enumerate sub-subgroups
             if ginfo["subgroups"]:
                 try:
                     with fs.open(s3_url, "rb") as f2:
@@ -600,32 +603,51 @@ async def get_microwave_data(
                             sg_grp = h5f2.groups[g].groups[sg]
                             sg_vars = list(sg_grp.variables.keys())
                             sg_subs = list(sg_grp.groups.keys()) if hasattr(sg_grp, "groups") else []
-                            subgroups.setdefault(f"{g}/{sg}", {
+                            deep_groups[f"{g}/{sg}"] = {
                                 "subgroups": sg_subs,
                                 "variables": sg_vars,
-                            })
-                            print(f"[MW]     Sub '{g}/{sg}': subgroups={sg_subs}, vars={sg_vars[:15]}")
-                            # One more level deep
-                            for ssg in sg_subs:
-                                ssg_grp = sg_grp.groups[ssg]
-                                ssg_vars = list(ssg_grp.variables.keys())
-                                subgroups.setdefault(f"{g}/{sg}/{ssg}", {
-                                    "subgroups": [],
-                                    "variables": ssg_vars,
-                                })
-                                print(f"[MW]       Sub '{g}/{sg}/{ssg}': vars={ssg_vars[:15]}")
+                            }
+                            print(f"[MW]     Sub '{g}/{sg}': vars={sg_vars[:15]}")
                         h5f2.close()
                 except Exception as e_sub:
                     print(f"[MW]   (error reading subgroups of '{g}': {e_sub})")
+        subgroups.update(deep_groups)
 
         data_dict = None
 
-        # ── Build candidate group paths ──
-        # Metadata-only groups to skip
-        _SKIP_GROUPS = {"overpass_metadata", "metadata", "overpass_storm"}
+        # ── TC-PRIMED swath structure ──
+        # Files use /passive_microwave/S1..S4 where each S* is a different
+        # frequency swath with its own lat/lon grid:
+        #   S1: low-freq (19 GHz)
+        #   S2: mid-freq (37 GHz)   ← used for 37h product
+        #   S3: high-freq (150/183 GHz)
+        #   S4: imaging-freq (85-92 GHz) ← used for 89pct product
+        # Each S* group has: latitude, longitude, x, y, TB_* variables.
+        #
+        # Strategy: find the right S* swath for the requested product
+        # by checking which subgroup has matching frequency variables.
 
-        # Priority-ordered explicit candidates
-        bt_group_candidates = [
+        # Frequency patterns to match for each product
+        if product == "89pct":
+            _FREQ_PATTERNS = ["89", "91", "85", "88", "92"]
+        else:  # 37h
+            _FREQ_PATTERNS = ["37", "36"]
+
+        # Build candidate groups — prioritize passive_microwave sub-swaths
+        bt_group_candidates = []
+
+        # First: try passive_microwave sub-swaths (the actual TC-PRIMED structure)
+        for compound_key, sg_info in subgroups.items():
+            if "passive_microwave/" in compound_key:
+                # Check if this swath has the right frequency
+                for vname in sg_info.get("variables", []):
+                    vname_upper = vname.upper()
+                    if any(fp in vname_upper for fp in _FREQ_PATTERNS) and "TB" in vname_upper:
+                        bt_group_candidates.insert(0, f"/{compound_key}")
+                        break
+
+        # Then: try other explicit paths as fallback
+        bt_group_candidates.extend([
             f"/{sensor}/interpolation",
             f"/{sensor}/brightness_temperature",
             f"/{sensor}",
@@ -634,28 +656,24 @@ async def get_microwave_data(
             "/passive_microwave",
             "/interpolation",
             "/brightness_temperature",
-        ]
-        geo_group_candidates = [
-            f"/{sensor}/geolocation",
-            "/passive_microwave/geolocation",
-            "/geolocation",
-        ]
+        ])
 
-        # Add every discovered group/subgroup (skipping metadata-only ones)
-        for g in all_groups:
-            if g.lower() not in _SKIP_GROUPS:
-                bt_group_candidates.append(f"/{g}")
+        # Also add any remaining discovered groups (skip metadata)
+        _SKIP_GROUPS = {"overpass_metadata", "overpass_storm_metadata",
+                        "metadata", "overpass_storm", "GPROF", "infrared"}
         for compound_key, sg_info in subgroups.items():
             path = f"/{compound_key}"
             if path not in bt_group_candidates:
-                leaf_name = compound_key.split("/")[-1].lower()
-                if leaf_name not in _SKIP_GROUPS:
+                leaf = compound_key.split("/")[-1].lower()
+                if leaf not in {s.lower() for s in _SKIP_GROUPS}:
                     bt_group_candidates.append(path)
-                # Geolocation subgroups
-                if "geolocation" in leaf_name or "geo" == leaf_name:
-                    geo_group_candidates.append(path)
+        for g in all_groups:
+            path = f"/{g}"
+            if path not in bt_group_candidates and g.lower() not in {s.lower() for s in _SKIP_GROUPS}:
+                bt_group_candidates.append(path)
 
-        print(f"[MW]   BT candidates to try: {bt_group_candidates}")
+        print(f"[MW]   Product={product}, freq_patterns={_FREQ_PATTERNS}")
+        print(f"[MW]   BT candidates: {bt_group_candidates}")
 
         # ── Try each candidate ──
         ds_data = None
@@ -666,67 +684,51 @@ async def get_microwave_data(
             try:
                 with fs.open(s3_url, "rb") as f:
                     ds_candidate = xr.open_dataset(f, engine="h5netcdf", group=group_path)
-                var_names_upper = [v.upper() for v in ds_candidate.data_vars]
-                has_bt = any(
-                    "89" in v or "91" in v or "85" in v or "88" in v or
-                    "37" in v or "36" in v or
-                    "BRIGHTNESS" in v or "TB" in v or "PCT" in v
-                    for v in var_names_upper
-                )
-                if has_bt:
+                # Check for frequency-appropriate TB variables
+                has_right_freq = False
+                for vname in ds_candidate.data_vars:
+                    vname_upper = vname.upper()
+                    if "TB" in vname_upper or "BRIGHTNESS" in vname_upper:
+                        if any(fp in vname_upper for fp in _FREQ_PATTERNS):
+                            has_right_freq = True
+                            break
+                if has_right_freq:
                     ds_data = ds_candidate
                     used_group = group_path
-                    print(f"[MW]   ✓ Found BT data in '{group_path}': {list(ds_candidate.data_vars)[:10]}")
+                    print(f"[MW]   ✓ Found matching data in '{group_path}': {list(ds_candidate.data_vars)[:10]}")
                     break
                 else:
-                    print(f"[MW]   ✗ Group '{group_path}' has no BT vars: {list(ds_candidate.data_vars)[:8]}")
+                    print(f"[MW]   ✗ '{group_path}' no matching freq: {list(ds_candidate.data_vars)[:8]}")
                     ds_candidate.close()
             except Exception as e_try:
-                print(f"[MW]   ✗ Group '{group_path}' error: {e_try}")
+                print(f"[MW]   ✗ '{group_path}' error: {e_try}")
                 continue
 
         if ds_data is None:
-            # Last resort: try root group
-            try:
-                with fs.open(s3_url, "rb") as f:
-                    ds_data = xr.open_dataset(f, engine="h5netcdf", group="")
-                used_group = "/"
-                print(f"[MW]   Using root group, vars: {list(ds_data.data_vars)[:15]}")
-            except Exception as e:
-                raise HTTPException(500,
-                    f"Could not find brightness temperature data. "
-                    f"File groups: {all_groups}, subgroups: {subgroups}")
+            raise HTTPException(500,
+                f"Could not find {product} data. "
+                f"File groups: {all_groups}, subgroups: {list(subgroups.keys())}")
 
-        # Try to get geolocation (lat/lon) — might be in data group or separate
+        # TC-PRIMED S* groups have latitude/longitude AND x/y in the same group
         has_latlon = ("latitude" in ds_data.data_vars or "latitude" in ds_data.coords or
                       "lat" in ds_data.data_vars or "lat" in ds_data.coords)
-        if not has_latlon:
-            for geo_path in geo_group_candidates:
-                try:
-                    with fs.open(s3_url, "rb") as f:
-                        ds_geo = xr.open_dataset(f, engine="h5netcdf", group=geo_path)
-                    logger.info("Found geolocation in group '%s'", geo_path)
-                    break
-                except Exception:
-                    continue
+        has_xy = ("x" in ds_data.coords or "x" in ds_data.dims or
+                  "x_distance" in ds_data.coords or "x_distance" in ds_data.dims)
+
+        print(f"[MW]   Data group '{used_group}': has_latlon={has_latlon}, has_xy={has_xy}, "
+              f"vars={list(ds_data.data_vars)[:12]}, coords={list(ds_data.coords)[:10]}")
+
+        # Inject center_lat/center_lon from query params into ds attrs
+        # (TC-PRIMED S* groups may not have storm_latitude attr)
+        if "storm_latitude" not in ds_data.attrs and center_lat is not None:
+            ds_data.attrs["storm_latitude"] = center_lat
+        if "storm_longitude" not in ds_data.attrs and center_lon is not None:
+            ds_data.attrs["storm_longitude"] = center_lon
 
         # Compute the product
         try:
-            if has_latlon or "x_distance" in ds_data.coords or "x_distance" in ds_data.dims:
-                # Gridded / interpolated data
-                if product == "89pct":
-                    data_dict = _compute_89pct_interpolated(ds_data, sensor)
-                else:
-                    data_dict = _compute_37h_interpolated(ds_data, sensor)
-            elif ds_geo is not None:
-                # Swath data with separate geolocation
-                if product == "89pct":
-                    data_dict = _compute_89pct_swath(ds_data, ds_geo, sensor)
-                else:
-                    data_dict = _compute_37h_swath(ds_data, ds_geo, sensor)
-                ds_geo.close()
-            else:
-                # Try as gridded anyway
+            if has_xy or has_latlon:
+                # Storm-centered grid (x/y km offsets) or has lat/lon coords
                 if product == "89pct":
                     data_dict = _compute_89pct_interpolated(ds_data, sensor)
                 else:
@@ -799,34 +801,57 @@ _37GHZ_PATTERNS = {
 def _find_channel_var(ds, sensor: str, freq_ghz: int, pol: str) -> Optional[str]:
     """
     Search the dataset variables for one that matches the desired
-    frequency and polarization. TC-PRIMED naming can vary, so we
-    try several patterns.
+    frequency and polarization.
+
+    TC-PRIMED naming convention:  TB_{freq}{pol}
+        e.g. TB_91.665V, TB_37.0H, TB_89.0V, TB_19.35H
+    The frequency in the var name may not exactly match freq_ghz
+    (e.g. 91.665 for "89 GHz" on SSMIS, 85.5 for "89 GHz" on SSM/I).
+    So we check a range of nearby frequencies.
     """
+    pol_upper = pol.upper()  # "V" or "H"
+
+    # Build a set of frequency prefixes to match
+    # e.g. for 89 GHz: look for 85, 86, 87, 88, 89, 90, 91, 92
+    if freq_ghz >= 85:
+        freq_candidates = [str(f) for f in range(85, 93)]
+    elif freq_ghz >= 35:
+        freq_candidates = [str(f) for f in range(36, 39)]  # 36, 37, 38
+    else:
+        freq_candidates = [str(freq_ghz)]
+
+    print(f"[MW]   _find_channel_var: sensor={sensor}, freq={freq_ghz}, pol={pol_upper}, "
+          f"freq_candidates={freq_candidates}, vars={list(ds.data_vars)[:15]}")
+
+    # Strategy 1: TC-PRIMED style — TB_{freq}{pol} where var name ends with pol letter
+    for var_name in ds.data_vars:
+        vn = var_name.upper()
+        if not vn.endswith(pol_upper):
+            continue
+        # Check if any freq candidate appears in the name
+        for fc in freq_candidates:
+            if fc in vn:
+                print(f"[MW]     → matched '{var_name}' (TC-PRIMED style)")
+                return var_name
+
+    # Strategy 2: legacy patterns from _89GHZ_PATTERNS / _37GHZ_PATTERNS
     patterns_dict = _89GHZ_PATTERNS if freq_ghz >= 85 else _37GHZ_PATTERNS
     sensor_info = patterns_dict.get(sensor, {})
     expected = sensor_info.get(pol.lower())
+    if expected:
+        for var_name in ds.data_vars:
+            vn_clean = var_name.upper().replace(".", "").replace("_", "").replace(" ", "")
+            ex_clean = expected.upper().replace(".", "").replace("_", "").replace(" ", "")
+            if ex_clean in vn_clean:
+                print(f"[MW]     → matched '{var_name}' (legacy pattern '{expected}')")
+                return var_name
 
-    if expected is None:
-        return None
-
-    # Direct match
-    for var_name in ds.data_vars:
-        vn_upper = var_name.upper().replace(".", "").replace("_", "")
-        ex_upper = expected.upper().replace(".", "").replace("_", "")
-        if ex_upper in vn_upper:
-            return var_name
-
-    # Fuzzy search — look for frequency number + polarization
-    freq_str = str(freq_ghz)
-    for var_name in ds.data_vars:
-        vn = var_name.upper()
-        if freq_str in vn and pol.upper() in vn:
-            return var_name
-
-    # Last resort — check for 'brightness_temperature' with channel dim
+    # Strategy 3: any var with 'brightness_temperature' + channel dimension
     if "brightness_temperature" in ds.data_vars:
+        print(f"[MW]     → matched 'brightness_temperature' (generic)")
         return "brightness_temperature"
 
+    print(f"[MW]     → no match found for {freq_ghz} GHz {pol_upper}")
     return None
 
 
