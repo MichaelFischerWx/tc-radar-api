@@ -10,6 +10,10 @@ Products:
       Available from: GMI, SSMIS, AMSR2, SSM/I, TMI
     - 37 GHz H-pol brightness temperature:
       Available from: GMI, SSMIS, AMSR2, SSM/I, TMI
+    - 37 GHz Color Composite (NRL 37color per Jiang et al. 2018):
+        RGB false-color: R=PCT37, G=V37, B=H37
+        PCT37 = 2.18 * V37 − 1.18 * H37
+      Available from: GMI, SSMIS, AMSR2, SSM/I, TMI
 
 Data source:
     s3://noaa-nesdis-tcprimed-pds/v01r01/final/{season}/{basin}/{ATCF_ID}/
@@ -544,8 +548,8 @@ async def get_microwave_data(
     import matplotlib.pyplot as plt
     import matplotlib.colors as mcolors
 
-    if product not in ("89pct", "37h"):
-        raise HTTPException(400, "product must be '89pct' or '37h'")
+    if product not in ("89pct", "37h", "37color"):
+        raise HTTPException(400, "product must be '89pct', '37h', or '37color'")
 
     # Validate S3 key
     if not s3_key.startswith(TCPRIMED_PREFIX) or not s3_key.endswith(".nc"):
@@ -560,7 +564,7 @@ async def get_microwave_data(
     if sensor not in SENSOR_INFO:
         raise HTTPException(400, f"Unsupported sensor: {sensor}")
 
-    if product == "37h" and not SENSOR_INFO[sensor]["has_37"]:
+    if product in ("37h", "37color") and not SENSOR_INFO[sensor]["has_37"]:
         raise HTTPException(400, f"Sensor {sensor} does not have 37 GHz channels")
 
     try:
@@ -630,7 +634,7 @@ async def get_microwave_data(
         # Frequency patterns to match for each product
         if product == "89pct":
             _FREQ_PATTERNS = ["89", "91", "85", "88", "92"]
-        else:  # 37h
+        else:  # 37h or 37color
             _FREQ_PATTERNS = ["37", "36"]
 
         # Build candidate groups — prioritize passive_microwave sub-swaths
@@ -752,6 +756,8 @@ async def get_microwave_data(
                 print(f"[MW]   Using SWATH compute path (2D lat/lon in same group)")
                 if product == "89pct":
                     data_dict = _compute_89pct_swath(ds_data, ds_data, sensor)
+                elif product == "37color":
+                    data_dict = _compute_37color_swath(ds_data, ds_data, sensor)
                 else:
                     data_dict = _compute_37h_swath(ds_data, ds_data, sensor)
             elif has_xy_coord:
@@ -759,6 +765,8 @@ async def get_microwave_data(
                 print(f"[MW]   Using GRID compute path (x_distance/y_distance)")
                 if product == "89pct":
                     data_dict = _compute_89pct_interpolated(ds_data, sensor)
+                elif product == "37color":
+                    data_dict = _compute_37color_interpolated(ds_data, sensor)
                 else:
                     data_dict = _compute_37h_interpolated(ds_data, sensor)
             elif has_latlon:
@@ -766,6 +774,8 @@ async def get_microwave_data(
                 print(f"[MW]   Using GRID compute path (1D lat/lon)")
                 if product == "89pct":
                     data_dict = _compute_89pct_interpolated(ds_data, sensor)
+                elif product == "37color":
+                    data_dict = _compute_37color_interpolated(ds_data, sensor)
                 else:
                     data_dict = _compute_37h_interpolated(ds_data, sensor)
             else:
@@ -783,10 +793,65 @@ async def get_microwave_data(
         if data_dict is None:
             raise HTTPException(500, "No data could be extracted")
 
-        # Generate a PNG image for efficient overlay
+        # Generate a PNG image for the Leaflet overlay
         png_b64 = _render_product_image(data_dict, product)
 
-        return JSONResponse({
+        # Build storm-relative grid for Plotly plan-view overlay
+        # TC-PRIMED S* groups have x/y (km) as data vars — same swath shape as TB
+        storm_grid = None
+        storm_grid_rgb = None  # for 37color: three separate grids (R, G, B)
+        try:
+            if "x" in ds_data.data_vars and "y" in ds_data.data_vars:
+                x_km_raw = ds_data["x"].values  # 2D (scan × pixel) — km from center
+                y_km_raw = ds_data["y"].values
+
+                if product == "37color":
+                    # Build RGB storm-relative grids for Plotly plan view
+                    # We need V37, H37, and PCT37 on the same grid
+                    v37_name = _find_channel_var(ds_data, sensor, 37, "V")
+                    h37_name = _find_channel_var(ds_data, sensor, 37, "H")
+                    if v37_name and h37_name:
+                        v37_raw = ds_data[v37_name].values.astype(np.float32)
+                        h37_raw = ds_data[h37_name].values.astype(np.float32)
+                        pct37_raw = 2.18 * v37_raw - 1.18 * h37_raw
+                        # Build a single grid from PCT37 for the single-channel Plotly view
+                        storm_grid = _build_storm_relative_grid(
+                            x_km_raw, y_km_raw, pct37_raw, grid_extent_km=250, grid_res_km=4
+                        )
+                        # Also build an RGB image for the plan view
+                        storm_grid_rgb = _build_storm_relative_rgb_grid(
+                            x_km_raw, y_km_raw, pct37_raw, v37_raw, h37_raw,
+                            grid_extent_km=250, grid_res_km=4
+                        )
+                        if storm_grid:
+                            print(f"[MW]   Storm-relative 37color grid built: "
+                                  f"{storm_grid['nx']}x{storm_grid['ny']}")
+                else:
+                    # Single-channel products: 89pct or 37h
+                    freq = 89 if product == "89pct" else 37
+                    pol = "V" if product == "89pct" else "H"
+                    v_name = _find_channel_var(ds_data, sensor, freq, pol)
+                    h_name = _find_channel_var(ds_data, sensor, 89, "H") if product == "89pct" else None
+                    if v_name:
+                        if product == "89pct" and h_name and v_name != h_name:
+                            pct_raw = (1.818 * ds_data[v_name].values.astype(np.float32) -
+                                       0.818 * ds_data[h_name].values.astype(np.float32))
+                        elif product == "89pct":
+                            pct_raw = ds_data[v_name].values.astype(np.float32)
+                        else:
+                            pct_raw = ds_data[v_name].values.astype(np.float32)
+
+                        storm_grid = _build_storm_relative_grid(
+                            x_km_raw, y_km_raw, pct_raw, grid_extent_km=250, grid_res_km=4
+                        )
+                        if storm_grid:
+                            print(f"[MW]   Storm-relative grid built: {storm_grid['nx']}x{storm_grid['ny']}")
+        except Exception as e_grid:
+            print(f"[MW]   Storm-relative grid failed: {e_grid}")
+            import traceback; traceback.print_exc()
+            storm_grid = None
+
+        response = {
             "product": product,
             "sensor": sensor,
             "platform": info["platform"],
@@ -801,7 +866,31 @@ async def get_microwave_data(
                 "dx_km": data_dict.get("dx_km"),
             },
             "stats": data_dict.get("stats", {}),
-        })
+            "is_rgb": product == "37color",
+        }
+
+        if product == "37color":
+            # 37color is RGB — no single-channel colorscale
+            response["colorscale"] = None
+            response["vmin"] = 0
+            response["vmax"] = 255
+        elif product == "89pct":
+            response["colorscale"] = NRL_89GHZ_PLOTLY_COLORSCALE
+            response["vmin"] = NRL_VMIN
+            response["vmax"] = NRL_VMAX
+        else:
+            response["colorscale"] = NRL_89GHZ_PLOTLY_COLORSCALE
+            response["vmin"] = 130
+            response["vmax"] = 300
+
+        # Include storm-relative grid for Plotly plan view
+        if storm_grid:
+            response["storm_grid"] = storm_grid
+        # Include RGB image for 37color plan view
+        if storm_grid_rgb:
+            response["storm_grid_rgb_b64"] = storm_grid_rgb
+
+        return JSONResponse(response)
 
     except HTTPException:
         raise
@@ -988,6 +1077,106 @@ def _compute_37h_swath(ds_bt, ds_geo, sensor: str) -> dict:
     return gridded
 
 
+def _compute_37color_swath(ds_bt, ds_geo, sensor: str) -> dict:
+    """
+    Compute 37 GHz false-color composite from swath data and regrid.
+
+    NRL 37color product (Jiang et al. 2018):
+        R = PCT37 = 2.18 * V37 − 1.18 * H37
+        G = V37
+        B = H37
+    Returns dict with 'data' as 3D RGB array (ny, nx, 3), uint8 0-255.
+    """
+    v_name = _find_channel_var(ds_bt, sensor, 37, "V")
+    h_name = _find_channel_var(ds_bt, sensor, 37, "H")
+    if not v_name or not h_name:
+        raise ValueError(f"Cannot find 37 GHz V and H channels for sensor {sensor}")
+
+    tb_v = ds_bt[v_name].values.astype(np.float32)
+    tb_h = ds_bt[h_name].values.astype(np.float32)
+    pct37 = 2.18 * tb_v - 1.18 * tb_h
+
+    # Regrid each channel separately on the same lat/lon grid
+    lats, lons = _get_swath_geolocation(ds_geo)
+    gridded_pct = _regrid_swath(pct37, lats, lons)
+    gridded_v = _regrid_swath(tb_v, lats, lons)
+    gridded_h = _regrid_swath(tb_h, lats, lons)
+
+    # Scale to 0-255 for RGB: use 100-300 K range for all channels
+    rgb_min, rgb_max = 100.0, 300.0
+    def _scale_channel(arr):
+        scaled = (arr - rgb_min) / (rgb_max - rgb_min)
+        scaled = np.clip(scaled, 0, 1) * 255
+        scaled[~np.isfinite(arr)] = 0
+        return scaled.astype(np.uint8)
+
+    r = _scale_channel(gridded_pct["data"])
+    g = _scale_channel(gridded_v["data"])
+    b = _scale_channel(gridded_h["data"])
+
+    # Stack into RGB (ny, nx, 3)
+    rgb = np.stack([r, g, b], axis=-1)
+
+    result = {
+        "data": rgb,
+        "center_lat": gridded_pct["center_lat"],
+        "center_lon": gridded_pct["center_lon"],
+        "bounds": gridded_pct["bounds"],
+        "nx": gridded_pct["nx"],
+        "ny": gridded_pct["ny"],
+        "dx_km": gridded_pct["dx_km"],
+        "is_rgb": True,
+        "product_label": "37 GHz Color Composite",
+        "stats": {
+            "pct37_min": float(np.nanmin(pct37)),
+            "pct37_max": float(np.nanmax(pct37)),
+            "v37_mean": float(np.nanmean(tb_v)),
+            "h37_mean": float(np.nanmean(tb_h)),
+        },
+    }
+    return result
+
+
+def _compute_37color_interpolated(ds, sensor: str) -> dict:
+    """
+    Compute 37 GHz false-color composite from an interpolated grid.
+    """
+    v_name = _find_channel_var(ds, sensor, 37, "V")
+    h_name = _find_channel_var(ds, sensor, 37, "H")
+    if not v_name or not h_name:
+        raise ValueError(f"Cannot find 37 GHz V and H channels for sensor {sensor}")
+
+    tb_v = ds[v_name].values.astype(np.float32)
+    tb_h = ds[h_name].values.astype(np.float32)
+    pct37 = 2.18 * tb_v - 1.18 * tb_h
+
+    # Scale to 0-255 for RGB: use 100-300 K range for all channels
+    rgb_min, rgb_max = 100.0, 300.0
+    def _scale_channel(arr):
+        scaled = (arr - rgb_min) / (rgb_max - rgb_min)
+        scaled = np.clip(scaled, 0, 1) * 255
+        scaled[~np.isfinite(arr)] = 0
+        return scaled.astype(np.uint8)
+
+    r = _scale_channel(pct37)
+    g = _scale_channel(tb_v)
+    b = _scale_channel(tb_h)
+
+    rgb = np.stack([r, g, b], axis=-1)
+
+    result = _extract_grid_info(ds, pct37)
+    result["data"] = rgb
+    result["is_rgb"] = True
+    result["product_label"] = "37 GHz Color Composite"
+    result["stats"] = {
+        "pct37_min": float(np.nanmin(pct37)),
+        "pct37_max": float(np.nanmax(pct37)),
+        "v37_mean": float(np.nanmean(tb_v)),
+        "h37_mean": float(np.nanmean(tb_h)),
+    }
+    return result
+
+
 def _get_swath_geolocation(ds_geo) -> Tuple[np.ndarray, np.ndarray]:
     """Extract lat/lon arrays from the geolocation group."""
     lat_candidates = ["latitude", "lat", "Latitude"]
@@ -1064,6 +1253,140 @@ def _extract_grid_info(ds, data: np.ndarray) -> dict:
     }
 
 
+def _build_storm_relative_grid(
+    x_km: np.ndarray, y_km: np.ndarray, pct_data: np.ndarray,
+    grid_extent_km: float = 250, grid_res_km: float = 4
+) -> Optional[dict]:
+    """
+    Regrid the MW product data from irregular swath x/y (km) onto a regular
+    storm-relative grid matching the TDR plan view (-250 to +250 km).
+
+    Returns dict with x_axis, y_axis (1D lists in km) and z (2D list of lists)
+    suitable for direct use as a Plotly heatmap/contour trace.
+    Returns None if insufficient data.
+    """
+    from scipy.interpolate import griddata
+
+    # Flatten & mask
+    xf = x_km.ravel().astype(np.float32)
+    yf = y_km.ravel().astype(np.float32)
+    zf = pct_data.ravel().astype(np.float32) if pct_data.ndim >= 2 else pct_data.astype(np.float32)
+
+    mask = (np.isfinite(xf) & np.isfinite(yf) & np.isfinite(zf) &
+            (np.abs(xf) <= grid_extent_km * 1.2) &
+            (np.abs(yf) <= grid_extent_km * 1.2))
+
+    xf, yf, zf = xf[mask], yf[mask], zf[mask]
+    if len(zf) < 50:
+        return None
+
+    # Regular grid
+    n = int(2 * grid_extent_km / grid_res_km) + 1
+    ax = np.linspace(-grid_extent_km, grid_extent_km, n)
+    gx, gy = np.meshgrid(ax, ax)
+
+    gridded = griddata((xf, yf), zf, (gx, gy), method="nearest")
+
+    # Mask points far from any data (>15 km) to avoid extrapolation artifacts
+    from scipy.spatial import cKDTree
+    tree = cKDTree(np.column_stack([xf, yf]))
+    dists, _ = tree.query(np.column_stack([gx.ravel(), gy.ravel()]))
+    far_mask = dists.reshape(gridded.shape) > 15.0
+    gridded[far_mask] = np.nan
+
+    # Convert to JSON-friendly lists (replace NaN with None for JSON null)
+    z_list = []
+    for row in gridded:
+        z_list.append([None if np.isnan(v) else round(float(v), 1) for v in row])
+
+    return {
+        "x_axis": [round(float(v), 1) for v in ax],
+        "y_axis": [round(float(v), 1) for v in ax],
+        "z": z_list,
+        "nx": n,
+        "ny": n,
+        "extent_km": grid_extent_km,
+        "res_km": grid_res_km,
+    }
+
+
+def _build_storm_relative_rgb_grid(
+    x_km: np.ndarray, y_km: np.ndarray,
+    pct37: np.ndarray, v37: np.ndarray, h37: np.ndarray,
+    grid_extent_km: float = 250, grid_res_km: float = 4
+) -> Optional[str]:
+    """
+    Build a storm-relative RGB PNG (base64) for the 37 GHz color composite
+    on the Plotly plan view. Returns base64 PNG string or None.
+
+    The RGB composite per Jiang et al. 2018:
+        R = PCT37, G = V37, B = H37  (scaled to 0-255 from 100-300 K)
+    """
+    from scipy.interpolate import griddata
+    from scipy.spatial import cKDTree
+
+    # Flatten & mask
+    xf = x_km.ravel().astype(np.float32)
+    yf = y_km.ravel().astype(np.float32)
+
+    mask_valid = (np.isfinite(xf) & np.isfinite(yf) &
+                  (np.abs(xf) <= grid_extent_km * 1.2) &
+                  (np.abs(yf) <= grid_extent_km * 1.2))
+
+    channels = {"pct37": pct37, "v37": v37, "h37": h37}
+    for ch_name, ch_data in channels.items():
+        cf = ch_data.ravel().astype(np.float32)
+        mask_valid &= np.isfinite(cf)
+
+    xf_m, yf_m = xf[mask_valid], yf[mask_valid]
+    if len(xf_m) < 50:
+        return None
+
+    # Regular grid
+    n = int(2 * grid_extent_km / grid_res_km) + 1
+    ax = np.linspace(-grid_extent_km, grid_extent_km, n)
+    gx, gy = np.meshgrid(ax, ax)
+
+    # Distance mask (same as single-channel version)
+    tree = cKDTree(np.column_stack([xf_m, yf_m]))
+    dists, _ = tree.query(np.column_stack([gx.ravel(), gy.ravel()]))
+    far_mask = dists.reshape((n, n)) > 15.0
+
+    # Scale: 100-300 K → 0-255
+    rgb_min, rgb_max = 100.0, 300.0
+
+    def _grid_and_scale(raw_data):
+        zf = raw_data.ravel().astype(np.float32)[mask_valid]
+        g = griddata((xf_m, yf_m), zf, (gx, gy), method="nearest")
+        g[far_mask] = np.nan
+        scaled = (g - rgb_min) / (rgb_max - rgb_min)
+        scaled = np.clip(scaled, 0, 1) * 255
+        scaled[np.isnan(g)] = 0
+        return scaled.astype(np.uint8)
+
+    r_ch = _grid_and_scale(pct37)
+    g_ch = _grid_and_scale(v37)
+    b_ch = _grid_and_scale(h37)
+
+    # Create alpha channel: transparent where data is missing
+    alpha = np.where(far_mask, 0, 180).astype(np.uint8)
+
+    # Build RGBA image
+    rgba = np.stack([r_ch, g_ch, b_ch, alpha], axis=-1)
+
+    # Flip vertically: numpy array has origin at top-left, but we want
+    # y increasing upward (matching Plotly plan view convention)
+    rgba = rgba[::-1]
+
+    # Encode as PNG
+    from PIL import Image
+    img = Image.fromarray(rgba, mode="RGBA")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode("ascii")
+
+
 def _regrid_swath(data: np.ndarray, lats: np.ndarray, lons: np.ndarray,
                   grid_res_deg: float = 0.02) -> dict:
     """
@@ -1123,37 +1446,100 @@ def _regrid_swath(data: np.ndarray, lats: np.ndarray, lons: np.ndarray,
 # Image rendering
 # ---------------------------------------------------------------------------
 
+def _nrl_89ghz_cmap():
+    """
+    Build a matplotlib colormap that mimics the NRL-Monterey 89/91 GHz
+    display.  Anchor points (TB in K → colour) sampled from the NRL
+    colourbar:
+        105 K  dark gray     (coldest / deepest ice scattering)
+        150 K  dark maroon
+        180 K  bright red
+        212 K  orange-yellow
+        228 K  yellow-green
+        254 K  green-cyan
+        280 K  blue
+        305 K  light blue    (warm ocean background)
+    """
+    import matplotlib.colors as mcolors
+    # Normalised positions for vmin=105, vmax=305
+    anchors = [
+        (0.000, "#303030"),   # 105 K — dark gray
+        (0.100, "#606060"),   # 125 K — medium gray
+        (0.225, "#800000"),   # 150 K — dark maroon
+        (0.375, "#FF0000"),   # 180 K — bright red
+        (0.500, "#FF8C00"),   # 205 K — orange
+        (0.535, "#FFD700"),   # 212 K — gold-yellow
+        (0.615, "#ADFF2F"),   # 228 K — yellow-green
+        (0.700, "#00CC44"),   # 245 K — green
+        (0.745, "#00DDCC"),   # 254 K — cyan
+        (0.825, "#0066FF"),   # 270 K — blue
+        (0.875, "#0000CC"),   # 280 K — dark blue
+        (1.000, "#8888FF"),   # 305 K — light blue
+    ]
+    positions = [a[0] for a in anchors]
+    colors = [a[1] for a in anchors]
+    return mcolors.LinearSegmentedColormap.from_list("nrl89ghz", list(zip(positions, colors)), N=256)
+
+
+# Plotly-compatible colorscale (same NRL anchors, for JSON responses)
+NRL_89GHZ_PLOTLY_COLORSCALE = [
+    [0.000, "#303030"], [0.100, "#606060"], [0.225, "#800000"],
+    [0.375, "#FF0000"], [0.500, "#FF8C00"], [0.535, "#FFD700"],
+    [0.615, "#ADFF2F"], [0.700, "#00CC44"], [0.745, "#00DDCC"],
+    [0.825, "#0066FF"], [0.875, "#0000CC"], [1.000, "#8888FF"],
+]
+
+# Default value range matching NRL display
+NRL_VMIN = 105
+NRL_VMAX = 305
+
+
 def _render_product_image(data_dict: dict, product: str) -> str:
     """
     Render the gridded product data as a transparent PNG (base64-encoded)
-    suitable for Leaflet image overlay.
+    suitable for Leaflet image overlay. Uses NRL-style colourmap for
+    single-channel products, or direct RGB for 37color composite.
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    import matplotlib.colors as mcolors
 
     data = data_dict["data"]
     if data is None:
         return ""
 
-    # Ensure 2D
+    # ── 37 GHz Color Composite: data is already RGB (ny, nx, 3) ──
+    if product == "37color" and data.ndim == 3 and data.shape[2] == 3:
+        from PIL import Image
+        ny, nx = data.shape[:2]
+        # Add alpha channel: transparent where all channels are zero
+        alpha = np.where(
+            (data[:, :, 0] == 0) & (data[:, :, 1] == 0) & (data[:, :, 2] == 0),
+            0, 200
+        ).astype(np.uint8)
+        rgba = np.concatenate([data, alpha[:, :, np.newaxis]], axis=-1)
+        # Flip vertically (origin="lower" convention)
+        rgba = rgba[::-1]
+        img = Image.fromarray(rgba, mode="RGBA")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        return base64.b64encode(buf.read()).decode("ascii")
+
+    # ── Single-channel products (89pct, 37h) ──
     if data.ndim == 1:
         return ""
 
     ny, nx = data.shape
 
-    # Set up colormaps and value ranges
+    # NRL-style colormap and range
     if product == "89pct":
-        # 89 GHz PCT: low values = deep convection (ice scattering)
-        # Typical range: ~80 K (intense convection) to ~280 K (warm ocean)
-        vmin, vmax = 80, 280
-        # Use reversed colormap: blue/purple for cold (convective), warm for clear
-        cmap = plt.cm.get_cmap("RdYlBu")  # already warm-to-cool
+        cmap = _nrl_89ghz_cmap()
+        vmin, vmax = NRL_VMIN, NRL_VMAX
     else:
-        # 37 GHz H-pol: warm values = warm rain, low values = ice/land
-        vmin, vmax = 130, 280
-        cmap = plt.cm.get_cmap("RdYlBu_r")
+        # 37 GHz H-pol — use same NRL map but tighter range
+        cmap = _nrl_89ghz_cmap()
+        vmin, vmax = 130, 300
 
     # Create figure with transparent background
     dpi = 100
@@ -1193,7 +1579,7 @@ def _render_product_image(data_dict: dict, product: str) -> str:
 
 @router.get("/colorbar")
 async def get_colorbar(
-    product: str = Query("89pct", description="Product: '89pct' or '37h'"),
+    product: str = Query("89pct", description="Product: '89pct', '37h', or '37color'"),
 ):
     """
     Return a standalone colorbar image (PNG, base64) for the given product,
@@ -1203,6 +1589,31 @@ async def get_colorbar(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.colors as mcolors
+
+    if product == "37color":
+        # 37color is RGB — return a legend image explaining the color mapping
+        fig, ax = plt.subplots(figsize=(4, 0.6))
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_axis_off()
+        # Show color patches for the main features
+        patches = [
+            (0.05, "green",   "Ocean"),
+            (0.25, "cyan",    "Rain/Cloud"),
+            (0.50, "magenta", "Deep Conv."),
+            (0.75, "pink",    "Ice Scatter"),
+        ]
+        for x, color, lbl in patches:
+            ax.add_patch(plt.Rectangle((x, 0.1), 0.12, 0.5, facecolor=color, edgecolor="white", lw=0.5))
+            ax.text(x + 0.06, 0.72, lbl, ha="center", va="bottom", fontsize=7, color="white")
+        ax.set_title("37 GHz Color (R=PCT37 G=V37 B=H37)", fontsize=8, color="white", pad=2)
+        fig.patch.set_facecolor("none")
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=120, bbox_inches="tight", transparent=True)
+        plt.close(fig)
+        buf.seek(0)
+        b64 = base64.b64encode(buf.read()).decode("ascii")
+        return JSONResponse({"image_b64": b64, "product": product, "label": "37 GHz Color Composite"})
 
     if product == "89pct":
         vmin, vmax = 80, 280
