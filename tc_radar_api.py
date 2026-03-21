@@ -7246,11 +7246,17 @@ app.include_router(realtime_router, prefix="/realtime")
 from global_archive_api import router as global_router
 app.include_router(global_router, prefix="/global")
 
-from microwave_api import router as microwave_router, start_index_build as _mw_start
-app.include_router(microwave_router, prefix="/microwave")
-# Kick off the TC-PRIMED overpass index build in a background thread.
-# The index maps TC-RADAR cases to temporally nearby microwave overpasses.
-_mw_start()
+try:
+    from microwave_api import router as microwave_router, start_index_build as _mw_start
+    app.include_router(microwave_router, prefix="/microwave")
+    # Kick off the TC-PRIMED overpass index build in a background thread.
+    # The index maps TC-RADAR cases to temporally nearby microwave overpasses.
+    _mw_start()
+    print("[microwave] Router mounted and index build started")
+except Exception as _mw_err:
+    import traceback
+    print(f"[microwave] FAILED to load microwave_api: {_mw_err}")
+    traceback.print_exc()
 
 if __name__ == "__main__":
     import uvicorn
