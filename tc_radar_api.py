@@ -7246,6 +7246,12 @@ app.include_router(realtime_router, prefix="/realtime")
 from global_archive_api import router as global_router
 app.include_router(global_router, prefix="/global")
 
+from microwave_api import router as microwave_router, start_index_build as _mw_start
+app.include_router(microwave_router, prefix="/microwave")
+# Kick off the TC-PRIMED overpass index build in a background thread.
+# The index maps TC-RADAR cases to temporally nearby microwave overpasses.
+_mw_start()
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
