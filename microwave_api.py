@@ -173,14 +173,49 @@ def _parse_case_datetime(case: dict) -> Optional[_dt]:
         return None
 
 
+def _extract_annual_number(atcf_id: str) -> str:
+    """
+    Extract the 2-digit annual storm number from an ATCF ID.
+    E.g. 'AL062018' -> '06', 'EP122020' -> '12', 'WP032019' -> '03'.
+    """
+    # ATCF format: BB##YYYY  (2-char basin + 2-digit number + 4-digit year)
+    return atcf_id[2:4]
+
+
+def _compute_tcprimed_season(atcf_id: str, year: int) -> int:
+    """
+    Compute the TC-PRIMED season directory year.
+
+    For the Northern Hemisphere: season = calendar year.
+    For the Southern Hemisphere: the season starts July 1, so the TC-PRIMED
+    season is the calendar year + 1 (e.g., a storm in Dec 2019 is season 2020).
+
+    Since IBTrACS 'year' already captures genesis year and TC-PRIMED follows
+    the same convention as IBTrACS for SH storm years, we use the ATCF year
+    directly — it already encodes the correct season.
+    """
+    # The 4-digit year in the ATCF ID IS the season year
+    try:
+        return int(atcf_id[4:8])
+    except (ValueError, IndexError):
+        return year
+
+
 def _list_tcprimed_files_for_storm(s3_client, atcf_id: str, season: int) -> List[str]:
     """
     List all TC-PRIMED NetCDF files for a given ATCF ID.
     Returns list of S3 keys.
+
+    TC-PRIMED S3 path structure:
+        v01r01/final/{season}/{basin}/{annual_number}/
+    where annual_number is the 2-digit storm number (e.g. '06'),
+    NOT the full ATCF ID.
     """
-    # Determine basin directory from ATCF prefix (first 2 chars)
     basin_code = atcf_id[:2]  # e.g. "AL", "EP", "WP"
-    prefix = f"{TCPRIMED_PREFIX}/{season}/{basin_code}/{atcf_id}/"
+    annual_num = _extract_annual_number(atcf_id)  # e.g. "06"
+    tcprimed_season = _compute_tcprimed_season(atcf_id, season)
+
+    prefix = f"{TCPRIMED_PREFIX}/{tcprimed_season}/{basin_code}/{annual_num}/"
     keys = []
     try:
         paginator = s3_client.get_paginator("list_objects_v2")
@@ -190,7 +225,9 @@ def _list_tcprimed_files_for_storm(s3_client, atcf_id: str, season: int) -> List
                 if key.endswith(".nc"):
                     keys.append(key)
     except Exception as e:
-        logger.warning("S3 list failed for %s: %s", prefix, e)
+        logger.warning("S3 list failed for %s/%s: %s", prefix, atcf_id, e)
+
+    logger.debug("Listed %d files for %s at %s", len(keys), atcf_id, prefix)
     return keys
 
 
@@ -245,6 +282,10 @@ def _build_index_thread(metadata_path: str, ibtracs_path: str):
             for key in s3_keys:
                 info = _parse_tcprimed_filename(key)
                 if info is None:
+                    continue
+                # Verify this file belongs to our storm (directory may contain
+                # files from other storms if annual numbers overlap across basins)
+                if info["atcf_id"] != atcf_id:
                     continue
                 # Only keep sensors that have useful channels
                 sensor = info["sensor"]
