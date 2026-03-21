@@ -479,6 +479,54 @@ async def get_overpasses(
     })
 
 
+def _live_tcprimed_lookup(atcf_id: str, year: Optional[int] = None) -> List[dict]:
+    """
+    Real-time S3 lookup for storms NOT in the pre-built index.
+    Called when the Global Archive requests overpasses for any IBTrACS storm
+    that isn't in the TC-RADAR database (which is the majority of storms).
+    Returns the same serialised overpass list format as the pre-built index.
+    """
+    try:
+        season = int(atcf_id[4:8])
+    except (ValueError, IndexError):
+        season = year or 0
+    if not season:
+        return []
+
+    try:
+        s3 = _get_boto3_client()
+        keys = _list_tcprimed_files_for_storm(s3, atcf_id, season)
+    except Exception as e:
+        logger.warning("Live TC-PRIMED lookup failed for %s: %s", atcf_id, e)
+        return []
+
+    overpasses = []
+    for key in keys:
+        info = _parse_tcprimed_filename(key)
+        if info is None:
+            continue
+        if info["atcf_id"] != atcf_id:
+            continue
+        sensor = info["sensor"]
+        if sensor not in SENSOR_INFO:
+            continue
+        overpasses.append({
+            "s3_key":      key,
+            "sensor":      sensor,
+            "platform":    info["platform"],
+            "orbit":       info["orbit"],
+            "datetime":    info["datetime"].strftime("%Y-%m-%d %H:%M UTC"),
+            "has_89":      SENSOR_INFO[sensor]["has_89"],
+            "has_37":      SENSOR_INFO[sensor]["has_37"],
+            "sensor_full": SENSOR_INFO[sensor]["full_name"],
+            "filename":    info["filename"],
+        })
+
+    overpasses.sort(key=lambda x: x["datetime"])
+    logger.info("Live TC-PRIMED lookup for %s: %d overpasses", atcf_id, len(overpasses))
+    return overpasses
+
+
 @router.get("/storm_overpasses")
 async def get_storm_overpasses(
     atcf_id: str = Query(None, description="ATCF storm ID, e.g. AL062018"),
@@ -514,6 +562,15 @@ async def get_storm_overpasses(
     resolved_atcf = resolved_atcf.upper()
     with _index_lock:
         overpasses = _storm_overpass_index.get(resolved_atcf, [])
+
+    # Live S3 fallback: if the pre-built index has nothing (storm not in
+    # TC-RADAR database), query TC-PRIMED directly.  Cache the result so
+    # subsequent calls for the same storm are instant.
+    if not overpasses:
+        overpasses = _live_tcprimed_lookup(resolved_atcf, year)
+        if overpasses:
+            with _index_lock:
+                _storm_overpass_index[resolved_atcf] = overpasses
 
     return JSONResponse({
         "atcf_id": resolved_atcf,
