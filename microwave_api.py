@@ -1623,6 +1623,16 @@ def _regrid_swath(data: np.ndarray, lats: np.ndarray, lons: np.ndarray,
         method="nearest",
     )
 
+    # Mask grid points far from any actual swath data to prevent
+    # nearest-neighbor extrapolation beyond the swath edge.
+    # Threshold: ~3x the grid resolution in degrees (~6 km at equator)
+    from scipy.spatial import cKDTree
+    tree = cKDTree(np.column_stack([flat_lon, flat_lat]))
+    dists, _ = tree.query(np.column_stack([glon.ravel(), glat.ravel()]))
+    max_dist_deg = grid_res_deg * 3.0
+    far_mask = dists.reshape(gridded.shape) > max_dist_deg
+    gridded[far_mask] = np.nan
+
     center_lat = (lat_min + lat_max) / 2.0
     center_lon = (lon_min + lon_max) / 2.0
 
@@ -1688,6 +1698,16 @@ def _regrid_swath_multi(
             (flat_lon, flat_lat), flat_ch,
             (glon, glat), method="nearest",
         )
+
+    # Mask grid points far from any actual swath data to prevent
+    # nearest-neighbor extrapolation beyond the swath edge.
+    from scipy.spatial import cKDTree
+    tree = cKDTree(np.column_stack([flat_lon, flat_lat]))
+    dists, _ = tree.query(np.column_stack([glon.ravel(), glat.ravel()]))
+    max_dist_deg = grid_res_deg * 3.0
+    far_mask = dists.reshape(glon.shape) > max_dist_deg
+    for name in channels:
+        channels[name][far_mask] = np.nan
 
     center_lat = (lat_min + lat_max) / 2.0
     center_lon = (lon_min + lon_max) / 2.0
