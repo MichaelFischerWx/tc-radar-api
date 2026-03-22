@@ -466,7 +466,7 @@ async def get_overpasses(
     and available products (89 GHz PCT, 37 GHz).
     """
     if not _index_ready.is_set():
-        raise HTTPException(503, "Microwave overpass index is still building. Try again shortly.")
+        raise HTTPException(503, "Index building, try again in a few seconds")
 
     with _index_lock:
         overpasses = _case_overpass_index.get(case_index, [])
@@ -538,9 +538,6 @@ async def get_storm_overpasses(
     Supports both global archive (query by ATCF ID) and archive mode
     (query by storm_name + year, which gets mapped to ATCF ID internally).
     """
-    if not _index_ready.is_set():
-        raise HTTPException(503, "Microwave overpass index is still building. Try again shortly.")
-
     # Resolve ATCF ID
     resolved_atcf = atcf_id
     if not resolved_atcf and storm_name and year:
@@ -1938,9 +1935,6 @@ async def get_realtime_overpasses(
     from the IBTrACS mapping and then filtering the storm's overpasses
     by the analysis time window.
     """
-    if not _index_ready.is_set():
-        raise HTTPException(503, "Microwave overpass index is still building.")
-
     # Parse analysis time
     try:
         analysis_dt = _dt.fromisoformat(analysis_time.replace("Z", "+00:00"))
@@ -1962,9 +1956,15 @@ async def get_realtime_overpasses(
             "message": "No ATCF ID found for this storm",
         })
 
-    # Get all storm overpasses and filter by time window
+    # Get all storm overpasses — use index if available, otherwise live lookup
     with _index_lock:
         all_ops = _storm_overpass_index.get(atcf, [])
+
+    if not all_ops:
+        all_ops = _live_tcprimed_lookup(atcf, year)
+        if all_ops:
+            with _index_lock:
+                _storm_overpass_index[atcf] = all_ops
 
     window = timedelta(hours=OVERPASS_WINDOW_HOURS)
     matched = []
